@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+SQLAlchemy==2.0.32
+psycopg2-binary==2.9.9
+alembic==1.13.2
+redis==5.0.8
+celery==5.4.0
+python-multipart==0.0.21
+requests>=2.31.0
+boto3==1.34.162
+botocore==1.34.162
