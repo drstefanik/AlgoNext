@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -9,6 +10,25 @@ from app.schemas import JobCreate, JobOut
 from app.workers.pipeline import run_analysis
 
 router = APIRouter()
+
+POLLING_SAFE_STATUSES = {"QUEUED", "RUNNING", "COMPLETED", "FAILED"}
+
+
+def normalize_status(status: str) -> str:
+    if status in POLLING_SAFE_STATUSES:
+        return status
+    if status == "WAITING_FOR_ANCHOR":
+        return "QUEUED"
+    return "QUEUED"
+
+
+def normalize_payload(payload: object) -> dict:
+    if payload is None:
+        return {}
+    encoded = jsonable_encoder(payload)
+    if isinstance(encoded, dict):
+        return encoded
+    return {"value": encoded}
 
 
 @router.post("/jobs", response_model=JobOut)
@@ -44,14 +64,12 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
 
     return {
         "id": job.id,
-        "status": job.status,
+        "status": normalize_status(job.status),
         "category": job.category,
         "role": job.role,
         "video_url": job.video_url,
-        "target": job.target,
-        "anchor": job.anchor,
-        "progress": job.progress,
-        "result": job.result,
+        "progress": normalize_payload(job.progress),
+        "result": normalize_payload(job.result),
         "error": job.error,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
