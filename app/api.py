@@ -74,6 +74,22 @@ def job_status(job_id: str, db: Session = Depends(get_db)):
     }
 
 
+@router.get("/jobs/{job_id}/poll")
+def job_poll(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "id": job.id,
+        "status": job.status,
+        "progress": job.progress,
+        "error": job.error,
+        "result": job.result if job.status == "COMPLETED" else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+    }
+
+
 # ✅ result “pulito” (solo quando pronto)
 @router.get("/jobs/{job_id}/result")
 def job_result(job_id: str, db: Session = Depends(get_db)):
