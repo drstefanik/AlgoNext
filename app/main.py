@@ -1,18 +1,21 @@
+import logging
 import os
 import time
 
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.core.db import Base, engine
+from app.core.db import Base, SessionLocal, engine
 from app.api import router as api_router
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 DOCS_URL = None if APP_ENV == "production" else "/docs"
 REDOC_URL = None if APP_ENV == "production" else "/redoc"
 OPENAPI_URL = None if APP_ENV == "production" else "/openapi.json"
+logger = logging.getLogger(__name__)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -51,6 +54,17 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 init_db()
+
+@app.on_event("startup")
+def fail_fast_db_check():
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("Database connectivity check failed during startup.")
+        raise
+    finally:
+        session.close()
 
 @app.get("/health", include_in_schema=False)
 def health():
