@@ -85,8 +85,8 @@ def job_status(job_id: str, db: Session = Depends(get_db)):
 
     return {
         "id": job.id,
-        "status": job.status,
-        "progress": job.progress,
+        "status": normalize_status(job.status),
+        "progress": normalize_payload(job.progress),
         "error": job.error,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
