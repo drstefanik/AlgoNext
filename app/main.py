@@ -5,10 +5,11 @@ import time
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.engine.url import make_url
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.core.db import Base, SessionLocal, engine
+from app.core.db import Base, SessionLocal, engine, DATABASE_URL
 from app.api import router as api_router
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -55,8 +56,15 @@ def init_db():
 
 init_db()
 
+def mask_database_url(url: str) -> str:
+    try:
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:
+        return "<invalid DATABASE_URL>"
+
 @app.on_event("startup")
 def fail_fast_db_check():
+    logger.info("DATABASE_URL: %s", mask_database_url(DATABASE_URL))
     session = SessionLocal()
     try:
         session.execute(text("SELECT 1"))
