@@ -296,6 +296,7 @@ def presign_get_url(s3_public, bucket: str, key: str, expires_seconds: int) -> s
 def run_analysis(job_id: str):
     db: Session = SessionLocal()
     job: Optional[AnalysisJob] = None
+    base_dir: Optional[Path] = None
 
     # Env vars (required)
     S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "").strip()
@@ -438,4 +439,9 @@ def run_analysis(job_id: str):
             db.rollback()
         raise
     finally:
+        if base_dir is not None and base_dir.exists():
+            try:
+                shutil.rmtree(base_dir)
+            except Exception:
+                pass
         db.close()
