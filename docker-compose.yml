@@ -5,8 +5,6 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: app
-    ports:
-      - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
@@ -14,6 +12,7 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   redis:
     image: redis:7
@@ -24,23 +23,43 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
-    ports:
-      - "9000:9000"  # S3 API
-      - "9001:9001"  # Console
+    command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 3s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
+
+  # Crea automaticamente il bucket (evita NoSuchBucket)
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      S3_BUCKET: fnh
+    entrypoint: ["/bin/sh", "-lc"]
+    command: >
+      "
+      mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
+      mc mb -p local/$S3_BUCKET || true
+      "
+    restart: "no"
 
   api:
     build: .
@@ -51,6 +70,18 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
+
+      # MinIO / S3 (stesse env del worker)
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: fnh
+      S3_REGION: us-east-1
+      SIGNED_URL_EXPIRES_SECONDS: 3600
+
+      # Se ti serve generare signed URL “cliccabili” dal browser:
+      # (deve puntare all'IP/DNS del server, NON a localhost)
+      # S3_PUBLIC_ENDPOINT_URL: http://YOUR_SERVER_IP:9000
     depends_on:
       db:
         condition: service_healthy
@@ -58,7 +89,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
 
   worker:
     build: .
@@ -70,16 +104,15 @@ services:
 
       # MinIO / S3 (PRIVATE + signed URLs)
       S3_ENDPOINT_URL: http://minio:9000
-
-      # Endpoint PUBBLICO che il client/user può raggiungere (Hetzner IP)
-      S3_PUBLIC_ENDPOINT_URL: http://46.224.249.136:9000
-
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: fnh
       S3_REGION: us-east-1
       SIGNED_URL_EXPIRES_SECONDS: 3600
 
+      # Se vuoi che i link funzionino dal tuo PC:
+      # metti l'IP pubblico del server (non localhost)
+      # S3_PUBLIC_ENDPOINT_URL: http://YOUR_SERVER_IP:9000
     depends_on:
       db:
         condition: service_healthy
@@ -87,7 +120,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
     command: celery -A app.workers.celery_app.celery worker --loglevel=info
+    restart: unless-stopped
 
 volumes:
   db_data:
