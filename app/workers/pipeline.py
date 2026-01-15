@@ -3,6 +3,7 @@ import time
 import json
 import shutil
 import subprocess
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +17,8 @@ from sqlalchemy.orm import Session
 from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------
@@ -141,12 +144,25 @@ def ensure_ffmpeg_available() -> None:
 
 def download_video(url: str, dst_path: Path) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=60) as r:
+    log_every_bytes = 100 * 1024 * 1024
+    bytes_downloaded = 0
+    next_log_bytes = log_every_bytes
+    with requests.get(
+        url,
+        stream=True,
+        timeout=(10, 1800),
+        headers={"User-Agent": "AlgoNextWorker/1.0"},
+    ) as r:
         r.raise_for_status()
         with open(dst_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+                    bytes_downloaded += len(chunk)
+                    if bytes_downloaded >= next_log_bytes:
+                        mb_downloaded = bytes_downloaded / (1024 * 1024)
+                        logger.info("Downloaded %.1f MB from %s", mb_downloaded, url)
+                        next_log_bytes += log_every_bytes
 
 
 def probe_video_meta(path: Path) -> Dict:
