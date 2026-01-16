@@ -34,7 +34,7 @@ class SelectionBox(BaseModel):
 
 
 class SelectionPayload(BaseModel):
-    selections: conlist(SelectionBox, min_items=2, max_items=5)
+    selections: conlist(SelectionBox, min_length=2, max_length=5)
 
 
 class PlayerRefBBox(BaseModel):
