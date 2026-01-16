@@ -81,15 +81,12 @@ def load_minio_context() -> Dict[str, Any]:
         )
 
     try:
-        public_endpoint = resolve_public_endpoint(
-            minio_internal_endpoint, minio_public_endpoint
-        )
+        resolve_public_endpoint(minio_internal_endpoint, minio_public_endpoint)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
         "s3_internal": get_s3_client(minio_internal_endpoint),
-        "public_endpoint": public_endpoint,
         "bucket": minio_bucket,
         "expires_seconds": expires_seconds,
     }
@@ -97,7 +94,6 @@ def load_minio_context() -> Dict[str, Any]:
 
 def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     s3_internal = context["s3_internal"]
-    public_endpoint = context["public_endpoint"]
     bucket_default = context["bucket"]
     expires_seconds = context["expires_seconds"]
     def presign(bucket: str, key: str) -> str:
@@ -106,7 +102,6 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
             bucket,
             key,
             expires_seconds,
-            public_endpoint,
         )
 
     def normalize_asset(asset: Dict[str, Any], include_url: bool) -> Dict[str, Any]:
@@ -328,13 +323,18 @@ def job_poll(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    result_payload = job.result if job.status == "COMPLETED" else None
+    if result_payload:
+        context = load_minio_context()
+        result_payload = attach_presigned_urls(result_payload, context)
+
     return {
         "id": job.id,
         "status": job.status,
         "progress": job.progress,
         "error": job.error,
         "failure_reason": job.failure_reason,
-        "result": job.result if job.status == "COMPLETED" else None,
+        "result": result_payload,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
 
@@ -429,7 +429,6 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     s3_internal = context["s3_internal"]
     minio_bucket = context["bucket"]
     expires_seconds = context["expires_seconds"]
-    public_endpoint = context["public_endpoint"]
 
     ensure_ffmpeg_available()
 
@@ -483,7 +482,6 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
             minio_bucket,
             frame_key,
             expires_seconds,
-            public_endpoint,
         )
         frames.append(
             {
