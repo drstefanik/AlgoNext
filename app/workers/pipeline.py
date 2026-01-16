@@ -16,6 +16,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import celery
+from app.core.env import is_production_env
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 
@@ -495,11 +496,23 @@ def resolve_public_endpoint(internal_endpoint: str, public_endpoint: str) -> str
     return resolved
 
 
-def replace_origin(url: str, public_endpoint: str) -> str:
+def rewrite_presigned_to_public(url: str) -> str:
+    public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
+    if not public_endpoint:
+        raise RuntimeError("Missing MINIO_PUBLIC_ENDPOINT.")
     parsed_url = urlsplit(url)
     parsed_public = urlsplit(public_endpoint)
     if not parsed_public.scheme or not parsed_public.netloc:
         raise RuntimeError("MINIO_PUBLIC_ENDPOINT must include scheme and host.")
+    if not is_production_env():
+        logger.info(
+            "MINIO_PRESIGN_REWRITE",
+            extra={
+                "minio_public_endpoint": public_endpoint,
+                "before_host": parsed_url.netloc,
+                "after_host": parsed_public.netloc,
+            },
+        )
     return urlunsplit(
         (
             parsed_public.scheme,
@@ -516,22 +529,13 @@ def presign_get_url(
     bucket: str,
     key: str,
     expires_seconds: int,
-    public_endpoint: str,
 ) -> str:
-    logger.info(
-        "MINIO_INTERNAL_ENDPOINT = %s",
-        os.environ.get("MINIO_INTERNAL_ENDPOINT"),
-    )
-    logger.info(
-        "MINIO_PUBLIC_ENDPOINT = %s",
-        os.environ.get("MINIO_PUBLIC_ENDPOINT"),
-    )
     signed_url = s3_internal.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
-    return replace_origin(signed_url, public_endpoint)
+    return rewrite_presigned_to_public(signed_url)
 
 
 # ----------------------------
