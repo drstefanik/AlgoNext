@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
-from app.schemas import JobCreate, JobOut, SelectionPayload
+from app.schemas import JobCreate, JobOut, PlayerRefPayload, SelectionPayload
 from app.workers.pipeline import run_analysis
 from app.workers.pipeline import (
     ensure_bucket_exists,
@@ -150,6 +151,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         target=target,
         video_meta={},
         anchor={},
+        player_ref={},
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
         error=None,
@@ -257,6 +259,39 @@ def save_selection(
     db.commit()
     db.refresh(job)
     return JobOut(job_id=job.id, status=job.status)
+
+
+@router.post("/jobs/{job_id}/player-ref")
+def save_player_ref(
+    job_id: str, payload: PlayerRefPayload, db: Session = Depends(get_db)
+):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    player_ref = payload.dict(exclude_none=True)
+    bbox = player_ref.get("bbox") or {}
+    if bbox.get("w", 0) <= 0 or bbox.get("h", 0) <= 0:
+        raise HTTPException(status_code=400, detail="Invalid bbox dimensions")
+
+    job.player_ref = player_ref
+
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    job.progress = {
+        **progress,
+        "step": "PLAYER_SELECTED",
+        "pct": max(current_pct, 12),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    db.commit()
+    db.refresh(job)
+    return {"status": "ok", "player_ref": job.player_ref}
 
 
 @router.get("/jobs/{job_id}/frames")

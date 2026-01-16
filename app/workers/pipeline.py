@@ -4,9 +4,9 @@ import json
 import shutil
 import subprocess
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import boto3
@@ -164,6 +164,7 @@ def download_video(
     next_log_bytes = log_every_bytes
     last_progress_tick = time.monotonic()
     progress_tick_seconds = 5
+
     with requests.get(
         url,
         stream=True,
@@ -176,6 +177,7 @@ def download_video(
                 if chunk:
                     f.write(chunk)
                     bytes_downloaded += len(chunk)
+
                     now = time.monotonic()
                     if (
                         progress_callback is not None
@@ -183,6 +185,7 @@ def download_video(
                     ):
                         last_progress_tick = now
                         progress_callback()
+
                     if bytes_downloaded >= next_log_bytes:
                         mb_downloaded = bytes_downloaded / (1024 * 1024)
                         logger.info("Downloaded %.1f MB from %s", mb_downloaded, url)
@@ -190,7 +193,6 @@ def download_video(
 
 
 def probe_video_meta(path: Path) -> Dict:
-    # Minimal ffprobe json (safe)
     try:
         out = _run(
             [
@@ -207,6 +209,41 @@ def probe_video_meta(path: Path) -> Dict:
         return json.loads(out)
     except Exception:
         return {}
+
+
+def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    try:
+        out = _run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                str(path),
+            ]
+        )
+        data = json.loads(out)
+        streams = data.get("streams") or []
+        for stream in streams:
+            width = stream.get("width")
+            height = stream.get("height")
+            if width and height:
+                return int(width), int(height)
+    except Exception:
+        return None, None
+    return None, None
+
+
+def get_duration_seconds(meta: Dict) -> Optional[float]:
+    try:
+        duration = meta.get("format", {}).get("duration")
+        if duration is None:
+            return None
+        return float(duration)
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
@@ -247,7 +284,6 @@ def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
                 }
             )
         except Exception:
-            # Se fallisce, stop e proviamo a fare almeno una clip "safe" di 3s da 0
             if not created:
                 fallback = out_dir / "clip_001.mp4"
                 _run(
@@ -275,7 +311,6 @@ def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
 def get_s3_client(endpoint_url: str):
-    # signature v4 ok per MinIO + AWS
     return boto3.client(
         "s3",
         endpoint_url=endpoint_url,
@@ -293,13 +328,13 @@ def ensure_bucket_exists(s3_client, bucket: str) -> None:
     except ClientError as e:
         code = str(e.response.get("Error", {}).get("Code", ""))
         if code not in ("404", "NoSuchBucket", "NotFound"):
-            # Se è un errore diverso (permission ecc.), non mascherarlo
             raise
-    # MinIO: create senza LocationConstraint
     s3_client.create_bucket(Bucket=bucket)
 
 
-def upload_file(s3_internal, bucket: str, local_path: Path, key: str, content_type: str) -> None:
+def upload_file(
+    s3_internal, bucket: str, local_path: Path, key: str, content_type: str
+) -> None:
     try:
         s3_internal.upload_file(
             Filename=str(local_path),
@@ -347,6 +382,7 @@ def run_analysis(job_id: str):
         job = reload_job(db, job_id)
         if not job:
             return
+
         video_url = job.video_url
         role = job.role
 
@@ -401,7 +437,7 @@ def run_analysis(job_id: str):
         s3_internal = get_s3_client(S3_ENDPOINT_URL)
         s3_public = get_s3_client(S3_PUBLIC_ENDPOINT_URL)
 
-        # ✅ Ensure bucket exists (kills NoSuchBucket forever)
+        # Ensure bucket exists
         ensure_bucket_exists(s3_internal, S3_BUCKET)
 
         # Download
@@ -436,7 +472,7 @@ def run_analysis(job_id: str):
         video_meta = probe_video_meta(input_path) or {}
         update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
 
-        # Upload input
+        # Upload input (so UI can always access it, even if we pause)
         update_job(
             db,
             job_id,
@@ -446,9 +482,97 @@ def run_analysis(job_id: str):
         )
         input_key = f"jobs/{job_id}/input.mp4"
         upload_file(s3_internal, S3_BUCKET, input_path, input_key, "video/mp4")
-
         input_signed = presign_get_url(s3_public, S3_BUCKET, input_key, expires_seconds)
 
+        # Persist input asset into result early (so frontend can show it immediately)
+        def store_input_asset(job: AnalysisJob) -> None:
+            existing = job.result or {}
+            assets = (existing.get("assets") or {}) if isinstance(existing, dict) else {}
+            assets = dict(assets)
+            assets["input_video"] = assets.get("input_video") or {
+                "s3_key": input_key,
+                "signed_url": input_signed,
+                "expires_in": expires_seconds,
+            }
+            job.result = {**existing, "assets": assets}
+
+        update_job(db, job_id, store_input_asset)
+
+        # Extract preview frames for UI selection
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "EXTRACTING_FRAMES", 25, "Extracting preview frames"
+            ),
+        )
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+        preview_count = max(1, min(12, preview_count))
+
+        duration = get_duration_seconds(video_meta)
+        if duration and duration > 0:
+            step = duration / (preview_count + 1)
+            timestamps = [round(step * (i + 1), 3) for i in range(preview_count)]
+        else:
+            timestamps = [i * 10 for i in range(preview_count)]
+
+        frames_dir = base_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        preview_frames: List[Dict[str, Any]] = []
+        for index, timestamp in enumerate(timestamps, start=1):
+            frame_name = f"frame_{index:04d}.jpg"
+            frame_path = frames_dir / frame_name
+
+            try:
+                _run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        str(timestamp),
+                        "-i",
+                        str(input_path),
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "2",
+                        str(frame_path),
+                    ]
+                )
+            except Exception:
+                break
+
+            width, height = probe_image_dimensions(frame_path)
+            frame_key = f"jobs/{job_id}/frames/{frame_name}"
+            upload_file(s3_internal, S3_BUCKET, frame_path, frame_key, "image/jpeg")
+            signed_url = presign_get_url(s3_public, S3_BUCKET, frame_key, expires_seconds)
+
+            preview_frames.append(
+                {
+                    "time_sec": timestamp,
+                    "key": frame_key,
+                    "signed_url": signed_url,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+        if preview_frames:
+            update_job(
+                db,
+                job_id,
+                lambda job: setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "preview_frames": preview_frames,
+                    },
+                ),
+            )
+
+        # Block analysis until player_ref is present (but keep assets/frames stored)
         job = reload_job(db, job_id)
         if not job:
             return
@@ -469,6 +593,7 @@ def run_analysis(job_id: str):
             )
             return
 
+        # Tracking (stub)
         update_job(
             db,
             job_id,
@@ -506,12 +631,14 @@ def run_analysis(job_id: str):
             ),
         )
 
-        clips_out: List[Dict] = []
+        clips_out: List[Dict[str, Any]] = []
         for i, c in enumerate(extracted, start=1):
             clip_path: Path = c["file"]
             clip_key = f"jobs/{job_id}/clips/{clip_path.name}"
             upload_file(s3_internal, S3_BUCKET, clip_path, clip_key, "video/mp4")
-            clip_signed = presign_get_url(s3_public, S3_BUCKET, clip_key, expires_seconds)
+            clip_signed = presign_get_url(
+                s3_public, S3_BUCKET, clip_key, expires_seconds
+            )
             clips_out.append(
                 {
                     "index": i,
@@ -541,7 +668,7 @@ def run_analysis(job_id: str):
         }
         overall = weighted_overall_score(radar, role)
 
-        # Final result (SIGNED URLs)
+        # Final result
         update_job(
             db,
             job_id,
@@ -549,14 +676,20 @@ def run_analysis(job_id: str):
         )
 
         def finalize_job(job: AnalysisJob) -> None:
-            existing_assets = (job.result or {}).get("assets") or {}
+            existing_result = job.result or {}
+
+            existing_assets = (existing_result.get("assets") or {}) if isinstance(existing_result, dict) else {}
             existing_input = existing_assets.get("input_video")
+
             input_video = existing_input or {
                 "s3_key": input_key,
                 "signed_url": input_signed,
                 "expires_in": expires_seconds,
             }
+
+            # keep existing assets/preview_frames/tracking if already present
             job.result = {
+                **existing_result,
                 "schema_version": "1.1",
                 "summary": {
                     "player_role": role,
@@ -564,17 +697,18 @@ def run_analysis(job_id: str):
                 },
                 "radar": radar,
                 "assets": {
+                    **existing_assets,
                     "input_video": input_video,
                 },
                 "clips": clips_out,
             }
+
             job.status = "COMPLETED"
             set_progress(job, "DONE", 100, "Completed")
 
         update_job(db, job_id, finalize_job)
 
     except Exception as e:
-        # Mark FAILED consistently
         try:
             update_job(
                 db,
