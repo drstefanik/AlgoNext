@@ -1,7 +1,7 @@
 """Ensure analysis_jobs columns are present and aligned.
 
 Revision ID: 20260318_ensure_analysis_job_columns
-Revises: 20260116_add_preview_frames
+Revises: 20260116_widen_alembic_version
 Create Date: 2026-03-18 12:00:00.000000
 """
 
@@ -10,7 +10,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "20260318_ensure_analysis_job_columns"
-down_revision = "20260116_add_preview_frames"
+down_revision = "20260116_widen_alembic_version"
 branch_labels = None
 depends_on = None
 
