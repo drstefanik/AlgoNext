@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import String, DateTime, Text, JSON, func
+from sqlalchemy import String, DateTime, Text, JSON, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -30,7 +31,12 @@ class AnalysisJob(Base):
 
     progress: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    preview_frames: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    preview_frames: Mapped[list] = mapped_column(
+        JSONB,
+        default=list,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
