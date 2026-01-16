@@ -92,7 +92,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["alembic", "upgrade", "head"]
+    command: alembic upgrade head
     restart: "no"
 
   worker:
