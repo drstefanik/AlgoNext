@@ -2,7 +2,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 from app.core.models import Base
 
@@ -39,6 +39,19 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        connection.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                  IF to_regclass('public.alembic_version') IS NOT NULL THEN
+                    ALTER TABLE alembic_version
+                      ALTER COLUMN version_num TYPE VARCHAR(255);
+                  END IF;
+                END$$;
+                """
+            )
+        )
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
