@@ -1,5 +1,10 @@
 import os
+
 from celery import Celery
+
+from app.core.env import load_env
+
+load_env()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 

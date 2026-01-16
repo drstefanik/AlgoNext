@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import boto3
@@ -433,9 +434,9 @@ def get_s3_client(endpoint_url: str):
     return boto3.client(
         "s3",
         endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("S3_REGION", "us-east-1"),
+        aws_access_key_id=os.environ["MINIO_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["MINIO_SECRET_KEY"],
+        region_name=os.environ.get("MINIO_REGION", "us-east-1"),
         config=Config(signature_version="s3v4"),
     )
 
@@ -475,12 +476,62 @@ def upload_file(
             raise
 
 
-def presign_get_url(s3_public, bucket: str, key: str, expires_seconds: int) -> str:
-    return s3_public.generate_presigned_url(
+def _normalize_endpoint(endpoint: str) -> str:
+    return endpoint.rstrip("/")
+
+
+def resolve_public_endpoint(
+    internal_endpoint: str, public_endpoint: str, app_env: str
+) -> str:
+    resolved = public_endpoint.strip()
+    if not resolved:
+        if app_env != "production":
+            resolved = "http://localhost:9000"
+        else:
+            return ""
+
+    internal_normalized = _normalize_endpoint(internal_endpoint)
+    public_normalized = _normalize_endpoint(resolved)
+    if internal_normalized and internal_normalized == public_normalized:
+        raise RuntimeError(
+            "MINIO_PUBLIC_ENDPOINT must differ from MINIO_INTERNAL_ENDPOINT."
+        )
+
+    return resolved
+
+
+def replace_origin(url: str, public_endpoint: str) -> str:
+    parsed_url = urlsplit(url)
+    parsed_public = urlsplit(public_endpoint)
+    if not parsed_public.scheme or not parsed_public.netloc:
+        raise RuntimeError("MINIO_PUBLIC_ENDPOINT must include scheme and host.")
+    return urlunsplit(
+        (
+            parsed_public.scheme,
+            parsed_public.netloc,
+            parsed_url.path,
+            parsed_url.query,
+            parsed_url.fragment,
+        )
+    )
+
+
+def presign_get_url(
+    s3_internal,
+    bucket: str,
+    key: str,
+    expires_seconds: int,
+    public_endpoint: str,
+    app_env: str,
+) -> str:
+    if not public_endpoint:
+        return "Asset link not configured"
+    signed_url = s3_internal.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
+    return replace_origin(signed_url, public_endpoint)
 
 
 # ----------------------------
@@ -495,9 +546,14 @@ def run_analysis(job_id: str):
     skills_missing: List[str] = []
 
     # Env vars (required)
-    S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "").strip()
-    S3_PUBLIC_ENDPOINT_URL = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
-    S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
+    minio_internal_endpoint = os.environ.get("MINIO_INTERNAL_ENDPOINT", "").strip()
+    minio_public_endpoint = os.environ.get("MINIO_PUBLIC_ENDPOINT", "").strip()
+    minio_access_key = os.environ.get("MINIO_ACCESS_KEY", "").strip()
+    minio_secret_key = os.environ.get("MINIO_SECRET_KEY", "").strip()
+    minio_bucket = (
+        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
+    ).strip()
+    app_env = os.environ.get("APP_ENV", "development").lower()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 
     try:
@@ -540,10 +596,19 @@ def run_analysis(job_id: str):
         )
 
         # Preconditions
-        if not S3_ENDPOINT_URL or not S3_PUBLIC_ENDPOINT_URL or not S3_BUCKET:
+        if (
+            not minio_internal_endpoint
+            or not minio_bucket
+            or not minio_access_key
+            or not minio_secret_key
+        ):
             raise RuntimeError(
-                "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, S3_BUCKET"
+                "Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET"
             )
+
+        public_endpoint = resolve_public_endpoint(
+            minio_internal_endpoint, minio_public_endpoint, app_env
+        )
 
         ensure_ffmpeg_available()
 
@@ -558,11 +623,10 @@ def run_analysis(job_id: str):
         clips_dir.mkdir(parents=True, exist_ok=True)
 
         # S3 clients
-        s3_internal = get_s3_client(S3_ENDPOINT_URL)
-        s3_public = get_s3_client(S3_PUBLIC_ENDPOINT_URL)
+        s3_internal = get_s3_client(minio_internal_endpoint)
 
         # Ensure bucket exists
-        ensure_bucket_exists(s3_internal, S3_BUCKET)
+        ensure_bucket_exists(s3_internal, minio_bucket)
 
         # Download
         update_job(
@@ -607,8 +671,11 @@ def run_analysis(job_id: str):
             ),
         )
         input_key = f"jobs/{job_id}/input.mp4"
-        upload_file(s3_internal, S3_BUCKET, input_path, input_key, "video/mp4")
-        input_signed = presign_get_url(s3_public, S3_BUCKET, input_key, expires_seconds)
+        upload_file(s3_internal, minio_bucket, input_path, input_key, "video/mp4")
+        input_signed = presign_get_url(
+            s3_internal, minio_bucket, input_key, expires_seconds, public_endpoint, app_env
+        )
+        input_public_url = input_signed
 
         # Persist input asset into result early (so frontend can show it immediately)
         def store_input_asset(job: AnalysisJob) -> None:
@@ -620,6 +687,7 @@ def run_analysis(job_id: str):
                 "signed_url": input_signed,
                 "expires_in": expires_seconds,
             }
+            assets["input_video_url"] = assets.get("input_video_url") or input_public_url
             job.result = {**existing, "assets": assets}
 
         update_job(db, job_id, store_input_asset)
@@ -671,8 +739,15 @@ def run_analysis(job_id: str):
 
             width, height = probe_image_dimensions(frame_path)
             frame_key = f"jobs/{job_id}/frames/{frame_name}"
-            upload_file(s3_internal, S3_BUCKET, frame_path, frame_key, "image/jpeg")
-            signed_url = presign_get_url(s3_public, S3_BUCKET, frame_key, expires_seconds)
+            upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
+            signed_url = presign_get_url(
+                s3_internal,
+                minio_bucket,
+                frame_key,
+                expires_seconds,
+                public_endpoint,
+                app_env,
+            )
 
             preview_frames.append(
                 {
@@ -790,9 +865,14 @@ def run_analysis(job_id: str):
         for i, c in enumerate(extracted, start=1):
             clip_path: Path = c["file"]
             clip_key = f"jobs/{job_id}/clips/{clip_path.name}"
-            upload_file(s3_internal, S3_BUCKET, clip_path, clip_key, "video/mp4")
+            upload_file(s3_internal, minio_bucket, clip_path, clip_key, "video/mp4")
             clip_signed = presign_get_url(
-                s3_public, S3_BUCKET, clip_key, expires_seconds
+                s3_internal,
+                minio_bucket,
+                clip_key,
+                expires_seconds,
+                public_endpoint,
+                app_env,
             )
             clips_out.append(
                 {
@@ -801,6 +881,7 @@ def run_analysis(job_id: str):
                     "end": c["end"],
                     "s3_key": clip_key,
                     "signed_url": clip_signed,
+                    "url": clip_signed,
                     "expires_in": expires_seconds,
                 }
             )
@@ -838,7 +919,11 @@ def run_analysis(job_id: str):
         def finalize_job(job: AnalysisJob) -> None:
             existing_result = job.result or {}
 
-            existing_assets = (existing_result.get("assets") or {}) if isinstance(existing_result, dict) else {}
+            existing_assets = (
+                (existing_result.get("assets") or {})
+                if isinstance(existing_result, dict)
+                else {}
+            )
             existing_input = existing_assets.get("input_video")
 
             input_video = existing_input or {
@@ -846,6 +931,11 @@ def run_analysis(job_id: str):
                 "signed_url": input_signed,
                 "expires_in": expires_seconds,
             }
+            existing_input_url = existing_assets.get("input_video_url") or input_public_url
+            clip_assets = [
+                {"start": clip["start"], "end": clip["end"], "url": clip["url"]}
+                for clip in clips_out
+            ]
 
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
@@ -862,6 +952,8 @@ def run_analysis(job_id: str):
                 "assets": {
                     **existing_assets,
                     "input_video": input_video,
+                    "input_video_url": existing_input_url,
+                    "clips": clip_assets,
                 },
                 "clips": clips_out,
             }
