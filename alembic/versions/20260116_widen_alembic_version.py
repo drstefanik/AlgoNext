@@ -1,7 +1,7 @@
 from alembic import op
 
 revision = "20260116_widen_alembic_version"
-down_revision = None
+down_revision = "20260116_add_preview_frames"
 branch_labels = None
 depends_on = None
 
