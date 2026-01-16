@@ -41,15 +41,8 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         connection.execute(
             text(
-                """
-                DO $$
-                BEGIN
-                  IF to_regclass('public.alembic_version') IS NOT NULL THEN
-                    ALTER TABLE alembic_version
-                      ALTER COLUMN version_num TYPE VARCHAR(255);
-                  END IF;
-                END$$;
-                """
+                "ALTER TABLE IF EXISTS alembic_version "
+                "ALTER COLUMN version_num TYPE VARCHAR(255);"
             )
         )
         context.configure(
