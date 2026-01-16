@@ -22,5 +22,8 @@ jobs:
             set -e
             cd /opt/AlgoNext
             git pull
-            docker compose down
-            docker compose up -d --build
+            docker compose pull
+            docker compose build
+            docker compose up -d db redis minio createbuckets
+            docker compose run --rm migrate
+            docker compose up -d --force-recreate api worker
