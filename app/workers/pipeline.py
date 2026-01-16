@@ -542,6 +542,121 @@ def presign_get_url(
 # ----------------------------
 # Celery task
 # ----------------------------
+@celery.task(name="app.workers.pipeline.extract_preview_frames")
+def extract_preview_frames(job_id: str) -> None:
+    db: Session = SessionLocal()
+    base_dir: Optional[Path] = None
+
+    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
+
+    try:
+        job = reload_job(db, job_id)
+        if not job:
+            return
+
+        existing = job.result or {}
+        if isinstance(existing, dict) and existing.get("preview_frames"):
+            return
+
+        if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
+            raise RuntimeError(
+                "Missing S3 env vars: S3_ENDPOINT_URL, S3_ACCESS_KEY, "
+                "S3_SECRET_KEY, S3_BUCKET"
+            )
+
+        ensure_ffmpeg_available()
+
+        base_dir = Path("/tmp/fnh_jobs_previews") / job_id
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = base_dir / "input.mp4"
+        frames_dir = base_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        s3_internal = get_s3_client(s3_endpoint_url)
+        ensure_bucket_exists(s3_internal, s3_bucket)
+
+        download_video(job.video_url, input_path)
+
+        video_meta = probe_video_meta(input_path) or {}
+        duration = get_duration_seconds(video_meta)
+
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+        preview_count = max(1, min(12, preview_count))
+
+        if duration and duration > 0:
+            step = duration / (preview_count + 1)
+            timestamps = [round(step * (i + 1), 3) for i in range(preview_count)]
+        else:
+            timestamps = [i * 10 for i in range(preview_count)]
+
+        preview_frames: List[Dict[str, Any]] = []
+        for index, timestamp in enumerate(timestamps, start=1):
+            frame_name = f"frame_{index:04d}.jpg"
+            frame_path = frames_dir / frame_name
+
+            try:
+                _run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        str(timestamp),
+                        "-i",
+                        str(input_path),
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "2",
+                        str(frame_path),
+                    ]
+                )
+            except Exception:
+                break
+
+            width, height = probe_image_dimensions(frame_path)
+            frame_key = f"jobs/{job_id}/frames/{frame_name}"
+            upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
+            preview_frames.append(
+                {
+                    "time_sec": timestamp,
+                    "bucket": s3_bucket,
+                    "key": frame_key,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+        if preview_frames:
+            update_job(
+                db,
+                job_id,
+                lambda job: setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "preview_frames": preview_frames,
+                    },
+                ),
+            )
+            logger.info("Preview frames generated for job %s", job_id)
+    except Exception:
+        logger.exception("Failed to generate preview frames for job %s", job_id)
+    finally:
+        if base_dir is not None and base_dir.exists():
+            try:
+                shutil.rmtree(base_dir)
+            except Exception:
+                pass
+        db.close()
+
+
 @celery.task(name="app.workers.pipeline.run_analysis")
 def run_analysis(job_id: str):
     db: Session = SessionLocal()
