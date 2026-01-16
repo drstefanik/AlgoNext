@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
+from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.schemas import JobCreate, JobOut
@@ -57,23 +58,27 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str, db: Session = Depends(get_db)):
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def get_job(job_id: str):
+    db: Session = SessionLocal()
+    try:
+        job = db.get(AnalysisJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
 
-    return {
-        "id": job.id,
-        "status": normalize_status(job.status),
-        "category": job.category,
-        "role": job.role,
-        "video_url": job.video_url,
-        "progress": normalize_payload(job.progress),
-        "result": normalize_payload(job.result),
-        "error": job.error,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-    }
+        return {
+            "id": job.id,
+            "status": normalize_status(job.status),
+            "category": job.category,
+            "role": job.role,
+            "video_url": job.video_url,
+            "progress": normalize_payload(job.progress),
+            "result": normalize_payload(job.result),
+            "error": job.error,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        }
+    finally:
+        db.close()
 
 
 # ✅ endpoint leggero per polling

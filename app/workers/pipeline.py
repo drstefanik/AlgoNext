@@ -6,7 +6,7 @@ import subprocess
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 import boto3
@@ -92,6 +92,19 @@ def safe_commit(db: Session) -> None:
         raise
 
 
+def reload_job(db: Session, job_id: str) -> Optional[AnalysisJob]:
+    return db.get(AnalysisJob, job_id)
+
+
+def update_job(db: Session, job_id: str, updater: Callable[[AnalysisJob], None]) -> bool:
+    job = reload_job(db, job_id)
+    if not job:
+        return False
+    updater(job)
+    safe_commit(db)
+    return True
+
+
 def set_progress(job: AnalysisJob, step: str, pct: int, message: str = "") -> None:
     pct = max(0, min(100, int(pct)))
     job.progress = {
@@ -142,11 +155,15 @@ def ensure_ffmpeg_available() -> None:
     _run(["ffprobe", "-version"])
 
 
-def download_video(url: str, dst_path: Path) -> None:
+def download_video(
+    url: str, dst_path: Path, progress_callback: Optional[Callable[[], None]] = None
+) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     log_every_bytes = 100 * 1024 * 1024
     bytes_downloaded = 0
     next_log_bytes = log_every_bytes
+    last_progress_tick = time.monotonic()
+    progress_tick_seconds = 5
     with requests.get(
         url,
         stream=True,
@@ -159,6 +176,13 @@ def download_video(url: str, dst_path: Path) -> None:
                 if chunk:
                     f.write(chunk)
                     bytes_downloaded += len(chunk)
+                    now = time.monotonic()
+                    if (
+                        progress_callback is not None
+                        and now - last_progress_tick >= progress_tick_seconds
+                    ):
+                        last_progress_tick = now
+                        progress_callback()
                     if bytes_downloaded >= next_log_bytes:
                         mb_downloaded = bytes_downloaded / (1024 * 1024)
                         logger.info("Downloaded %.1f MB from %s", mb_downloaded, url)
@@ -311,7 +335,6 @@ def presign_get_url(s3_public, bucket: str, key: str, expires_seconds: int) -> s
 @celery.task(name="app.workers.pipeline.run_analysis")
 def run_analysis(job_id: str):
     db: Session = SessionLocal()
-    job: Optional[AnalysisJob] = None
     base_dir: Optional[Path] = None
 
     # Env vars (required)
@@ -321,15 +344,22 @@ def run_analysis(job_id: str):
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 
     try:
-        job = db.get(AnalysisJob, job_id)
+        job = reload_job(db, job_id)
         if not job:
             return
+        video_url = job.video_url
+        role = job.role
 
         # RUNNING
-        job.status = "RUNNING"
-        job.error = None
-        set_progress(job, "STARTING", 1, "Job started")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: (
+                setattr(job, "status", "RUNNING"),
+                setattr(job, "error", None),
+                set_progress(job, "STARTING", 1, "Job started"),
+            ),
+        )
 
         # Preconditions
         if not S3_ENDPOINT_URL or not S3_PUBLIC_ENDPOINT_URL or not S3_BUCKET:
@@ -357,32 +387,66 @@ def run_analysis(job_id: str):
         ensure_bucket_exists(s3_internal, S3_BUCKET)
 
         # Download
-        set_progress(job, "DOWNLOADING", 10, "Downloading video")
-        safe_commit(db)
-        download_video(job.video_url, input_path)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(job, "DOWNLOADING", 10, "Downloading video"),
+        )
+        download_pct = 10
+
+        def download_progress_tick() -> None:
+            nonlocal download_pct
+            if download_pct >= 18:
+                return
+            download_pct = min(18, download_pct + 5)
+            update_job(
+                db,
+                job_id,
+                lambda job: set_progress(
+                    job, "DOWNLOADING", download_pct, "Downloading video"
+                ),
+            )
+
+        download_video(video_url, input_path, progress_callback=download_progress_tick)
 
         # Probe meta
-        set_progress(job, "PROBING", 20, "Probing video metadata")
-        safe_commit(db)
-        job.video_meta = probe_video_meta(input_path) or {}
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(job, "PROBING", 20, "Probing video metadata"),
+        )
+        video_meta = probe_video_meta(input_path) or {}
+        update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
 
         # Upload input
-        set_progress(job, "UPLOADING_INPUT", 30, "Uploading input video to storage")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "UPLOADING_INPUT", 30, "Uploading input video to storage"
+            ),
+        )
         input_key = f"jobs/{job_id}/input.mp4"
         upload_file(s3_internal, S3_BUCKET, input_path, input_key, "video/mp4")
 
         input_signed = presign_get_url(s3_public, S3_BUCKET, input_key, expires_seconds)
 
         # Extract clips
-        set_progress(job, "EXTRACTING", 55, "Extracting clips")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(job, "EXTRACTING", 55, "Extracting clips"),
+        )
         extracted = extract_clips(input_path, clips_dir)
 
         # Upload clips + signed
-        set_progress(job, "UPLOADING_CLIPS", 75, "Uploading clips to storage")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "UPLOADING_CLIPS", 75, "Uploading clips to storage"
+            ),
+        )
 
         clips_out: List[Dict] = []
         for i, c in enumerate(extracted, start=1):
@@ -402,8 +466,11 @@ def run_analysis(job_id: str):
             )
 
         # Mock analysis output (replace with real pipeline)
-        set_progress(job, "ANALYZING", 85, "Running analysis")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(job, "ANALYZING", 85, "Running analysis"),
+        )
         time.sleep(0.2)
 
         radar = {
@@ -414,46 +481,52 @@ def run_analysis(job_id: str):
             "Off-the-ball Movement": 80,
             "Shot Power": 74,
         }
-        overall = weighted_overall_score(radar, job.role)
+        overall = weighted_overall_score(radar, role)
 
         # Final result (SIGNED URLs)
-        set_progress(job, "FINALIZING", 95, "Saving results")
-        safe_commit(db)
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(job, "FINALIZING", 95, "Saving results"),
+        )
 
-        job.result = {
-            "schema_version": "1.1",
-            "summary": {
-                "player_role": job.role,
-                "overall_score": overall,
-            },
-            "radar": radar,
-            "assets": {
-                "input_video": {
-                    "s3_key": input_key,
-                    "signed_url": input_signed,
-                    "expires_in": expires_seconds,
-                }
-            },
-            "clips": clips_out,
-        }
+        def finalize_job(job: AnalysisJob) -> None:
+            job.result = {
+                "schema_version": "1.1",
+                "summary": {
+                    "player_role": role,
+                    "overall_score": overall,
+                },
+                "radar": radar,
+                "assets": {
+                    "input_video": {
+                        "s3_key": input_key,
+                        "signed_url": input_signed,
+                        "expires_in": expires_seconds,
+                    }
+                },
+                "clips": clips_out,
+            }
+            job.status = "COMPLETED"
+            set_progress(job, "DONE", 100, "Completed")
 
-        job.status = "COMPLETED"
-        set_progress(job, "DONE", 100, "Completed")
-        safe_commit(db)
+        update_job(db, job_id, finalize_job)
 
     except Exception as e:
         # Mark FAILED consistently
         try:
-            if job is None:
-                job = db.get(AnalysisJob, job_id)
-            if job is not None:
-                job.status = "FAILED"
-                job.error = str(e)
-                set_progress(job, "FAILED", 100, f"Failed: {str(e)}")
-                safe_commit(db)
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "error", str(e)),
+                    set_progress(job, "FAILED", 100, f"Failed: {str(e)}"),
+                ),
+            )
         except Exception:
             db.rollback()
-        raise
+        return
     finally:
         if base_dir is not None and base_dir.exists():
             try:
