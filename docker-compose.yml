@@ -1,3 +1,19 @@
+version: "3.9"
+
+x-minio-env: &minio_env
+  # Endpoint interno: rete docker
+  MINIO_INTERNAL_ENDPOINT: http://minio:9000
+
+  # Endpoint pubblico: quello che il BROWSER deve poter raggiungere
+  # Cambia questo valore se l'IP/dominio è diverso
+  MINIO_PUBLIC_ENDPOINT: http://46.224.249.136:9000
+
+  MINIO_ACCESS_KEY: minioadmin
+  MINIO_SECRET_KEY: minioadmin
+  MINIO_BUCKET: fnh
+  MINIO_REGION: us-east-1
+  SIGNED_URL_EXPIRES_SECONDS: 3600
+
 services:
   db:
     image: postgres:16
@@ -32,12 +48,12 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console
+      - "9000:9000"   # S3 API (USATO PER VIDEO/CLIP/FRAME)
+      - "9001:9001"   # Console (SOLO UI)
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -50,13 +66,12 @@ services:
       minio:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
       MINIO_BUCKET: fnh
+      # mc supporta MC_HOST_<alias>=http://user:pass@host:port
+      MC_HOST_local: http://minioadmin:minioadmin@minio:9000
     entrypoint: ["/bin/sh", "-lc"]
     command: >
       "
-      mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
       mc mb -p local/$MINIO_BUCKET || true
       "
     restart: "no"
@@ -70,21 +85,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-
-      # MinIO / S3 (stesse env del worker)
-      # MINIO_INTERNAL_ENDPOINT: usato da API/worker per upload/download (rete docker)
-      MINIO_INTERNAL_ENDPOINT: http://minio:9000
-      # MINIO_PUBLIC_ENDPOINT: usato SOLO per link cliccabili dal browser
-      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: fnh
-      MINIO_REGION: us-east-1
-      SIGNED_URL_EXPIRES_SECONDS: 3600
-
-      # VPS example (non usare localhost):
-      # MINIO_INTERNAL_ENDPOINT=http://minio:9000
-      # MINIO_PUBLIC_ENDPOINT=http://46.224.249.136:9000
+      <<: *minio_env
     depends_on:
       db:
         condition: service_healthy
@@ -98,7 +99,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\"",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\"",
         ]
       interval: 5s
       timeout: 3s
@@ -113,21 +114,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-
-      # MinIO / S3 (PRIVATE + signed URLs)
-      # MINIO_INTERNAL_ENDPOINT: usato da API/worker per upload/download (rete docker)
-      MINIO_INTERNAL_ENDPOINT: http://minio:9000
-      # MINIO_PUBLIC_ENDPOINT: usato SOLO per link cliccabili dal browser
-      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: fnh
-      MINIO_REGION: us-east-1
-      SIGNED_URL_EXPIRES_SECONDS: 3600
-
-      # VPS example (non usare localhost):
-      # MINIO_INTERNAL_ENDPOINT=http://minio:9000
-      # MINIO_PUBLIC_ENDPOINT=http://46.224.249.136:9000
+      <<: *minio_env
     depends_on:
       db:
         condition: service_healthy
