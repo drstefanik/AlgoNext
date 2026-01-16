@@ -68,6 +68,14 @@ def mask_database_url(url: str) -> str:
 @app.on_event("startup")
 def fail_fast_db_check():
     logger.info("DATABASE_URL: %s", mask_database_url(DATABASE_URL))
+    logger.info(
+        "MINIO_INTERNAL_ENDPOINT = %s",
+        os.environ.get("MINIO_INTERNAL_ENDPOINT"),
+    )
+    logger.info(
+        "MINIO_PUBLIC_ENDPOINT = %s",
+        os.environ.get("MINIO_PUBLIC_ENDPOINT"),
+    )
     session = SessionLocal()
     try:
         session.execute(text("SELECT 1"))
