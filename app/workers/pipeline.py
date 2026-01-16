@@ -21,6 +21,10 @@ from app.core.models import AnalysisJob
 logger = logging.getLogger(__name__)
 
 
+class AnalysisError(RuntimeError):
+    pass
+
+
 # ----------------------------
 # Role weights (v1)
 # ----------------------------
@@ -150,6 +154,10 @@ def _run(cmd: List[str]) -> str:
     return (res.stdout or "").strip()
 
 
+def _run_json(cmd: List[str]) -> Dict[str, Any]:
+    return json.loads(_run(cmd))
+
+
 def ensure_ffmpeg_available() -> None:
     _run(["ffmpeg", "-version"])
     _run(["ffprobe", "-version"])
@@ -244,6 +252,117 @@ def get_duration_seconds(meta: Dict) -> Optional[float]:
         return float(duration)
     except (TypeError, ValueError):
         return None
+
+
+def probe_frame_count(path: Path) -> int:
+    data = _run_json(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames,nb_frames",
+            "-print_format",
+            "json",
+            str(path),
+        ]
+    )
+    streams = data.get("streams") or []
+    if not streams:
+        raise AnalysisError("Unable to read video stream for frame count")
+    frames = streams[0].get("nb_read_frames") or streams[0].get("nb_frames")
+    if frames is None:
+        raise AnalysisError("Unable to count frames in video stream")
+    return int(frames)
+
+
+def probe_scene_change_count(path: Path, threshold: float = 0.3) -> int:
+    data = _run_json(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"movie={path.as_posix()},select='gt(scene,{threshold})'",
+            "-show_entries",
+            "frame=pkt_pts_time",
+            "-print_format",
+            "json",
+        ]
+    )
+    frames = data.get("frames")
+    if frames is None:
+        raise AnalysisError("Unable to detect scene changes in video")
+    return len(frames)
+
+
+def extract_video_features(path: Path, meta: Dict) -> Dict[str, Any]:
+    duration = get_duration_seconds(meta)
+    if not duration or duration <= 0:
+        raise AnalysisError("Insufficient video signal to compute score")
+
+    frame_count = probe_frame_count(path)
+    if frame_count <= 0:
+        raise AnalysisError("Insufficient video signal to compute score")
+
+    scene_change_count = probe_scene_change_count(path)
+    scene_change_rate = scene_change_count / max(duration, 1.0)
+    fps = frame_count / max(duration, 1.0)
+
+    return {
+        "duration_seconds": duration,
+        "frame_count": frame_count,
+        "fps": round(fps, 2),
+        "scene_change_count": scene_change_count,
+        "scene_change_rate": round(scene_change_rate, 4),
+    }
+
+
+def _score_value(base: float, activity_score: float, scene_bonus: float) -> int:
+    raw = base + (activity_score * 45.0) + scene_bonus
+    return int(round(max(0.0, min(100.0, raw))))
+
+
+def compute_skill_scores(
+    features: Dict[str, Any],
+) -> Tuple[Dict[str, Optional[int]], List[str]]:
+    scene_change_count = features.get("scene_change_count")
+    scene_change_rate = features.get("scene_change_rate")
+    if scene_change_count is None or scene_change_rate is None:
+        raise AnalysisError("Insufficient video signal to compute score")
+
+    if scene_change_count < 1:
+        raise AnalysisError("Insufficient video signal to compute score")
+
+    activity_score = min(1.0, float(scene_change_rate) / 0.25)
+    scene_bonus = min(float(scene_change_count), 10.0) * 2.0
+
+    skills: Dict[str, Optional[int]] = {}
+    missing: List[str] = []
+
+    def add_skill(name: str, condition: bool, base: float) -> None:
+        if not condition:
+            skills[name] = None
+            missing.append(name)
+            return
+        skills[name] = _score_value(base, activity_score, scene_bonus)
+
+    add_skill("Finishing", scene_change_count >= 2, 34.0)
+    add_skill("Shot Power", scene_change_count >= 2, 32.0)
+    add_skill("Heading", scene_change_count >= 3, 30.0)
+    add_skill("Positioning", scene_change_rate >= 0.03, 38.0)
+    add_skill("Off-the-ball Movement", scene_change_rate >= 0.04, 36.0)
+    add_skill("Composure", scene_change_rate >= 0.015, 40.0)
+
+    if all(value is None for value in skills.values()):
+        raise AnalysisError("Insufficient video signal to compute score")
+
+    return skills, missing
 
 
 def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
@@ -371,6 +490,9 @@ def presign_get_url(s3_public, bucket: str, key: str, expires_seconds: int) -> s
 def run_analysis(job_id: str):
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
+    video_features: Optional[Dict[str, Any]] = None
+    skills_computed: Dict[str, Optional[int]] = {}
+    skills_missing: List[str] = []
 
     # Env vars (required)
     S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "").strip()
@@ -385,6 +507,7 @@ def run_analysis(job_id: str):
 
         video_url = job.video_url
         role = job.role
+        category = job.category
 
         selections = (job.target or {}).get("selections") or []
         if len(selections) < 1:
@@ -411,6 +534,7 @@ def run_analysis(job_id: str):
             lambda job: (
                 setattr(job, "status", "RUNNING"),
                 setattr(job, "error", None),
+                setattr(job, "failure_reason", None),
                 set_progress(job, "STARTING", 1, "Job started"),
             ),
         )
@@ -470,6 +594,8 @@ def run_analysis(job_id: str):
             lambda job: set_progress(job, "PROBING", 20, "Probing video metadata"),
         )
         video_meta = probe_video_meta(input_path) or {}
+        if not video_meta:
+            raise AnalysisError("Insufficient video signal to compute score")
         update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
 
         # Upload input (so UI can always access it, even if we pause)
@@ -614,6 +740,35 @@ def run_analysis(job_id: str):
             ),
         )
 
+        # Extract visual features for scoring
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "EXTRACTING_FEATURES", 50, "Extracting visual features"
+            ),
+        )
+        video_features = extract_video_features(input_path, video_meta)
+        logger.info(
+            "VIDEO_FEATURES_USED",
+            extra={
+                "frames_analyzed": video_features.get("frame_count"),
+                "features": video_features,
+            },
+        )
+        update_job(
+            db,
+            job_id,
+            lambda job: setattr(
+                job,
+                "result",
+                {
+                    **(job.result or {}),
+                    "raw_video_features": video_features,
+                },
+            ),
+        )
+
         # Extract clips
         update_job(
             db,
@@ -650,22 +805,27 @@ def run_analysis(job_id: str):
                 }
             )
 
-        # Mock analysis output (replace with real pipeline)
+        # Analysis output from visual features
         update_job(
             db,
             job_id,
             lambda job: set_progress(job, "ANALYZING", 85, "Running analysis"),
         )
-        time.sleep(0.2)
+        if video_features is None:
+            raise AnalysisError("Insufficient video signal to compute score")
 
-        radar = {
-            "Finishing": 72,
-            "Heading": 65,
-            "Positioning": 78,
-            "Composure": 70,
-            "Off-the-ball Movement": 80,
-            "Shot Power": 74,
-        }
+        logger.info(
+            "SCORE_INPUTS",
+            extra={
+                "role": role,
+                "category": category,
+                "video_features_present": True,
+                "video_features": video_features,
+            },
+        )
+
+        skills_computed, skills_missing = compute_skill_scores(video_features)
+        radar = {k: v for k, v in skills_computed.items() if v is not None}
         overall = weighted_overall_score(radar, role)
 
         # Final result
@@ -690,12 +850,15 @@ def run_analysis(job_id: str):
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
                 **existing_result,
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "summary": {
                     "player_role": role,
                     "overall_score": overall,
                 },
                 "radar": radar,
+                "raw_video_features": video_features,
+                "skills_computed": skills_computed,
+                "skills_missing": skills_missing,
                 "assets": {
                     **existing_assets,
                     "input_video": input_video,
@@ -704,10 +867,26 @@ def run_analysis(job_id: str):
             }
 
             job.status = "COMPLETED"
+            job.failure_reason = None
             set_progress(job, "DONE", 100, "Completed")
 
         update_job(db, job_id, finalize_job)
 
+    except AnalysisError as e:
+        try:
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "error", str(e)),
+                    setattr(job, "failure_reason", "insufficient_visual_signal"),
+                    set_progress(job, "FAILED", 100, f"Failed: {str(e)}"),
+                ),
+            )
+        except Exception:
+            db.rollback()
+        return
     except Exception as e:
         try:
             update_job(
