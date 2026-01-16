@@ -280,9 +280,16 @@ def get_job(job_id: str):
             raise HTTPException(status_code=404, detail="Job not found")
 
         result_payload = normalize_payload(job.result)
-        if result_payload:
+        preview_frames = job.preview_frames or []
+        context = None
+        if result_payload or preview_frames:
             context = load_s3_context()
+        if result_payload:
             result_payload = attach_presigned_urls(result_payload, context)
+        if preview_frames:
+            preview_frames = attach_presigned_urls(
+                {"preview_frames": preview_frames}, context
+            ).get("preview_frames", preview_frames)
 
         return {
             "id": job.id,
@@ -290,6 +297,7 @@ def get_job(job_id: str):
             "category": job.category,
             "role": job.role,
             "video_url": job.video_url,
+            "preview_frames": preview_frames,
             "progress": normalize_payload(job.progress),
             "result": result_payload,
             "error": job.error,

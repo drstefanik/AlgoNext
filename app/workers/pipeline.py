@@ -557,8 +557,7 @@ def extract_preview_frames(job_id: str) -> None:
         if not job:
             return
 
-        existing = job.result or {}
-        if isinstance(existing, dict) and existing.get("preview_frames"):
+        if job.preview_frames:
             return
 
         if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
@@ -566,6 +565,14 @@ def extract_preview_frames(job_id: str) -> None:
                 "Missing S3 env vars: S3_ENDPOINT_URL, S3_ACCESS_KEY, "
                 "S3_SECRET_KEY, S3_BUCKET"
             )
+
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "EXTRACTING_PREVIEWS", 15, "Extracting preview frames"
+            ),
+        )
 
         ensure_ffmpeg_available()
 
@@ -636,13 +643,9 @@ def extract_preview_frames(job_id: str) -> None:
             update_job(
                 db,
                 job_id,
-                lambda job: setattr(
-                    job,
-                    "result",
-                    {
-                        **(job.result or {}),
-                        "preview_frames": preview_frames,
-                    },
+                lambda job: (
+                    setattr(job, "preview_frames", preview_frames),
+                    set_progress(job, "PREVIEWS_READY", 20, "Preview frames ready"),
                 ),
             )
             logger.info("Preview frames generated for job %s", job_id)
@@ -840,11 +843,11 @@ def run_analysis(job_id: str):
 
             width, height = probe_image_dimensions(frame_path)
             frame_key = f"jobs/{job_id}/frames/{frame_name}"
-            upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
+            upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
             preview_frames.append(
                 {
                     "time_sec": timestamp,
-                    "bucket": minio_bucket,
+                    "bucket": s3_bucket,
                     "key": frame_key,
                     "width": width,
                     "height": height,
@@ -855,13 +858,9 @@ def run_analysis(job_id: str):
             update_job(
                 db,
                 job_id,
-                lambda job: setattr(
-                    job,
-                    "result",
-                    {
-                        **(job.result or {}),
-                        "preview_frames": preview_frames,
-                    },
+                lambda job: (
+                    setattr(job, "preview_frames", preview_frames),
+                    set_progress(job, "PREVIEWS_READY", 30, "Preview frames ready"),
                 ),
             )
 
@@ -957,13 +956,13 @@ def run_analysis(job_id: str):
         for i, c in enumerate(extracted, start=1):
             clip_path: Path = c["file"]
             clip_key = f"jobs/{job_id}/clips/{clip_path.name}"
-            upload_file(s3_internal, minio_bucket, clip_path, clip_key, "video/mp4")
+            upload_file(s3_internal, s3_bucket, clip_path, clip_key, "video/mp4")
             clips_out.append(
                 {
                     "index": i,
                     "start": c["start"],
                     "end": c["end"],
-                    "bucket": minio_bucket,
+                    "bucket": s3_bucket,
                     "key": clip_key,
                 }
             )
@@ -1012,7 +1011,7 @@ def run_analysis(job_id: str):
                 if key not in ("input_video_url",)
             }
             input_video = {
-                "bucket": minio_bucket,
+                "bucket": s3_bucket,
                 "key": input_key,
             }
             clip_assets = [
