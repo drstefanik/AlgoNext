@@ -61,7 +61,9 @@ services:
     restart: "no"
 
   api:
-    build: .
+    build:
+      context: .
+      target: api
     ports:
       - "8000:8000"
     env_file:
@@ -84,7 +86,9 @@ services:
     restart: unless-stopped
 
   migrate:
-    build: .
+    build:
+      context: .
+      target: migrate
     env_file:
       - .env
     environment:
@@ -96,7 +100,9 @@ services:
     restart: "no"
 
   worker:
-    build: .
+    build:
+      context: .
+      target: worker
     env_file:
       - .env
     environment:
