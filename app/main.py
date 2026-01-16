@@ -9,8 +9,11 @@ from sqlalchemy.engine.url import make_url
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from app.core.env import load_env
 from app.core.db import Base, SessionLocal, engine, DATABASE_URL
 from app.api import router as api_router
+
+load_env()
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 DOCS_URL = None if APP_ENV == "production" else "/docs"

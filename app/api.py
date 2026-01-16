@@ -21,6 +21,7 @@ from app.workers.pipeline import (
     ensure_bucket_exists,
     get_s3_client,
     presign_get_url,
+    resolve_public_endpoint,
     upload_file,
 )
 
@@ -307,16 +308,30 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    s3_endpoint_url = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
-    s3_public_endpoint_url = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
-    s3_bucket = (os.environ.get("S3_BUCKET") or "").strip()
+    minio_internal_endpoint = (os.environ.get("MINIO_INTERNAL_ENDPOINT") or "").strip()
+    minio_public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
+    minio_access_key = (os.environ.get("MINIO_ACCESS_KEY") or "").strip()
+    minio_secret_key = (os.environ.get("MINIO_SECRET_KEY") or "").strip()
+    minio_bucket = (
+        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
+    ).strip()
+    app_env = os.environ.get("APP_ENV", "development").lower()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 
-    if not s3_endpoint_url or not s3_public_endpoint_url or not s3_bucket:
+    if (
+        not minio_internal_endpoint
+        or not minio_access_key
+        or not minio_secret_key
+        or not minio_bucket
+    ):
         raise HTTPException(
             status_code=500,
-            detail="Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, S3_BUCKET",
+            detail="Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET",
         )
+
+    public_endpoint = resolve_public_endpoint(
+        minio_internal_endpoint, minio_public_endpoint, app_env
+    )
 
     ensure_ffmpeg_available()
 
@@ -336,9 +351,8 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
 
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    s3_internal = get_s3_client(s3_endpoint_url)
-    s3_public = get_s3_client(s3_public_endpoint_url)
-    ensure_bucket_exists(s3_internal, s3_bucket)
+    s3_internal = get_s3_client(minio_internal_endpoint)
+    ensure_bucket_exists(s3_internal, minio_bucket)
 
     frames: List[Dict[str, Any]] = []
     for index, timestamp in enumerate(timestamps, start=1):
@@ -366,8 +380,15 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
 
         width, height = probe_image_dimensions(frame_path)
         frame_key = f"jobs/{job_id}/frames/{frame_name}"
-        upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
-        signed_url = presign_get_url(s3_public, s3_bucket, frame_key, expires_seconds)
+        upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
+        signed_url = presign_get_url(
+            s3_internal,
+            minio_bucket,
+            frame_key,
+            expires_seconds,
+            public_endpoint,
+            app_env,
+        )
         frames.append(
             {
                 "index": index,

@@ -10,3 +10,4 @@ python-multipart==0.0.21
 requests>=2.31.0
 boto3==1.34.162
 botocore==1.34.162
+python-dotenv==1.0.1
