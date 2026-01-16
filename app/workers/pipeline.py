@@ -350,6 +350,24 @@ def run_analysis(job_id: str):
         video_url = job.video_url
         role = job.role
 
+        selections = (job.target or {}).get("selections") or []
+        if len(selections) < 2:
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "error", "PLAYER_SELECTION_REQUIRED"),
+                    set_progress(
+                        job,
+                        "FAILED",
+                        100,
+                        "Failed: PLAYER_SELECTION_REQUIRED",
+                    ),
+                ),
+            )
+            return
+
         # RUNNING
         update_job(
             db,
@@ -417,6 +435,26 @@ def run_analysis(job_id: str):
         )
         video_meta = probe_video_meta(input_path) or {}
         update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
+
+        update_job(
+            db,
+            job_id,
+            lambda job: (
+                set_progress(job, "TRACKING", 40, "Tracking selected player"),
+                setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "tracking": {
+                            "method": "stub",
+                            "selected_boxes": len(selections),
+                            "notes": "tracking not implemented yet",
+                        },
+                    },
+                ),
+            ),
+        )
 
         # Upload input
         update_job(
