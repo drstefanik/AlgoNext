@@ -30,6 +30,7 @@ class AnalysisJob(Base):
 
     progress: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    preview_frames: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
