@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
+from app.core.normalizers import normalize_failure_reason
 from app.schemas import JobCreate, JobOut, PlayerRefPayload, SelectionPayload
 from app.workers.pipeline import run_analysis
 from app.workers.pipeline import (
@@ -258,7 +259,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
         error=None,
-        failure_reason=None,
+        failure_reason=normalize_failure_reason(None),
     )
 
     db.add(job)
