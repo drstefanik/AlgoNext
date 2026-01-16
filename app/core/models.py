@@ -13,7 +13,7 @@ class AnalysisJob(Base):
 
     status: Mapped[str] = mapped_column(
         String,
-        default="WAITING_FOR_ANCHOR",
+        default="WAITING_FOR_SELECTION",
         nullable=False,
     )
 
