@@ -27,6 +27,7 @@ router = APIRouter()
 
 POLLING_SAFE_STATUSES = {
     "WAITING_FOR_SELECTION",
+    "WAITING_FOR_PLAYER",
     "CREATED",
     "QUEUED",
     "RUNNING",
@@ -356,7 +357,7 @@ def enqueue_job(job_id: str, db: Session = Depends(get_db)):
     if job.status in ["QUEUED", "RUNNING", "COMPLETED", "FAILED"]:
         return JobOut(job_id=job.id, status=job.status)
 
-    if job.status not in ["WAITING_FOR_SELECTION", "CREATED"]:
+    if job.status not in ["WAITING_FOR_SELECTION", "CREATED", "WAITING_FOR_PLAYER"]:
         raise HTTPException(status_code=400, detail="Job not enqueueable")
 
     selections = (job.target or {}).get("selections") or []

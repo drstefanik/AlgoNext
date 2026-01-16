@@ -436,6 +436,39 @@ def run_analysis(job_id: str):
         video_meta = probe_video_meta(input_path) or {}
         update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
 
+        # Upload input
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "UPLOADING_INPUT", 30, "Uploading input video to storage"
+            ),
+        )
+        input_key = f"jobs/{job_id}/input.mp4"
+        upload_file(s3_internal, S3_BUCKET, input_path, input_key, "video/mp4")
+
+        input_signed = presign_get_url(s3_public, S3_BUCKET, input_key, expires_seconds)
+
+        job = reload_job(db, job_id)
+        if not job:
+            return
+        if not (job.player_ref or "").strip():
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "WAITING_FOR_PLAYER"),
+                    setattr(job, "error", None),
+                    set_progress(
+                        job,
+                        "WAITING_FOR_PLAYER",
+                        30,
+                        "Waiting for player reference",
+                    ),
+                ),
+            )
+            return
+
         update_job(
             db,
             job_id,
@@ -455,19 +488,6 @@ def run_analysis(job_id: str):
                 ),
             ),
         )
-
-        # Upload input
-        update_job(
-            db,
-            job_id,
-            lambda job: set_progress(
-                job, "UPLOADING_INPUT", 30, "Uploading input video to storage"
-            ),
-        )
-        input_key = f"jobs/{job_id}/input.mp4"
-        upload_file(s3_internal, S3_BUCKET, input_path, input_key, "video/mp4")
-
-        input_signed = presign_get_url(s3_public, S3_BUCKET, input_key, expires_seconds)
 
         # Extract clips
         update_job(
