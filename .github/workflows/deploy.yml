@@ -3,17 +3,13 @@ name: Deploy to VPS
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: {}
-
-concurrency:
-  group: deploy-main
-  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout (for metadata only)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Deploy via SSH
@@ -22,30 +18,8 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          port: ${{ secrets.VPS_SSH_PORT }}
           script: |
-            set -e
-            cd /opt/AlgoNext
-
-            echo "== git status =="
-            git status --porcelain || true
-
-            echo "== git fetch/pull =="
-            git fetch --all --prune
-            git reset --hard origin/main
-
-            echo "== docker compose up =="
+            cd ${{ secrets.VPS_PATH }}
+            git pull
             docker compose down
-            docker compose up -d --build --force-recreate
-
-            echo "== docker compose ps =="
-            docker compose ps
-
-            echo "== env check (api) =="
-            docker compose exec -T api printenv | grep '^S3_' || true
-
-            echo "== last logs (api) =="
-            docker compose logs --tail=50 api || true
-
-            echo "== last logs (worker) =="
-            docker compose logs --tail=80 worker || true
+            docker compose up -d --build
