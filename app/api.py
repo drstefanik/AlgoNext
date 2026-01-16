@@ -254,7 +254,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         target=target,
         video_meta={},
         anchor={},
-        player_ref={},
+        player_ref=None,
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
         error=None,
@@ -395,7 +395,7 @@ def save_player_ref(
     if bbox.get("w", 0) <= 0 or bbox.get("h", 0) <= 0:
         raise HTTPException(status_code=400, detail="Invalid bbox dimensions")
 
-    job.player_ref = player_ref
+    job.player_ref = payload.frame_key
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
