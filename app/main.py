@@ -69,12 +69,10 @@ def mask_database_url(url: str) -> str:
 def fail_fast_db_check():
     logger.info("DATABASE_URL: %s", mask_database_url(DATABASE_URL))
     logger.info(
-        "MINIO_INTERNAL_ENDPOINT = %s",
-        os.environ.get("MINIO_INTERNAL_ENDPOINT"),
-    )
-    logger.info(
-        "MINIO_PUBLIC_ENDPOINT = %s",
-        os.environ.get("MINIO_PUBLIC_ENDPOINT"),
+        "S3 config: S3_ENDPOINT_URL=%s S3_PUBLIC_ENDPOINT_URL=%s S3_BUCKET=%s",
+        os.environ.get("S3_ENDPOINT_URL"),
+        os.environ.get("S3_PUBLIC_ENDPOINT_URL"),
+        os.environ.get("S3_BUCKET"),
     )
     session = SessionLocal()
     try:
