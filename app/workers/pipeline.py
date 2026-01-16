@@ -19,6 +19,7 @@ from app.workers.celery_app import celery
 from app.core.env import is_production_env
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
+from app.core.normalizers import normalize_failure_reason
 
 logger = logging.getLogger(__name__)
 
@@ -589,7 +590,7 @@ def run_analysis(job_id: str):
             lambda job: (
                 setattr(job, "status", "RUNNING"),
                 setattr(job, "error", None),
-                setattr(job, "failure_reason", None),
+                setattr(job, "failure_reason", normalize_failure_reason(None)),
                 set_progress(job, "STARTING", 1, "Job started"),
             ),
         )
@@ -930,7 +931,7 @@ def run_analysis(job_id: str):
             }
 
             job.status = "COMPLETED"
-            job.failure_reason = None
+            job.failure_reason = normalize_failure_reason(None)
             set_progress(job, "DONE", 100, "Completed")
 
         update_job(db, job_id, finalize_job)
@@ -943,7 +944,11 @@ def run_analysis(job_id: str):
                 lambda job: (
                     setattr(job, "status", "FAILED"),
                     setattr(job, "error", str(e)),
-                    setattr(job, "failure_reason", "insufficient_visual_signal"),
+                    setattr(
+                        job,
+                        "failure_reason",
+                        normalize_failure_reason("insufficient_visual_signal"),
+                    ),
                     set_progress(job, "FAILED", 100, f"Failed: {str(e)}"),
                 ),
             )
