@@ -36,3 +36,18 @@ Notes:
 - `S3_ENDPOINT_URL` and `S3_PUBLIC_ENDPOINT_URL` must be different.
 - Presigned URLs are generated with the internal endpoint and then rewritten to the public endpoint.
 - If `S3_PUBLIC_ENDPOINT_URL` is not set: development falls back to `http://localhost:9000`; production returns `"Asset link not configured"` instead of a broken link.
+
+## GitHub Actions Deploy
+
+Create these GitHub Secrets for the repository:
+
+- `VPS_HOST`: IP VPS (e.g. `46.224.249.136`)
+- `VPS_USER`: utente SSH (e.g. `root` o `ubuntu`)
+- `VPS_SSH_KEY`: private key completa (`-----BEGIN OPENSSH PRIVATE KEY-----...`)
+- `VPS_SSH_PORT`: `22` (se non hai cambiato porta)
+
+Recommended server setup (manual):
+
+- Repository already cloned in `/opt/AlgoNext`.
+- Docker and Docker Compose installed.
+- `.env` present on the VPS (not committed to git).
