@@ -510,6 +510,39 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     return {"count": len(frames), "frames": frames}
 
 
+@router.get("/jobs/{job_id}/frames/list")
+def list_frames(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    context = load_s3_context()
+    s3_internal = context["s3_internal"]
+    bucket = context["bucket"]
+    expires_seconds = context["expires_seconds"]
+
+    prefix = f"jobs/{job_id}/frames/"
+    paginator = s3_internal.get_paginator("list_objects_v2")
+
+    items: List[Dict[str, Any]] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key")
+            if not key or key.endswith("/"):
+                continue
+            name = key.split("/")[-1]
+            signed_url = presign_get_url(
+                s3_internal,
+                bucket,
+                key,
+                expires_seconds,
+            )
+            items.append({"name": name, "url": signed_url, "key": key})
+
+    items.sort(key=lambda item: item["name"])
+    return {"items": items}
+
+
 @router.post("/jobs/{job_id}/enqueue", response_model=JobOut)
 def enqueue_job(job_id: str, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
