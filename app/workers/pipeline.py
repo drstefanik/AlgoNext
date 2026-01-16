@@ -6,7 +6,7 @@ import subprocess
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import boto3
@@ -207,6 +207,41 @@ def probe_video_meta(path: Path) -> Dict:
         return json.loads(out)
     except Exception:
         return {}
+
+
+def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    try:
+        out = _run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                str(path),
+            ]
+        )
+        data = json.loads(out)
+        streams = data.get("streams") or []
+        for stream in streams:
+            width = stream.get("width")
+            height = stream.get("height")
+            if width and height:
+                return int(width), int(height)
+    except Exception:
+        return None, None
+    return None, None
+
+
+def get_duration_seconds(meta: Dict) -> Optional[float]:
+    try:
+        duration = meta.get("format", {}).get("duration")
+        if duration is None:
+            return None
+        return float(duration)
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
@@ -436,6 +471,78 @@ def run_analysis(job_id: str):
         video_meta = probe_video_meta(input_path) or {}
         update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
 
+        # Extract preview frames for UI selection
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "EXTRACTING_FRAMES", 25, "Extracting preview frames"
+            ),
+        )
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+        preview_count = max(1, min(12, preview_count))
+        duration = get_duration_seconds(video_meta)
+        if duration and duration > 0:
+            step = duration / (preview_count + 1)
+            timestamps = [round(step * (i + 1), 3) for i in range(preview_count)]
+        else:
+            timestamps = [i * 10 for i in range(preview_count)]
+
+        frames_dir = base_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        preview_frames: List[Dict[str, Any]] = []
+        for index, timestamp in enumerate(timestamps, start=1):
+            frame_name = f"frame_{index:04d}.jpg"
+            frame_path = frames_dir / frame_name
+            try:
+                _run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        str(timestamp),
+                        "-i",
+                        str(input_path),
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "2",
+                        str(frame_path),
+                    ]
+                )
+            except Exception:
+                break
+
+            width, height = probe_image_dimensions(frame_path)
+            frame_key = f"jobs/{job_id}/frames/{frame_name}"
+            upload_file(s3_internal, S3_BUCKET, frame_path, frame_key, "image/jpeg")
+            signed_url = presign_get_url(
+                s3_public, S3_BUCKET, frame_key, expires_seconds
+            )
+            preview_frames.append(
+                {
+                    "time_sec": timestamp,
+                    "key": frame_key,
+                    "signed_url": signed_url,
+                    "width": width,
+                    "height": height,
+                }
+            )
+
+        if preview_frames:
+            update_job(
+                db,
+                job_id,
+                lambda job: setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "preview_frames": preview_frames,
+                    },
+                ),
+            )
+
         update_job(
             db,
             job_id,
@@ -529,7 +636,9 @@ def run_analysis(job_id: str):
         )
 
         def finalize_job(job: AnalysisJob) -> None:
+            existing_result = job.result or {}
             job.result = {
+                **existing_result,
                 "schema_version": "1.1",
                 "summary": {
                     "player_role": role,
