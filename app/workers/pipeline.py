@@ -351,18 +351,18 @@ def run_analysis(job_id: str):
         role = job.role
 
         selections = (job.target or {}).get("selections") or []
-        if len(selections) < 2:
+        if len(selections) < 1:
             update_job(
                 db,
                 job_id,
                 lambda job: (
-                    setattr(job, "status", "FAILED"),
-                    setattr(job, "error", "PLAYER_SELECTION_REQUIRED"),
+                    setattr(job, "status", "WAITING_FOR_SELECTION"),
+                    setattr(job, "error", None),
                     set_progress(
                         job,
-                        "FAILED",
-                        100,
-                        "Failed: PLAYER_SELECTION_REQUIRED",
+                        "WAITING_FOR_SELECTION",
+                        5,
+                        "Waiting for player selection",
                     ),
                 ),
             )
@@ -549,6 +549,13 @@ def run_analysis(job_id: str):
         )
 
         def finalize_job(job: AnalysisJob) -> None:
+            existing_assets = (job.result or {}).get("assets") or {}
+            existing_input = existing_assets.get("input_video")
+            input_video = existing_input or {
+                "s3_key": input_key,
+                "signed_url": input_signed,
+                "expires_in": expires_seconds,
+            }
             job.result = {
                 "schema_version": "1.1",
                 "summary": {
@@ -557,11 +564,7 @@ def run_analysis(job_id: str):
                 },
                 "radar": radar,
                 "assets": {
-                    "input_video": {
-                        "s3_key": input_key,
-                        "signed_url": input_signed,
-                        "expires_in": expires_seconds,
-                    }
+                    "input_video": input_video,
                 },
                 "clips": clips_out,
             }
