@@ -20,6 +20,7 @@ class JobStatusOut(BaseModel):
     status: str
     progress: Dict
     error: Optional[str]
+    failure_reason: Optional[str]
     created_at: Optional[str]
     updated_at: Optional[str]
 

@@ -155,6 +155,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
         error=None,
+        failure_reason=None,
     )
 
     db.add(job)
@@ -181,6 +182,7 @@ def get_job(job_id: str):
             "progress": normalize_payload(job.progress),
             "result": normalize_payload(job.result),
             "error": job.error,
+            "failure_reason": job.failure_reason,
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         }
@@ -200,6 +202,7 @@ def job_status(job_id: str, db: Session = Depends(get_db)):
         "status": normalize_status(job.status),
         "progress": normalize_payload(job.progress),
         "error": job.error,
+        "failure_reason": job.failure_reason,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
 
@@ -215,6 +218,7 @@ def job_poll(job_id: str, db: Session = Depends(get_db)):
         "status": job.status,
         "progress": job.progress,
         "error": job.error,
+        "failure_reason": job.failure_reason,
         "result": job.result if job.status == "COMPLETED" else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }

@@ -34,6 +34,7 @@ class AnalysisJob(Base):
     result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # timestamps robusti (lato DB)
     created_at: Mapped[datetime] = mapped_column(
