@@ -23,12 +23,10 @@ class AnalysisJob(Base):
     video_url: Mapped[str] = mapped_column(Text, nullable=False)
     video_meta: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
-    player_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     target: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     anchor: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
-    player_ref: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    player_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     progress: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
