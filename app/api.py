@@ -17,7 +17,7 @@ from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
 from app.schemas import JobCreate, JobOut, PlayerRefPayload, SelectionPayload
-from app.workers.pipeline import run_analysis
+from app.workers.pipeline import extract_preview_frames, run_analysis
 from app.workers.pipeline import (
     ensure_bucket_exists,
     get_s3_client,
@@ -265,6 +265,8 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     db.add(job)
     db.commit()
     db.refresh(job)
+
+    extract_preview_frames.delay(job.id)
 
     return JobOut(job_id=job.id, status=job.status)
 
