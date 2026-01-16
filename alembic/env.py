@@ -41,7 +41,7 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         connection.execution_options(isolation_level="AUTOCOMMIT").execute(
             text(
-                "ALTER TABLE IF EXISTS public.alembic_version "
+                "ALTER TABLE IF EXISTS alembic_version "
                 "ALTER COLUMN version_num TYPE VARCHAR(255);"
             )
         )
