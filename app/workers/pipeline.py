@@ -435,9 +435,9 @@ def get_s3_client(endpoint_url: str):
     return boto3.client(
         "s3",
         endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["MINIO_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["MINIO_SECRET_KEY"],
-        region_name=os.environ.get("MINIO_REGION", "us-east-1"),
+        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+        region_name=os.environ.get("S3_REGION", "us-east-1"),
         config=Config(signature_version="s3v4"),
     )
 
@@ -484,31 +484,31 @@ def _normalize_endpoint(endpoint: str) -> str:
 def resolve_public_endpoint(internal_endpoint: str, public_endpoint: str) -> str:
     resolved = public_endpoint.strip()
     if not resolved:
-        raise RuntimeError("Missing MINIO_PUBLIC_ENDPOINT.")
+        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
 
     internal_normalized = _normalize_endpoint(internal_endpoint)
     public_normalized = _normalize_endpoint(resolved)
     if internal_normalized and internal_normalized == public_normalized:
         raise RuntimeError(
-            "MINIO_PUBLIC_ENDPOINT must differ from MINIO_INTERNAL_ENDPOINT."
+            "S3_PUBLIC_ENDPOINT_URL must differ from S3_ENDPOINT_URL."
         )
 
     return resolved
 
 
 def rewrite_presigned_to_public(url: str) -> str:
-    public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
+    public_endpoint = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
     if not public_endpoint:
-        raise RuntimeError("Missing MINIO_PUBLIC_ENDPOINT.")
+        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
     parsed_url = urlsplit(url)
     parsed_public = urlsplit(public_endpoint)
     if not parsed_public.scheme or not parsed_public.netloc:
-        raise RuntimeError("MINIO_PUBLIC_ENDPOINT must include scheme and host.")
+        raise RuntimeError("S3_PUBLIC_ENDPOINT_URL must include scheme and host.")
     if not is_production_env():
         logger.info(
-            "MINIO_PRESIGN_REWRITE",
+            "S3_PRESIGN_REWRITE",
             extra={
-                "minio_public_endpoint": public_endpoint,
+                "s3_public_endpoint": public_endpoint,
                 "before_host": parsed_url.netloc,
                 "after_host": parsed_public.netloc,
             },
@@ -550,12 +550,10 @@ def run_analysis(job_id: str):
     skills_missing: List[str] = []
 
     # Env vars (required)
-    minio_internal_endpoint = os.environ.get("MINIO_INTERNAL_ENDPOINT", "").strip()
-    minio_access_key = os.environ.get("MINIO_ACCESS_KEY", "").strip()
-    minio_secret_key = os.environ.get("MINIO_SECRET_KEY", "").strip()
-    minio_bucket = (
-        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
-    ).strip()
+    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
 
     try:
         job = reload_job(db, job_id)
@@ -597,14 +595,10 @@ def run_analysis(job_id: str):
         )
 
         # Preconditions
-        if (
-            not minio_internal_endpoint
-            or not minio_bucket
-            or not minio_access_key
-            or not minio_secret_key
-        ):
+        if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
             raise RuntimeError(
-                "Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET"
+                "Missing S3 env vars: S3_ENDPOINT_URL, S3_ACCESS_KEY, "
+                "S3_SECRET_KEY, S3_BUCKET"
             )
 
         ensure_ffmpeg_available()
@@ -620,10 +614,10 @@ def run_analysis(job_id: str):
         clips_dir.mkdir(parents=True, exist_ok=True)
 
         # S3 clients
-        s3_internal = get_s3_client(minio_internal_endpoint)
+        s3_internal = get_s3_client(s3_endpoint_url)
 
         # Ensure bucket exists
-        ensure_bucket_exists(s3_internal, minio_bucket)
+        ensure_bucket_exists(s3_internal, s3_bucket)
 
         # Download
         update_job(
@@ -668,7 +662,7 @@ def run_analysis(job_id: str):
             ),
         )
         input_key = f"jobs/{job_id}/input.mp4"
-        upload_file(s3_internal, minio_bucket, input_path, input_key, "video/mp4")
+        upload_file(s3_internal, s3_bucket, input_path, input_key, "video/mp4")
         # Persist input asset into result early (so frontend can show it immediately)
         def store_input_asset(job: AnalysisJob) -> None:
             existing = job.result or {}
@@ -676,7 +670,7 @@ def run_analysis(job_id: str):
             assets = dict(assets)
             assets.pop("input_video_url", None)
             assets["input_video"] = {
-                "bucket": minio_bucket,
+                "bucket": s3_bucket,
                 "key": input_key,
             }
             job.result = {**existing, "assets": assets}

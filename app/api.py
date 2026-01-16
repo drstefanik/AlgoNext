@@ -55,39 +55,37 @@ def normalize_payload(payload: object) -> dict:
     return {"value": encoded}
 
 
-def load_minio_context() -> Dict[str, Any]:
-    minio_internal_endpoint = (os.environ.get("MINIO_INTERNAL_ENDPOINT") or "").strip()
-    minio_public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
-    minio_access_key = (os.environ.get("MINIO_ACCESS_KEY") or "").strip()
-    minio_secret_key = (os.environ.get("MINIO_SECRET_KEY") or "").strip()
-    minio_bucket = (
-        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
-    ).strip()
+def load_s3_context() -> Dict[str, Any]:
+    s3_endpoint_url = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
+    s3_public_endpoint_url = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
+    s3_access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip()
+    s3_secret_key = (os.environ.get("S3_SECRET_KEY") or "").strip()
+    s3_bucket = (os.environ.get("S3_BUCKET") or "").strip()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 
     if (
-        not minio_internal_endpoint
-        or not minio_public_endpoint
-        or not minio_access_key
-        or not minio_secret_key
-        or not minio_bucket
+        not s3_endpoint_url
+        or not s3_public_endpoint_url
+        or not s3_access_key
+        or not s3_secret_key
+        or not s3_bucket
     ):
         raise HTTPException(
             status_code=500,
             detail=(
-                "Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_PUBLIC_ENDPOINT, "
-                "MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET"
+                "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
+                "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
             ),
         )
 
     try:
-        resolve_public_endpoint(minio_internal_endpoint, minio_public_endpoint)
+        resolve_public_endpoint(s3_endpoint_url, s3_public_endpoint_url)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
-        "s3_internal": get_s3_client(minio_internal_endpoint),
-        "bucket": minio_bucket,
+        "s3_internal": get_s3_client(s3_endpoint_url),
+        "bucket": s3_bucket,
         "expires_seconds": expires_seconds,
     }
 
@@ -280,7 +278,7 @@ def get_job(job_id: str):
 
         result_payload = normalize_payload(job.result)
         if result_payload:
-            context = load_minio_context()
+            context = load_s3_context()
             result_payload = attach_presigned_urls(result_payload, context)
 
         return {
@@ -325,7 +323,7 @@ def job_poll(job_id: str, db: Session = Depends(get_db)):
 
     result_payload = job.result if job.status == "COMPLETED" else None
     if result_payload:
-        context = load_minio_context()
+        context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
 
     return {
@@ -354,7 +352,7 @@ def job_result(job_id: str, db: Session = Depends(get_db)):
 
     result_payload = normalize_payload(job.result)
     if result_payload:
-        context = load_minio_context()
+        context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
     return result_payload
 
@@ -425,7 +423,7 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    context = load_minio_context()
+    context = load_s3_context()
     s3_internal = context["s3_internal"]
     minio_bucket = context["bucket"]
     expires_seconds = context["expires_seconds"]
