@@ -55,6 +55,115 @@ def normalize_payload(payload: object) -> dict:
     return {"value": encoded}
 
 
+def load_minio_context() -> Dict[str, Any]:
+    minio_internal_endpoint = (os.environ.get("MINIO_INTERNAL_ENDPOINT") or "").strip()
+    minio_public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
+    minio_access_key = (os.environ.get("MINIO_ACCESS_KEY") or "").strip()
+    minio_secret_key = (os.environ.get("MINIO_SECRET_KEY") or "").strip()
+    minio_bucket = (
+        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
+    ).strip()
+    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+
+    if (
+        not minio_internal_endpoint
+        or not minio_public_endpoint
+        or not minio_access_key
+        or not minio_secret_key
+        or not minio_bucket
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_PUBLIC_ENDPOINT, "
+                "MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET"
+            ),
+        )
+
+    try:
+        public_endpoint = resolve_public_endpoint(
+            minio_internal_endpoint, minio_public_endpoint
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "s3_internal": get_s3_client(minio_internal_endpoint),
+        "public_endpoint": public_endpoint,
+        "bucket": minio_bucket,
+        "expires_seconds": expires_seconds,
+    }
+
+
+def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    s3_internal = context["s3_internal"]
+    public_endpoint = context["public_endpoint"]
+    bucket_default = context["bucket"]
+    expires_seconds = context["expires_seconds"]
+    def presign(bucket: str, key: str) -> str:
+        return presign_get_url(
+            s3_internal,
+            bucket,
+            key,
+            expires_seconds,
+            public_endpoint,
+        )
+
+    def normalize_asset(asset: Dict[str, Any], include_url: bool) -> Dict[str, Any]:
+        bucket = asset.get("bucket") or bucket_default
+        key = asset.get("key") or asset.get("s3_key")
+        normalized = {**asset}
+        if bucket:
+            normalized["bucket"] = bucket
+        if key:
+            normalized["key"] = key
+        if bucket and key:
+            signed_url = presign(bucket, key)
+            normalized["signed_url"] = signed_url
+            if include_url:
+                normalized["url"] = signed_url
+        return normalized
+
+    hydrated = {**result}
+
+    assets = hydrated.get("assets")
+    if isinstance(assets, dict):
+        assets_copy = {**assets}
+        input_video = assets_copy.get("input_video")
+        if isinstance(input_video, dict):
+            input_video = normalize_asset(input_video, include_url=True)
+            assets_copy["input_video"] = input_video
+            if "input_video_url" not in assets_copy:
+                assets_copy["input_video_url"] = input_video.get("signed_url")
+
+        clips = assets_copy.get("clips")
+        if isinstance(clips, list):
+            assets_copy["clips"] = [
+                normalize_asset(clip, include_url=True) if isinstance(clip, dict) else clip
+                for clip in clips
+            ]
+
+        hydrated["assets"] = assets_copy
+
+    preview_frames = hydrated.get("preview_frames")
+    if isinstance(preview_frames, list):
+        hydrated["preview_frames"] = [
+            normalize_asset(frame, include_url=False)
+            if isinstance(frame, dict)
+            else frame
+            for frame in preview_frames
+        ]
+
+    clips_root = hydrated.get("clips")
+    if isinstance(clips_root, list):
+        hydrated["clips"] = [
+            normalize_asset(clip, include_url=True) if isinstance(clip, dict) else clip
+            for clip in clips_root
+        ]
+
+    return hydrated
+
+
 def _run_command(cmd: List[str]) -> str:
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -174,6 +283,11 @@ def get_job(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
 
+        result_payload = normalize_payload(job.result)
+        if result_payload:
+            context = load_minio_context()
+            result_payload = attach_presigned_urls(result_payload, context)
+
         return {
             "id": job.id,
             "status": normalize_status(job.status),
@@ -181,7 +295,7 @@ def get_job(job_id: str):
             "role": job.role,
             "video_url": job.video_url,
             "progress": normalize_payload(job.progress),
-            "result": normalize_payload(job.result),
+            "result": result_payload,
             "error": job.error,
             "failure_reason": job.failure_reason,
             "created_at": job.created_at.isoformat() if job.created_at else None,
@@ -238,7 +352,11 @@ def job_result(job_id: str, db: Session = Depends(get_db)):
     if job.status != "COMPLETED":
         raise HTTPException(status_code=409, detail="Job not completed yet")
 
-    return job.result or {}
+    result_payload = normalize_payload(job.result)
+    if result_payload:
+        context = load_minio_context()
+        result_payload = attach_presigned_urls(result_payload, context)
+    return result_payload
 
 
 @router.post("/jobs/{job_id}/selection", response_model=JobOut)
@@ -307,31 +425,11 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
-    minio_internal_endpoint = (os.environ.get("MINIO_INTERNAL_ENDPOINT") or "").strip()
-    minio_public_endpoint = (os.environ.get("MINIO_PUBLIC_ENDPOINT") or "").strip()
-    minio_access_key = (os.environ.get("MINIO_ACCESS_KEY") or "").strip()
-    minio_secret_key = (os.environ.get("MINIO_SECRET_KEY") or "").strip()
-    minio_bucket = (
-        os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET") or ""
-    ).strip()
-    app_env = os.environ.get("APP_ENV", "development").lower()
-    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-
-    if (
-        not minio_internal_endpoint
-        or not minio_access_key
-        or not minio_secret_key
-        or not minio_bucket
-    ):
-        raise HTTPException(
-            status_code=500,
-            detail="Missing MinIO env vars: MINIO_INTERNAL_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET",
-        )
-
-    public_endpoint = resolve_public_endpoint(
-        minio_internal_endpoint, minio_public_endpoint, app_env
-    )
+    context = load_minio_context()
+    s3_internal = context["s3_internal"]
+    minio_bucket = context["bucket"]
+    expires_seconds = context["expires_seconds"]
+    public_endpoint = context["public_endpoint"]
 
     ensure_ffmpeg_available()
 
@@ -351,7 +449,6 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
 
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    s3_internal = get_s3_client(minio_internal_endpoint)
     ensure_bucket_exists(s3_internal, minio_bucket)
 
     frames: List[Dict[str, Any]] = []
@@ -387,7 +484,6 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
             frame_key,
             expires_seconds,
             public_endpoint,
-            app_env,
         )
         frames.append(
             {
