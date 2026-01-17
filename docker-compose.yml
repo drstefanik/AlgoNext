@@ -73,6 +73,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
+      MINIO_BUCKET: fnh
     depends_on:
       db:
         condition: service_healthy
@@ -93,6 +94,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/app
+      MINIO_BUCKET: fnh
     depends_on:
       db:
         condition: service_healthy
@@ -110,6 +112,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
+      MINIO_BUCKET: fnh
     depends_on:
       db:
         condition: service_healthy
