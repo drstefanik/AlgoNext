@@ -1,15 +1,22 @@
 from typing import Optional, Dict, List, Literal
 
-from pydantic import BaseModel, Field, conlist
+from pydantic import BaseModel, Field, conlist, root_validator
 
 
 class JobCreate(BaseModel):
-    video_url: str
+    video_url: Optional[str] = None
+    video_key: Optional[str] = None
     role: str
     category: str
     team_name: str = Field(min_length=1)
     player_name: Optional[str] = None
     shirt_number: Optional[int] = Field(default=None, ge=0, le=99)
+
+    @root_validator
+    def require_video_source(cls, values: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+        if not values.get("video_url") and not values.get("video_key"):
+            raise ValueError("video_url or video_key is required")
+        return values
 
 class JobOut(BaseModel):
     job_id: str

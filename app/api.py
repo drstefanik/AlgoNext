@@ -255,6 +255,18 @@ def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
 @router.post("/jobs", response_model=JobOut)
 def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     job_id = str(uuid4())
+    video_url = payload.video_url
+    if payload.video_key:
+        context = load_s3_context()
+        s3_internal = context["s3_internal"]
+        bucket = context["bucket"]
+        expires_seconds = context["expires_seconds"]
+        video_url = presign_get_url(
+            s3_internal,
+            bucket,
+            payload.video_key,
+            expires_seconds,
+        )
 
     target = {
         "player": {
@@ -271,7 +283,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         status="WAITING_FOR_SELECTION",
         category=payload.category,
         role=payload.role,
-        video_url=payload.video_url,
+        video_url=video_url,
         target=target,
         video_meta={},
         anchor={},
