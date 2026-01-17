@@ -166,41 +166,87 @@ def ensure_ffmpeg_available() -> None:
     _run(["ffprobe", "-version"])
 
 
+def _is_http_url(value: str) -> bool:
+    return urlsplit(value).scheme in ("http", "https")
+
+
+def _is_shared_object_url(value: str) -> bool:
+    return urlsplit(value).path.startswith("/api/v1/download-shared-object/")
+
+
 def download_video(
-    url: str, dst_path: Path, progress_callback: Optional[Callable[[], None]] = None
+    source: str,
+    dst_path: Path,
+    s3_client,
+    bucket: str,
+    progress_callback: Optional[Callable[[], None]] = None,
 ) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    log_every_bytes = 100 * 1024 * 1024
-    bytes_downloaded = 0
-    next_log_bytes = log_every_bytes
     last_progress_tick = time.monotonic()
     progress_tick_seconds = 5
 
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(10, 1800),
-        headers={"User-Agent": "AlgoNextWorker/1.0"},
-    ) as r:
-        r.raise_for_status()
-        with open(dst_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    bytes_downloaded += len(chunk)
+    if not source:
+        raise RuntimeError("Missing video source.")
 
-                    now = time.monotonic()
-                    if (
-                        progress_callback is not None
-                        and now - last_progress_tick >= progress_tick_seconds
-                    ):
-                        last_progress_tick = now
-                        progress_callback()
+    if _is_http_url(source):
+        if _is_shared_object_url(source):
+            raise RuntimeError("Shared object URLs are not supported for video download.")
 
-                    if bytes_downloaded >= next_log_bytes:
-                        mb_downloaded = bytes_downloaded / (1024 * 1024)
-                        logger.info("Downloaded %.1f MB from %s", mb_downloaded, url)
-                        next_log_bytes += log_every_bytes
+        log_every_bytes = 100 * 1024 * 1024
+        bytes_downloaded = 0
+        next_log_bytes = log_every_bytes
+
+        with requests.get(
+            source,
+            stream=True,
+            timeout=(10, 1800),
+            headers={"User-Agent": "AlgoNextWorker/1.0"},
+        ) as r:
+            r.raise_for_status()
+            with open(dst_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        bytes_downloaded += len(chunk)
+
+                        now = time.monotonic()
+                        if (
+                            progress_callback is not None
+                            and now - last_progress_tick >= progress_tick_seconds
+                        ):
+                            last_progress_tick = now
+                            progress_callback()
+
+                        if bytes_downloaded >= next_log_bytes:
+                            mb_downloaded = bytes_downloaded / (1024 * 1024)
+                            logger.info(
+                                "Downloaded %.1f MB from %s", mb_downloaded, source
+                            )
+                            next_log_bytes += log_every_bytes
+        return
+
+    object_key = source.lstrip("/")
+    if not object_key:
+        raise RuntimeError("Missing MinIO object key for video download.")
+    if s3_client is None:
+        raise RuntimeError("Missing S3 client for video download.")
+
+    def _tick(_: int) -> None:
+        nonlocal last_progress_tick
+        if progress_callback is None:
+            return
+        now = time.monotonic()
+        if now - last_progress_tick >= progress_tick_seconds:
+            last_progress_tick = now
+            progress_callback()
+
+    callback = _tick if progress_callback is not None else None
+    s3_client.download_file(
+        Bucket=bucket,
+        Key=object_key,
+        Filename=str(dst_path),
+        Callback=callback,
+    )
 
 
 def probe_video_meta(path: Path) -> Dict:
@@ -588,7 +634,7 @@ def extract_preview_frames(job_id: str) -> None:
         s3_internal = get_s3_client(s3_endpoint_url)
         ensure_bucket_exists(s3_internal, s3_bucket)
 
-        download_video(job.video_url, input_path)
+        download_video(job.video_url, input_path, s3_internal, s3_bucket)
 
         video_meta = probe_video_meta(input_path) or {}
         duration = get_duration_seconds(video_meta)
@@ -759,7 +805,13 @@ def run_analysis(job_id: str):
                 ),
             )
 
-        download_video(video_url, input_path, progress_callback=download_progress_tick)
+        download_video(
+            video_url,
+            input_path,
+            s3_internal,
+            s3_bucket,
+            progress_callback=download_progress_tick,
+        )
 
         # Probe meta
         update_job(

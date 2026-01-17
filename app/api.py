@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import requests
@@ -170,19 +171,38 @@ def ensure_ffmpeg_available() -> None:
     _run_command(["ffprobe", "-version"])
 
 
-def download_video(url: str, dst_path: Path) -> None:
+def download_video(url: str, dst_path: Path, s3_client, bucket: str) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(10, 1800),
-        headers={"User-Agent": "AlgoNextAPI/1.0"},
-    ) as response:
-        response.raise_for_status()
-        with open(dst_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing video source.")
+    parsed = urlsplit(url)
+    if parsed.scheme in ("http", "https"):
+        if parsed.path.startswith("/api/v1/download-shared-object/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Shared object URLs are not supported for video download.",
+            )
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(10, 1800),
+            headers={"User-Agent": "AlgoNextAPI/1.0"},
+        ) as response:
+            response.raise_for_status()
+            with open(dst_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return
+
+    object_key = url.lstrip("/")
+    if not object_key:
+        raise HTTPException(status_code=400, detail="Missing MinIO object key.")
+    s3_client.download_file(
+        Bucket=bucket,
+        Key=object_key,
+        Filename=str(dst_path),
+    )
 
 
 def probe_video_duration(path: Path) -> Optional[float]:
@@ -446,7 +466,7 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
     frames_dir = base_dir / "frames"
 
     if not input_path.exists():
-        download_video(job.video_url, input_path)
+        download_video(job.video_url, input_path, s3_internal, minio_bucket)
 
     duration = probe_video_duration(input_path)
     if duration and duration > 0:
