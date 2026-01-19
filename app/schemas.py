@@ -23,7 +23,8 @@ class JobOut(BaseModel):
     status: str
 
 class JobStatusOut(BaseModel):
-    id: str
+    job_id: str
+    id: Optional[str] = None
     status: str
     progress: Dict
     error: Optional[str]
