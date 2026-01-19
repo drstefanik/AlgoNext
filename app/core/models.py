@@ -21,7 +21,9 @@ class AnalysisJob(Base):
     category: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False)
 
-    video_url: Mapped[str] = mapped_column(Text, nullable=False)
+    video_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    video_bucket: Mapped[str | None] = mapped_column(Text, nullable=True)
+    video_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     video_meta: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     target: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

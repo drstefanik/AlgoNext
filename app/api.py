@@ -116,6 +116,44 @@ def _ensure_public_url(url: str) -> None:
             )
 
 
+def _is_shared_object_url(url: str) -> bool:
+    return urlsplit(url).path.startswith("/api/v1/download-shared-object/")
+
+
+def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[str, str]:
+    if job.video_key:
+        bucket = job.video_bucket or fallback_bucket
+        if not bucket:
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail("VIDEO_BUCKET_MISSING", "Missing video bucket."),
+            )
+        return job.video_key, bucket
+    if job.video_url:
+        parsed = urlsplit(job.video_url)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "INVALID_URL",
+                    "video_url must be an http(s) URL.",
+                ),
+            )
+        if _is_shared_object_url(job.video_url):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "SHARED_OBJECT_UNSUPPORTED",
+                    "Shared object URLs are not supported for video download.",
+                ),
+            )
+        return job.video_url, fallback_bucket
+    raise HTTPException(
+        status_code=400,
+        detail=error_detail("VIDEO_SOURCE_MISSING", "Missing video source."),
+    )
+
+
 def load_s3_context() -> Dict[str, Any]:
     s3_endpoint_url = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
     s3_public_endpoint_url = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
@@ -244,7 +282,7 @@ def download_video(url: str, dst_path: Path, s3_client, bucket: str) -> None:
     parsed = urlsplit(url)
     if parsed.scheme in ("http", "https"):
         _ensure_public_url(url)
-        if parsed.path.startswith("/api/v1/download-shared-object/"):
+        if _is_shared_object_url(url):
             raise HTTPException(
                 status_code=400,
                 detail=error_detail(
@@ -329,10 +367,20 @@ def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
 def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_db)):
     job_id = str(uuid4())
     video_url = payload.video_url
+    video_bucket = None
+    video_key = None
     if payload.video_key:
         context = load_s3_context()
         s3_internal = context["s3_internal"]
-        bucket = context["bucket"]
+        bucket = payload.video_bucket or context["bucket"]
+        if not bucket:
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "VIDEO_BUCKET_MISSING",
+                    "video_bucket is required when using video_key.",
+                ),
+            )
         expires_seconds = context["expires_seconds"]
         video_url = presign_get_url(
             s3_internal,
@@ -340,6 +388,26 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
             payload.video_key,
             expires_seconds,
         )
+        video_bucket = bucket
+        video_key = payload.video_key
+    elif video_url:
+        parsed = urlsplit(video_url)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "INVALID_URL",
+                    "video_url must be an http(s) URL.",
+                ),
+            )
+        if _is_shared_object_url(video_url):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail(
+                    "SHARED_OBJECT_UNSUPPORTED",
+                    "Shared object URLs are not supported for video download.",
+                ),
+            )
 
     target = {
         "player": {
@@ -357,6 +425,8 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
         category=payload.category,
         role=payload.role,
         video_url=video_url,
+        video_bucket=video_bucket,
+        video_key=video_key,
         target=target,
         video_meta={},
         anchor={},
@@ -600,7 +670,8 @@ def get_frames(
     frames_dir = base_dir / "frames"
 
     if not input_path.exists():
-        download_video(job.video_url, input_path, s3_internal, minio_bucket)
+        video_source, source_bucket = resolve_job_video_source(job, minio_bucket)
+        download_video(video_source, input_path, s3_internal, source_bucket)
 
     duration = probe_video_duration(input_path)
     if duration and duration > 0:
