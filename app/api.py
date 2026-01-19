@@ -75,7 +75,7 @@ def error_detail(code: str, message: str, details: dict | None = None) -> dict:
     payload = {"code": code, "message": message}
     if details:
         payload["details"] = details
-    return payload
+    return {"error": payload}
 
 
 def _is_private_ip(ip_value: str) -> bool:
@@ -373,7 +373,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
 
     extract_preview_frames.delay(job.id)
 
-    return ok_response({"id": job.id, "status": job.status}, request)
+    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
 
 @router.get("/jobs/{job_id}")
@@ -401,6 +401,7 @@ def get_job(job_id: str, request: Request):
 
         return ok_response(
             {
+                "job_id": job.id,
                 "id": job.id,
                 "status": normalize_status(job.status),
                 "category": job.category,
@@ -432,6 +433,7 @@ def job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     return ok_response(
         {
+            "job_id": job.id,
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
@@ -459,6 +461,7 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     return ok_response(
         {
+            "job_id": job.id,
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
@@ -497,7 +500,7 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
-    return ok_response({"result": result_payload}, request)
+    return ok_response({"job_id": job.id, "id": job.id, "result": result_payload}, request)
 
 
 @router.post("/jobs/{job_id}/selection")
@@ -525,7 +528,7 @@ def save_selection(
 
     db.commit()
     db.refresh(job)
-    return ok_response({"id": job.id, "status": job.status}, request)
+    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
 
 @router.post("/jobs/{job_id}/player-ref")
@@ -564,7 +567,9 @@ def save_player_ref(
 
     db.commit()
     db.refresh(job)
-    return ok_response({"id": job.id, "player_ref": job.player_ref}, request)
+    return ok_response(
+        {"job_id": job.id, "id": job.id, "player_ref": job.player_ref}, request
+    )
 
 
 @router.get("/jobs/{job_id}/frames")
@@ -709,7 +714,7 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     # idempotente: se già avanzato, non reinvio
     if job.status in ["QUEUED", "RUNNING", "COMPLETED", "FAILED"]:
-        return ok_response({"id": job.id, "status": job.status}, request)
+        return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
     if job.status not in ["WAITING_FOR_SELECTION", "CREATED", "WAITING_FOR_PLAYER"]:
         raise HTTPException(
@@ -733,4 +738,4 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     run_analysis.delay(job.id)
 
-    return ok_response({"id": job.id, "status": job.status}, request)
+    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)

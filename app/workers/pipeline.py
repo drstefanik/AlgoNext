@@ -733,11 +733,13 @@ def extract_preview_frames(self, job_id: str) -> None:
         if self.request.retries < max_retries:
             raise self.retry(exc=exc, countdown=5 * (2 ** self.request.retries))
         try:
+            error_message = f"PREVIEW_FRAMES_FAILED: {exc}"
             update_job(
                 db,
                 job_id,
                 lambda job: (
-                    setattr(job, "error", str(exc)),
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "error", error_message),
                     setattr(
                         job,
                         "failure_reason",
