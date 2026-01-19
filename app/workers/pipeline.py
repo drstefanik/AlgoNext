@@ -281,6 +281,17 @@ def download_video(
     )
 
 
+def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[str, str]:
+    if job.video_key:
+        bucket = job.video_bucket or fallback_bucket
+        if not bucket:
+            raise RuntimeError("Missing video bucket for download.")
+        return job.video_key, bucket
+    if job.video_url:
+        return job.video_url, fallback_bucket
+    raise RuntimeError("Missing video source.")
+
+
 def probe_video_meta(path: Path) -> Dict:
     try:
         out = _run(
@@ -667,7 +678,17 @@ def extract_preview_frames(self, job_id: str) -> None:
         s3_internal = get_s3_client(s3_endpoint_url)
         ensure_bucket_exists(s3_internal, s3_bucket)
 
-        download_video(job.video_url, input_path, s3_internal, s3_bucket)
+        video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
+        try:
+            download_video(video_source, input_path, s3_internal, source_bucket)
+        except Exception as exc:
+            logger.exception(
+                "Preview download failed for job %s (source=%s, bucket=%s)",
+                job_id,
+                video_source,
+                source_bucket,
+            )
+            raise RuntimeError(f"Download failed: {exc}") from exc
 
         video_meta = probe_video_meta(input_path) or {}
         duration = get_duration_seconds(video_meta)
@@ -779,7 +800,6 @@ def run_analysis(self, job_id: str):
         if not job:
             return
 
-        video_url = job.video_url
         role = job.role
         category = job.category
 
@@ -859,11 +879,12 @@ def run_analysis(self, job_id: str):
                 ),
             )
 
+        video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
         download_video(
-            video_url,
+            video_source,
             input_path,
             s3_internal,
-            s3_bucket,
+            source_bucket,
             progress_callback=download_progress_tick,
         )
 

@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, conlist, model_validator
 
 class JobCreate(BaseModel):
     video_url: Optional[str] = None
+    video_bucket: Optional[str] = None
     video_key: Optional[str] = None
     role: str
     category: str
@@ -16,6 +17,8 @@ class JobCreate(BaseModel):
     def require_video_source(self) -> "JobCreate":
         if not self.video_url and not self.video_key:
             raise ValueError("video_url or video_key is required")
+        if self.video_url and self.video_key:
+            raise ValueError("Provide either video_url or video_key, not both")
         return self
 
 class JobOut(BaseModel):
