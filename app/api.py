@@ -1,7 +1,9 @@
 import json
 import os
+import socket
 import subprocess
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -9,7 +11,7 @@ from uuid import uuid4
 
 import requests
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,7 @@ from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.schemas import JobCreate, JobOut, PlayerRefPayload, SelectionPayload
+from app.schemas import JobCreate, PlayerRefPayload, SelectionPayload
 from app.workers.pipeline import extract_preview_frames, run_analysis
 from app.workers.pipeline import (
     ensure_bucket_exists,
@@ -57,6 +59,63 @@ def normalize_payload(payload: object) -> dict:
     return {"value": encoded}
 
 
+def build_meta(request: Request | None = None) -> dict:
+    request_id = getattr(request.state, "request_id", None) if request else None
+    return {
+        "request_id": request_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def ok_response(data: dict, request: Request | None = None) -> dict:
+    return {"ok": True, "data": data, "meta": build_meta(request)}
+
+
+def error_detail(code: str, message: str, details: dict | None = None) -> dict:
+    payload = {"code": code, "message": message}
+    if details:
+        payload["details"] = details
+    return payload
+
+
+def _is_private_ip(ip_value: str) -> bool:
+    try:
+        ip = ip_address(ip_value)
+    except ValueError:
+        return True
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+    )
+
+
+def _ensure_public_url(url: str) -> None:
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("INVALID_URL", "Invalid URL host"),
+        )
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 443)
+    except socket.gaierror as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("INVALID_URL", "Unable to resolve URL host"),
+        ) from exc
+    for _, _, _, _, sockaddr in infos:
+        ip_value = sockaddr[0]
+        if _is_private_ip(ip_value):
+            raise HTTPException(
+                status_code=400,
+                detail=error_detail("FORBIDDEN_URL", "URL host is not allowed"),
+            )
+
+
 def load_s3_context() -> Dict[str, Any]:
     s3_endpoint_url = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
     s3_public_endpoint_url = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
@@ -74,16 +133,20 @@ def load_s3_context() -> Dict[str, Any]:
     ):
         raise HTTPException(
             status_code=500,
-            detail=(
+            detail=error_detail(
+                "S3_CONFIG_MISSING",
                 "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
-                "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
+                "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET",
             ),
         )
 
     try:
         resolve_public_endpoint(s3_endpoint_url, s3_public_endpoint_url)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("S3_CONFIG_INVALID", str(exc)),
+        ) from exc
 
     return {
         "s3_internal": get_s3_client(s3_endpoint_url),
@@ -174,13 +237,20 @@ def ensure_ffmpeg_available() -> None:
 def download_video(url: str, dst_path: Path, s3_client, bucket: str) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     if not url:
-        raise HTTPException(status_code=400, detail="Missing video source.")
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("VIDEO_SOURCE_MISSING", "Missing video source."),
+        )
     parsed = urlsplit(url)
     if parsed.scheme in ("http", "https"):
+        _ensure_public_url(url)
         if parsed.path.startswith("/api/v1/download-shared-object/"):
             raise HTTPException(
                 status_code=400,
-                detail="Shared object URLs are not supported for video download.",
+                detail=error_detail(
+                    "SHARED_OBJECT_UNSUPPORTED",
+                    "Shared object URLs are not supported for video download.",
+                ),
             )
         with requests.get(
             url,
@@ -197,7 +267,10 @@ def download_video(url: str, dst_path: Path, s3_client, bucket: str) -> None:
 
     object_key = url.lstrip("/")
     if not object_key:
-        raise HTTPException(status_code=400, detail="Missing MinIO object key.")
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("VIDEO_KEY_MISSING", "Missing MinIO object key."),
+        )
     s3_client.download_file(
         Bucket=bucket,
         Key=object_key,
@@ -252,8 +325,8 @@ def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
     return None, None
 
 
-@router.post("/jobs", response_model=JobOut)
-def create_job(payload: JobCreate, db: Session = Depends(get_db)):
+@router.post("/jobs")
+def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_db)):
     job_id = str(uuid4())
     video_url = payload.video_url
     if payload.video_key:
@@ -300,16 +373,19 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
 
     extract_preview_frames.delay(job.id)
 
-    return JobOut(job_id=job.id, status=job.status)
+    return ok_response({"id": job.id, "status": job.status}, request)
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, request: Request):
     db: Session = SessionLocal()
     try:
         job = db.get(AnalysisJob, job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
+            raise HTTPException(
+                status_code=404,
+                detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+            )
 
         result_payload = normalize_payload(job.result)
         preview_frames = job.preview_frames or []
@@ -323,90 +399,117 @@ def get_job(job_id: str):
                 {"preview_frames": preview_frames}, context
             ).get("preview_frames", preview_frames)
 
-        return {
-            "id": job.id,
-            "status": normalize_status(job.status),
-            "category": job.category,
-            "role": job.role,
-            "video_url": job.video_url,
-            "preview_frames": preview_frames,
-            "progress": normalize_payload(job.progress),
-            "result": result_payload,
-            "error": job.error,
-            "failure_reason": job.failure_reason,
-            "created_at": job.created_at.isoformat() if job.created_at else None,
-            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        }
+        return ok_response(
+            {
+                "id": job.id,
+                "status": normalize_status(job.status),
+                "category": job.category,
+                "role": job.role,
+                "video_url": job.video_url,
+                "preview_frames": preview_frames,
+                "progress": normalize_payload(job.progress),
+                "result": result_payload,
+                "error": job.error,
+                "failure_reason": job.failure_reason,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+            },
+            request,
+        )
     finally:
         db.close()
 
 
 # ✅ endpoint leggero per polling
 @router.get("/jobs/{job_id}/status")
-def job_status(job_id: str, db: Session = Depends(get_db)):
+def job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
-    return {
-        "id": job.id,
-        "status": normalize_status(job.status),
-        "progress": normalize_payload(job.progress),
-        "error": job.error,
-        "failure_reason": job.failure_reason,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-    }
+    return ok_response(
+        {
+            "id": job.id,
+            "status": normalize_status(job.status),
+            "progress": normalize_payload(job.progress),
+            "error": job.error,
+            "failure_reason": job.failure_reason,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        },
+        request,
+    )
 
 
 @router.get("/jobs/{job_id}/poll")
-def job_poll(job_id: str, db: Session = Depends(get_db)):
+def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     result_payload = job.result if job.status == "COMPLETED" else None
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
 
-    return {
-        "id": job.id,
-        "status": job.status,
-        "progress": job.progress,
-        "error": job.error,
-        "failure_reason": job.failure_reason,
-        "result": result_payload,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-    }
+    return ok_response(
+        {
+            "id": job.id,
+            "status": normalize_status(job.status),
+            "progress": normalize_payload(job.progress),
+            "error": job.error,
+            "failure_reason": job.failure_reason,
+            "result": normalize_payload(result_payload),
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        },
+        request,
+    )
 
 
 # ✅ result “pulito” (solo quando pronto)
 @router.get("/jobs/{job_id}/result")
-def job_result(job_id: str, db: Session = Depends(get_db)):
+def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     if job.status == "FAILED":
-        raise HTTPException(status_code=409, detail=job.error or "Job failed")
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_FAILED", job.error or "Job failed"),
+        )
 
     if job.status != "COMPLETED":
-        raise HTTPException(status_code=409, detail="Job not completed yet")
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_NOT_COMPLETED", "Job not completed yet"),
+        )
 
     result_payload = normalize_payload(job.result)
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
-    return result_payload
+    return ok_response({"result": result_payload}, request)
 
 
-@router.post("/jobs/{job_id}/selection", response_model=JobOut)
+@router.post("/jobs/{job_id}/selection")
 def save_selection(
-    job_id: str, payload: SelectionPayload, db: Session = Depends(get_db)
+    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
 ):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     current_target = job.target or {}
     player = current_target.get("player") or {}
@@ -422,21 +525,27 @@ def save_selection(
 
     db.commit()
     db.refresh(job)
-    return JobOut(job_id=job.id, status=job.status)
+    return ok_response({"id": job.id, "status": job.status}, request)
 
 
 @router.post("/jobs/{job_id}/player-ref")
 def save_player_ref(
-    job_id: str, payload: PlayerRefPayload, db: Session = Depends(get_db)
+    job_id: str, payload: PlayerRefPayload, request: Request, db: Session = Depends(get_db)
 ):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     player_ref = payload.dict(exclude_none=True)
     bbox = player_ref.get("bbox") or {}
     if bbox.get("w", 0) <= 0 or bbox.get("h", 0) <= 0:
-        raise HTTPException(status_code=400, detail="Invalid bbox dimensions")
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("INVALID_BBOX", "Invalid bbox dimensions"),
+        )
 
     job.player_ref = payload.frame_key
 
@@ -455,17 +564,25 @@ def save_player_ref(
 
     db.commit()
     db.refresh(job)
-    return {"status": "ok", "player_ref": job.player_ref}
+    return ok_response({"id": job.id, "player_ref": job.player_ref}, request)
 
 
 @router.get("/jobs/{job_id}/frames")
-def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
+def get_frames(
+    job_id: str, request: Request, count: int = 8, db: Session = Depends(get_db)
+):
     if count < 1:
-        raise HTTPException(status_code=400, detail="Count must be >= 1")
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("INVALID_COUNT", "Count must be >= 1"),
+        )
 
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
     context = load_s3_context()
     s3_internal = context["s3_internal"]
     minio_bucket = context["bucket"]
@@ -537,16 +654,22 @@ def get_frames(job_id: str, count: int = 8, db: Session = Depends(get_db)):
         )
 
     if not frames:
-        raise HTTPException(status_code=500, detail="No frames extracted")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("FRAMES_EXTRACTION_FAILED", "No frames extracted"),
+        )
 
-    return {"count": len(frames), "frames": frames}
+    return ok_response({"count": len(frames), "frames": frames}, request)
 
 
 @router.get("/jobs/{job_id}/frames/list")
-def list_frames(job_id: str, db: Session = Depends(get_db)):
+def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     context = load_s3_context()
     s3_internal = context["s3_internal"]
@@ -572,27 +695,35 @@ def list_frames(job_id: str, db: Session = Depends(get_db)):
             items.append({"name": name, "url": signed_url, "key": key})
 
     items.sort(key=lambda item: item["name"])
-    return {"items": items}
+    return ok_response({"items": items}, request)
 
 
-@router.post("/jobs/{job_id}/enqueue", response_model=JobOut)
-def enqueue_job(job_id: str, db: Session = Depends(get_db)):
+@router.post("/jobs/{job_id}/enqueue")
+def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = db.get(AnalysisJob, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
 
     # idempotente: se già avanzato, non reinvio
     if job.status in ["QUEUED", "RUNNING", "COMPLETED", "FAILED"]:
-        return JobOut(job_id=job.id, status=job.status)
+        return ok_response({"id": job.id, "status": job.status}, request)
 
     if job.status not in ["WAITING_FOR_SELECTION", "CREATED", "WAITING_FOR_PLAYER"]:
-        raise HTTPException(status_code=400, detail="Job not enqueueable")
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("JOB_NOT_ENQUEUEABLE", "Job not enqueueable"),
+        )
 
     selections = (job.target or {}).get("selections") or []
     if len(selections) < 2:
         raise HTTPException(
             status_code=400,
-            detail={"error": "PLAYER_SELECTION_REQUIRED"},
+            detail=error_detail(
+                "PLAYER_SELECTION_REQUIRED", "Player selection is required"
+            ),
         )
 
     job.status = "QUEUED"
@@ -602,4 +733,4 @@ def enqueue_job(job_id: str, db: Session = Depends(get_db)):
 
     run_analysis.delay(job.id)
 
-    return JobOut(job_id=job.id, status=job.status)
+    return ok_response({"id": job.id, "status": job.status}, request)

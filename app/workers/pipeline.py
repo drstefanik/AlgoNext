@@ -4,7 +4,9 @@ import json
 import shutil
 import subprocess
 import logging
+import socket
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -174,6 +176,35 @@ def _is_shared_object_url(value: str) -> bool:
     return urlsplit(value).path.startswith("/api/v1/download-shared-object/")
 
 
+def _is_private_ip(ip_value: str) -> bool:
+    try:
+        ip = ip_address(ip_value)
+    except ValueError:
+        return True
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+    )
+
+
+def _ensure_public_url(url: str) -> None:
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        raise RuntimeError("Invalid URL host for video download.")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 443)
+    except socket.gaierror as exc:
+        raise RuntimeError("Unable to resolve URL host for video download.") from exc
+    for _, _, _, _, sockaddr in infos:
+        ip_value = sockaddr[0]
+        if _is_private_ip(ip_value):
+            raise RuntimeError("URL host is not allowed for video download.")
+
+
 def download_video(
     source: str,
     dst_path: Path,
@@ -189,6 +220,7 @@ def download_video(
         raise RuntimeError("Missing video source.")
 
     if _is_http_url(source):
+        _ensure_public_url(source)
         if _is_shared_object_url(source):
             raise RuntimeError("Shared object URLs are not supported for video download.")
 
@@ -588,8 +620,8 @@ def presign_get_url(
 # ----------------------------
 # Celery task
 # ----------------------------
-@celery.task(name="app.workers.pipeline.extract_preview_frames")
-def extract_preview_frames(job_id: str) -> None:
+@celery.task(name="app.workers.pipeline.extract_preview_frames", bind=True)
+def extract_preview_frames(self, job_id: str) -> None:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
 
@@ -598,6 +630,7 @@ def extract_preview_frames(job_id: str) -> None:
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
 
+    max_retries = int(os.environ.get("PREVIEW_TASK_RETRIES", "2"))
     try:
         job = reload_job(db, job_id)
         if not job:
@@ -695,8 +728,26 @@ def extract_preview_frames(job_id: str) -> None:
                 ),
             )
             logger.info("Preview frames generated for job %s", job_id)
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to generate preview frames for job %s", job_id)
+        if self.request.retries < max_retries:
+            raise self.retry(exc=exc, countdown=5 * (2 ** self.request.retries))
+        try:
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "error", str(exc)),
+                    setattr(
+                        job,
+                        "failure_reason",
+                        normalize_failure_reason("preview_generation_failed"),
+                    ),
+                    set_progress(job, "PREVIEWS_FAILED", 20, "Preview generation failed"),
+                ),
+            )
+        except Exception:
+            db.rollback()
     finally:
         if base_dir is not None and base_dir.exists():
             try:
@@ -706,8 +757,8 @@ def extract_preview_frames(job_id: str) -> None:
         db.close()
 
 
-@celery.task(name="app.workers.pipeline.run_analysis")
-def run_analysis(job_id: str):
+@celery.task(name="app.workers.pipeline.run_analysis", bind=True)
+def run_analysis(self, job_id: str):
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
     video_features: Optional[Dict[str, Any]] = None
@@ -720,6 +771,7 @@ def run_analysis(job_id: str):
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
 
+    max_retries = int(os.environ.get("ANALYSIS_TASK_RETRIES", "2"))
     try:
         job = reload_job(db, job_id)
         if not job:
@@ -1123,6 +1175,8 @@ def run_analysis(job_id: str):
         return
     except Exception as e:
         try:
+            if self.request.retries < max_retries:
+                raise self.retry(exc=e, countdown=10 * (2 ** self.request.retries))
             update_job(
                 db,
                 job_id,

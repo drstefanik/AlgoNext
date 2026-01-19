@@ -1,9 +1,13 @@
 import logging
 import os
 import time
+from datetime import datetime, timezone
+from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine.url import make_url
@@ -34,6 +38,27 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-Id") or str(uuid4())
+        request.state.request_id = request_id
+        start_time = time.monotonic()
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = request_id
+        duration_ms = (time.monotonic() - start_time) * 1000
+        logger.info(
+            "API_REQUEST",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+                "request_id": request_id,
+            },
+        )
+        return response
+
+
 app = FastAPI(
     title="FNX Video AI Backend",
     docs_url=DOCS_URL,
@@ -42,6 +67,7 @@ app = FastAPI(
 )
 
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestContextMiddleware)
 
 cors_allowed_origins = [
     origin.strip()
@@ -67,6 +93,71 @@ if APP_ENV == "production":
     allowed_hosts = [host.strip() for host in allowed_hosts_env.split(",") if host.strip()]
     if allowed_hosts:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+
+def _error_payload(code: str, message: str, details: dict | None = None) -> dict:
+    payload = {"code": code, "message": message}
+    if details:
+        payload["details"] = details
+    return payload
+
+
+def _meta_payload(request: Request) -> dict:
+    request_id = getattr(request.state, "request_id", None)
+    return {
+        "request_id": request_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "ok": False,
+            "error": _error_payload(
+                "VALIDATION_ERROR",
+                "Request validation failed",
+                {"errors": exc.errors()},
+            ),
+            "meta": _meta_payload(request),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception during request.")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": _error_payload("INTERNAL_ERROR", "Unexpected server error"),
+            "meta": _meta_payload(request),
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        code = detail.get("code") or "HTTP_ERROR"
+        message = detail.get("message") or "Request failed"
+        details = detail.get("details")
+    else:
+        code = "HTTP_ERROR"
+        message = str(detail)
+        details = None
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "error": _error_payload(code, message, details),
+            "meta": _meta_payload(request),
+        },
+    )
 
 def init_db():
     for _ in range(30):  # ~30s
