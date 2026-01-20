@@ -22,6 +22,7 @@ from app.core.env import is_production_env
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
+from app.workers.tracking import track_player
 
 logger = logging.getLogger(__name__)
 
@@ -518,6 +519,46 @@ def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
     return created
 
 
+def build_motion_segments(
+    bboxes: List[Dict[str, Any]], speed_threshold: float = 0.02
+) -> List[Dict[str, float]]:
+    if len(bboxes) < 2:
+        return []
+    segments: List[Dict[str, float]] = []
+    active_start = None
+    last_time = None
+    last_center = None
+    for bbox in bboxes:
+        t = float(bbox.get("t", 0.0))
+        center = (
+            float(bbox.get("x", 0.0)) + float(bbox.get("w", 0.0)) * 0.5,
+            float(bbox.get("y", 0.0)) + float(bbox.get("h", 0.0)) * 0.5,
+        )
+        if last_time is None or last_center is None:
+            last_time = t
+            last_center = center
+            continue
+        dt = t - last_time
+        if dt <= 0:
+            last_time = t
+            last_center = center
+            continue
+        dist = ((center[0] - last_center[0]) ** 2 + (center[1] - last_center[1]) ** 2) ** 0.5
+        speed = dist / dt
+        if speed >= speed_threshold:
+            if active_start is None:
+                active_start = last_time
+        else:
+            if active_start is not None:
+                segments.append({"start": float(active_start), "end": float(t)})
+                active_start = None
+        last_time = t
+        last_center = center
+    if active_start is not None and last_time is not None:
+        segments.append({"start": float(active_start), "end": float(last_time)})
+    return segments
+
+
 # ----------------------------
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
@@ -995,7 +1036,8 @@ def run_analysis(self, job_id: str):
         job = reload_job(db, job_id)
         if not job:
             return
-        if not (job.player_ref or "").strip():
+        player_ref = job.anchor or {}
+        if not (player_ref.get("bbox") and player_ref.get("time_sec") is not None):
             update_job(
                 db,
                 job_id,
@@ -1012,24 +1054,44 @@ def run_analysis(self, job_id: str):
             )
             return
 
-        # Tracking (stub)
+        # Tracking
         update_job(
             db,
             job_id,
-            lambda job: (
-                set_progress(job, "TRACKING", 40, "Tracking selected player"),
-                setattr(
-                    job,
-                    "result",
-                    {
-                        **(job.result or {}),
-                        "tracking": {
-                            "method": "stub",
-                            "selected_boxes": len(selections),
-                            "notes": "tracking not implemented yet",
-                        },
+            lambda job: set_progress(job, "TRACKING", 35, "Tracking selected player"),
+        )
+        tracking_output = track_player(
+            job_id,
+            str(input_path),
+            player_ref,
+            selections,
+        )
+        tracking_asset = {
+            "bucket": s3_bucket,
+            "key": tracking_output.get("tracking_key"),
+            "url": tracking_output.get("tracking_url"),
+        }
+        motion_segments = build_motion_segments(tracking_output.get("bboxes") or [])
+        update_job(
+            db,
+            job_id,
+            lambda job: setattr(
+                job,
+                "result",
+                {
+                    **(job.result or {}),
+                    "tracking": {
+                        "method": tracking_output.get("method"),
+                        "fps": tracking_output.get("fps"),
+                        "coverage_pct": tracking_output.get("coverage_pct"),
+                        "bboxes_count": len(tracking_output.get("bboxes") or []),
+                        "track_id": tracking_output.get("track_id"),
+                        "lost_segments": tracking_output.get("lost_segments"),
+                        "motion_segments": motion_segments,
+                        "notes": tracking_output.get("notes"),
+                        "asset": tracking_asset,
                     },
-                ),
+                },
             ),
         )
 
