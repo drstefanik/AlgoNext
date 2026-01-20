@@ -391,23 +391,45 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
         video_bucket = bucket
         video_key = payload.video_key
     elif video_url:
-        parsed = urlsplit(video_url)
-        if parsed.scheme not in ("http", "https"):
-            raise HTTPException(
-                status_code=400,
-                detail=error_detail(
-                    "INVALID_URL",
-                    "video_url must be an http(s) URL.",
-                ),
+        if video_url.lower().startswith(("http://", "https://")):
+            parsed = urlsplit(video_url)
+            if parsed.scheme not in ("http", "https"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_detail(
+                        "INVALID_URL",
+                        "video_url must be an http(s) URL.",
+                    ),
+                )
+            if _is_shared_object_url(video_url):
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_detail(
+                        "SHARED_OBJECT_UNSUPPORTED",
+                        "Shared object URLs are not supported for video download.",
+                    ),
+                )
+        else:
+            context = load_s3_context()
+            s3_internal = context["s3_internal"]
+            bucket = payload.video_bucket or context["bucket"]
+            if not bucket:
+                raise HTTPException(
+                    status_code=400,
+                    detail=error_detail(
+                        "VIDEO_BUCKET_MISSING",
+                        "video_bucket is required when using video_key.",
+                    ),
+                )
+            expires_seconds = context["expires_seconds"]
+            video_url = presign_get_url(
+                s3_internal,
+                bucket,
+                video_url,
+                expires_seconds,
             )
-        if _is_shared_object_url(video_url):
-            raise HTTPException(
-                status_code=400,
-                detail=error_detail(
-                    "SHARED_OBJECT_UNSUPPORTED",
-                    "Shared object URLs are not supported for video download.",
-                ),
-            )
+            video_bucket = bucket
+            video_key = payload.video_url
 
     target = {
         "player": {
