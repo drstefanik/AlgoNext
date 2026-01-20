@@ -257,6 +257,14 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
             for clip in clips_root
         ]
 
+    tracking = hydrated.get("tracking")
+    if isinstance(tracking, dict):
+        tracking_copy = {**tracking}
+        asset = tracking_copy.get("asset")
+        if isinstance(asset, dict):
+            tracking_copy["asset"] = normalize_asset(asset, include_url=True)
+        hydrated["tracking"] = tracking_copy
+
     return hydrated
 
 
@@ -643,6 +651,7 @@ def save_player_ref(
         )
 
     job.player_ref = payload.frame_key
+    job.anchor = player_ref
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
