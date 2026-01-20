@@ -1,6 +1,7 @@
 import logging
 import os
 
+import torch
 from celery import Celery
 
 from app.core.env import load_env
@@ -16,6 +17,11 @@ logger.info(
     os.environ.get("S3_ENDPOINT_URL"),
     os.environ.get("S3_PUBLIC_ENDPOINT_URL"),
     os.environ.get("S3_BUCKET"),
+)
+logger.info(
+    "Torch device: cuda_available=%s device=%s",
+    torch.cuda.is_available(),
+    "cuda" if torch.cuda.is_available() else "cpu",
 )
 
 celery = Celery(
