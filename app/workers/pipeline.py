@@ -839,13 +839,33 @@ def run_analysis(self, job_id: str):
     try:
         job = reload_job(db, job_id)
         if not job:
+            logger.warning("run_analysis early-exit: job_not_found job_id=%s", job_id)
             return
+
+        logger.info(
+            "run_analysis loaded job_id=%s status=%s role=%s category=%s",
+            job_id,
+            getattr(job, "status", None),
+            getattr(job, "role", None),
+            getattr(job, "category", None),
+        )
 
         role = job.role
         category = job.category
 
-        selections = (job.target or {}).get("selections") or []
+        target = job.target or {}
+        selections = target.get("selections") or []
+        logger.info(
+            "run_analysis target job_id=%s selections_len=%s target_keys=%s",
+            job_id,
+            len(selections),
+            sorted(list(target.keys()))[:50],
+        )
+
         if len(selections) < 1:
+            logger.warning(
+                "run_analysis early-exit: waiting_for_selection job_id=%s", job_id
+            )
             update_job(
                 db,
                 job_id,
@@ -873,6 +893,7 @@ def run_analysis(self, job_id: str):
                 set_progress(job, "STARTING", 1, "Job started"),
             ),
         )
+        logger.info("run_analysis status set RUNNING job_id=%s", job_id)
 
         # Preconditions
         if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
@@ -881,7 +902,14 @@ def run_analysis(self, job_id: str):
                 "S3_SECRET_KEY, S3_BUCKET"
             )
 
+        logger.info(
+            "run_analysis preconditions job_id=%s s3_endpoint=%s bucket=%s",
+            job_id,
+            s3_endpoint_url,
+            s3_bucket,
+        )
         ensure_ffmpeg_available()
+        logger.info("run_analysis ffmpeg ok job_id=%s", job_id)
 
         # Prepare workspace
         base_dir = Path("/tmp/fnh_jobs") / job_id
@@ -892,12 +920,20 @@ def run_analysis(self, job_id: str):
         input_path = base_dir / "input.mp4"
         clips_dir = base_dir / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "run_analysis workspace ready job_id=%s base_dir=%s input_path=%s",
+            job_id,
+            str(base_dir),
+            str(input_path),
+        )
 
         # S3 clients
+        logger.info("run_analysis s3 client init job_id=%s", job_id)
         s3_internal = get_s3_client(s3_endpoint_url)
 
         # Ensure bucket exists
         ensure_bucket_exists(s3_internal, s3_bucket)
+        logger.info("run_analysis bucket ok job_id=%s bucket=%s", job_id, s3_bucket)
 
         # Download
         update_job(
