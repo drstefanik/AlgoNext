@@ -573,6 +573,13 @@ def get_s3_client(endpoint_url: str):
     )
 
 
+def get_s3_public_client():
+    endpoint = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
+    if not endpoint:
+        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
+    return get_s3_client(endpoint)
+
+
 def ensure_bucket_exists(s3_client, bucket: str) -> None:
     try:
         s3_client.head_bucket(Bucket=bucket)
@@ -661,12 +668,12 @@ def presign_get_url(
     key: str,
     expires_seconds: int,
 ) -> str:
-    signed_url = s3_internal.generate_presigned_url(
+    s3_public = get_s3_public_client()
+    return s3_public.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
-    return rewrite_presigned_to_public(signed_url)
 
 
 # ----------------------------

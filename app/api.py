@@ -24,8 +24,6 @@ from app.workers.pipeline import extract_preview_frames, run_analysis
 from app.workers.pipeline import (
     ensure_bucket_exists,
     get_s3_client,
-    presign_get_url,
-    resolve_public_endpoint,
     upload_file,
 )
 
@@ -178,31 +176,27 @@ def load_s3_context() -> Dict[str, Any]:
             ),
         )
 
-    try:
-        resolve_public_endpoint(s3_endpoint_url, s3_public_endpoint_url)
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=error_detail("S3_CONFIG_INVALID", str(exc)),
-        ) from exc
+    s3_internal = get_s3_client(s3_endpoint_url)
+    s3_public = get_s3_client(s3_public_endpoint_url)
 
     return {
-        "s3_internal": get_s3_client(s3_endpoint_url),
+        "s3_internal": s3_internal,
+        "s3_public": s3_public,
         "bucket": s3_bucket,
         "expires_seconds": expires_seconds,
     }
 
 
 def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    s3_internal = context["s3_internal"]
+    s3_public = context["s3_public"]
     bucket_default = context["bucket"]
     expires_seconds = context["expires_seconds"]
+
     def presign(bucket: str, key: str) -> str:
-        return presign_get_url(
-            s3_internal,
-            bucket,
-            key,
-            expires_seconds,
+        return s3_public.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_seconds,
         )
 
     def normalize_asset(asset: Dict[str, Any], include_url: bool) -> Dict[str, Any]:
@@ -379,7 +373,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
     video_key = None
     if payload.video_key:
         context = load_s3_context()
-        s3_internal = context["s3_internal"]
+        s3_public = context["s3_public"]
         bucket = payload.video_bucket or context["bucket"]
         if not bucket:
             raise HTTPException(
@@ -390,11 +384,10 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                 ),
             )
         expires_seconds = context["expires_seconds"]
-        video_url = presign_get_url(
-            s3_internal,
-            bucket,
-            payload.video_key,
-            expires_seconds,
+        video_url = s3_public.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": payload.video_key},
+            ExpiresIn=expires_seconds,
         )
         video_bucket = bucket
         video_key = payload.video_key
@@ -419,7 +412,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                 )
         else:
             context = load_s3_context()
-            s3_internal = context["s3_internal"]
+            s3_public = context["s3_public"]
             bucket = payload.video_bucket or context["bucket"]
             if not bucket:
                 raise HTTPException(
@@ -430,11 +423,10 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                     ),
                 )
             expires_seconds = context["expires_seconds"]
-            video_url = presign_get_url(
-                s3_internal,
-                bucket,
-                video_url,
-                expires_seconds,
+            video_url = s3_public.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": video_url},
+                ExpiresIn=expires_seconds,
             )
             video_bucket = bucket
             video_key = payload.video_url
@@ -691,6 +683,7 @@ def get_frames(
         )
     context = load_s3_context()
     s3_internal = context["s3_internal"]
+    s3_public = context["s3_public"]
     minio_bucket = context["bucket"]
     expires_seconds = context["expires_seconds"]
 
@@ -742,11 +735,10 @@ def get_frames(
         width, height = probe_image_dimensions(frame_path)
         frame_key = f"jobs/{job_id}/frames/{frame_name}"
         upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
-        signed_url = presign_get_url(
-            s3_internal,
-            minio_bucket,
-            frame_key,
-            expires_seconds,
+        signed_url = s3_public.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": minio_bucket, "Key": frame_key},
+            ExpiresIn=expires_seconds,
         )
         frames.append(
             {
@@ -780,6 +772,7 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     context = load_s3_context()
     s3_internal = context["s3_internal"]
+    s3_public = context["s3_public"]
     bucket = context["bucket"]
     expires_seconds = context["expires_seconds"]
 
@@ -793,11 +786,10 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
             if not key or key.endswith("/"):
                 continue
             name = key.split("/")[-1]
-            signed_url = presign_get_url(
-                s3_internal,
-                bucket,
-                key,
-                expires_seconds,
+            signed_url = s3_public.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=expires_seconds,
             )
             items.append({"name": name, "url": signed_url, "key": key})
 

@@ -34,8 +34,18 @@ SIGNED_URL_EXPIRES_SECONDS=3600
 
 Notes:
 - `S3_ENDPOINT_URL` and `S3_PUBLIC_ENDPOINT_URL` must be different.
-- Presigned URLs are generated with the internal endpoint and then rewritten to the public endpoint.
-- If `S3_PUBLIC_ENDPOINT_URL` is not set: development falls back to `http://localhost:9000`; production returns `"Asset link not configured"` instead of a broken link.
+- Presigned URLs for external clients are generated directly with `S3_PUBLIC_ENDPOINT_URL` (no rewrite).
+
+Verification after deploy/restart:
+
+```bash
+JOB_ID="ce0314d8-5944-4bc6-b9df-60b9f1746e92"
+SIGNED_URL="$(curl -s http://localhost:8000/jobs/$JOB_ID | jq -r '.data.preview_frames[0].signed_url')"
+echo "$SIGNED_URL"
+curl -s -o /dev/null -w "%{http_code}\n" "$SIGNED_URL"
+```
+
+Expected result: `200`.
 
 ## GitHub Actions Deploy
 
