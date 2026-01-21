@@ -27,8 +27,14 @@ jobs:
 
             echo "== DEPLOY START $(date -u) =="
 
-            echo "== git pull =="
-            git pull
+            echo "== git fetch =="
+            git fetch origin main
+
+            echo "== git reset --hard origin/main =="
+            git reset --hard origin/main
+
+            echo "== git clean =="
+            git clean -fd
 
             echo "== docker compose pull =="
             docker compose pull || true
