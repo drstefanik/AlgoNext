@@ -18,14 +18,55 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: root
           key: ${{ secrets.VPS_SSH_KEY }}
-          timeout: 60m
-          command_timeout: 60m
+          timeout: 45m
+          command_timeout: 45m
           script: |
-            set -e
+            set -euo pipefail
+
             cd /opt/AlgoNext
-            git pull
-            docker compose pull
-            docker compose build
+
+            echo "== DEPLOY START $(date -u) =="
+
+            echo "== git fetch =="
+            git fetch origin main
+
+            echo "== git reset --hard origin/main =="
+            git reset --hard origin/main
+
+            echo "== git clean =="
+            git clean -fd
+
+            echo "== docker compose pull =="
+            docker compose pull || true
+
+            echo "== build (with heartbeat) =="
+            (
+              while true; do
+                echo "[heartbeat] building... $(date -u)"
+                sleep 25
+              done
+            ) &
+            HB_PID=$!
+
+            # se build fallisce, fermiamo heartbeat e usciamo con errore
+            if ! docker compose build; then
+              kill $HB_PID || true
+              wait $HB_PID 2>/dev/null || true
+              echo "== build failed =="
+              exit 1
+            fi
+
+            kill $HB_PID || true
+            wait $HB_PID 2>/dev/null || true
+
+            echo "== up base services =="
             docker compose up -d db redis minio createbuckets
+
+            echo "== migrate =="
             docker compose run --rm migrate
+
+            echo "== up api + worker =="
             docker compose up -d --force-recreate api worker
+
+            echo "== DEPLOY END $(date -u) =="
+            docker compose ps
