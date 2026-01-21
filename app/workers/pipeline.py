@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import requests
 import boto3
@@ -18,7 +18,6 @@ from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import celery
-from app.core.env import is_production_env
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
@@ -573,13 +572,6 @@ def get_s3_client(endpoint_url: str):
     )
 
 
-def get_s3_public_client():
-    endpoint = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
-    if not endpoint:
-        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
-    return get_s3_client(endpoint)
-
-
 def ensure_bucket_exists(s3_client, bucket: str) -> None:
     try:
         s3_client.head_bucket(Bucket=bucket)
@@ -615,60 +607,12 @@ def upload_file(
             raise
 
 
-def _normalize_endpoint(endpoint: str) -> str:
-    return endpoint.rstrip("/")
-
-
-def resolve_public_endpoint(internal_endpoint: str, public_endpoint: str) -> str:
-    resolved = public_endpoint.strip()
-    if not resolved:
-        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
-
-    internal_normalized = _normalize_endpoint(internal_endpoint)
-    public_normalized = _normalize_endpoint(resolved)
-    if internal_normalized and internal_normalized == public_normalized:
-        raise RuntimeError(
-            "S3_PUBLIC_ENDPOINT_URL must differ from S3_ENDPOINT_URL."
-        )
-
-    return resolved
-
-
-def rewrite_presigned_to_public(url: str) -> str:
-    public_endpoint = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
-    if not public_endpoint:
-        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
-    parsed_url = urlsplit(url)
-    parsed_public = urlsplit(public_endpoint)
-    if not parsed_public.scheme or not parsed_public.netloc:
-        raise RuntimeError("S3_PUBLIC_ENDPOINT_URL must include scheme and host.")
-    if not is_production_env():
-        logger.info(
-            "S3_PRESIGN_REWRITE",
-            extra={
-                "s3_public_endpoint": public_endpoint,
-                "before_host": parsed_url.netloc,
-                "after_host": parsed_public.netloc,
-            },
-        )
-    return urlunsplit(
-        (
-            parsed_public.scheme,
-            parsed_public.netloc,
-            parsed_url.path,
-            parsed_url.query,
-            parsed_url.fragment,
-        )
-    )
-
-
 def presign_get_url(
-    s3_internal,
+    s3_public,
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
-    s3_public = get_s3_public_client()
     return s3_public.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
