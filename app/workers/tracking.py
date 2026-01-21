@@ -5,7 +5,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
 
 import boto3
 import cv2
@@ -15,7 +14,6 @@ from botocore.exceptions import ClientError
 from ultralytics import YOLO
 
 from app.core.db import SessionLocal
-from app.core.env import is_production_env
 from app.core.models import AnalysisJob
 
 logger = logging.getLogger(__name__)
@@ -96,63 +94,17 @@ def _upload_file(
             raise
 
 
-def _normalize_endpoint(endpoint: str) -> str:
-    return endpoint.rstrip("/")
-
-
-def _resolve_public_endpoint(internal_endpoint: str, public_endpoint: str) -> str:
-    resolved = public_endpoint.strip()
-    if not resolved:
-        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
-
-    internal_normalized = _normalize_endpoint(internal_endpoint)
-    public_normalized = _normalize_endpoint(resolved)
-    if internal_normalized and internal_normalized == public_normalized:
-        raise RuntimeError("S3_PUBLIC_ENDPOINT_URL must differ from S3_ENDPOINT_URL.")
-
-    return resolved
-
-
-def _rewrite_presigned_to_public(url: str) -> str:
-    public_endpoint = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
-    if not public_endpoint:
-        raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL.")
-    parsed_url = urlsplit(url)
-    parsed_public = urlsplit(public_endpoint)
-    if not parsed_public.scheme or not parsed_public.netloc:
-        raise RuntimeError("S3_PUBLIC_ENDPOINT_URL must include scheme and host.")
-    if not is_production_env():
-        logger.info(
-            "S3_PRESIGN_REWRITE",
-            extra={
-                "s3_public_endpoint": public_endpoint,
-                "before_host": parsed_url.netloc,
-                "after_host": parsed_public.netloc,
-            },
-        )
-    return urlunsplit(
-        (
-            parsed_public.scheme,
-            parsed_public.netloc,
-            parsed_url.path,
-            parsed_url.query,
-            parsed_url.fragment,
-        )
-    )
-
-
 def _presign_get_url(
-    s3_internal,
+    s3_public,
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
-    signed_url = s3_internal.generate_presigned_url(
+    return s3_public.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
-    return _rewrite_presigned_to_public(signed_url)
 
 
 def _bbox_xyxy_to_xywh_norm(
@@ -290,8 +242,6 @@ def track_player(
             "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
             "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
         )
-
-    _resolve_public_endpoint(s3_endpoint_url, s3_public_endpoint_url)
 
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
@@ -537,10 +487,11 @@ def track_player(
         json.dump(tracking_output, handle, ensure_ascii=False, indent=2)
 
     s3_internal = _get_s3_client(s3_endpoint_url)
+    s3_public = _get_s3_client(s3_public_endpoint_url)
     _ensure_bucket_exists(s3_internal, s3_bucket)
     tracking_key = f"jobs/{job_id}/tracking/tracking.json"
     _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
-    tracking_url = _presign_get_url(s3_internal, s3_bucket, tracking_key, expires_seconds)
+    tracking_url = _presign_get_url(s3_public, s3_bucket, tracking_key, expires_seconds)
 
     tracking_output["tracking_key"] = tracking_key
     tracking_output["tracking_url"] = tracking_url

@@ -187,17 +187,26 @@ def load_s3_context() -> Dict[str, Any]:
     }
 
 
+def presign_get_url(
+    s3_public,
+    bucket: str,
+    key: str,
+    expires_seconds: int,
+) -> str:
+    return s3_public.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
+
+
 def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     s3_public = context["s3_public"]
     bucket_default = context["bucket"]
     expires_seconds = context["expires_seconds"]
 
     def presign(bucket: str, key: str) -> str:
-        return s3_public.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=expires_seconds,
-        )
+        return presign_get_url(s3_public, bucket, key, expires_seconds)
 
     def normalize_asset(asset: Dict[str, Any], include_url: bool) -> Dict[str, Any]:
         bucket = asset.get("bucket") or bucket_default
@@ -735,10 +744,11 @@ def get_frames(
         width, height = probe_image_dimensions(frame_path)
         frame_key = f"jobs/{job_id}/frames/{frame_name}"
         upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
-        signed_url = s3_public.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": minio_bucket, "Key": frame_key},
-            ExpiresIn=expires_seconds,
+        signed_url = presign_get_url(
+            s3_public,
+            minio_bucket,
+            frame_key,
+            expires_seconds,
         )
         frames.append(
             {
@@ -786,10 +796,11 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
             if not key or key.endswith("/"):
                 continue
             name = key.split("/")[-1]
-            signed_url = s3_public.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket, "Key": key},
-                ExpiresIn=expires_seconds,
+            signed_url = presign_get_url(
+                s3_public,
+                bucket,
+                key,
+                expires_seconds,
             )
             items.append({"name": name, "url": signed_url, "key": key})
 
