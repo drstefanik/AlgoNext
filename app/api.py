@@ -39,6 +39,13 @@ POLLING_SAFE_STATUSES = {
     "FAILED",
 }
 
+S3_ENDPOINT_URL = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
+S3_PUBLIC_ENDPOINT_URL = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
+S3_ACCESS_KEY = (os.environ.get("S3_ACCESS_KEY") or "").strip()
+S3_SECRET_KEY = (os.environ.get("S3_SECRET_KEY") or "").strip()
+S3_BUCKET = (os.environ.get("S3_BUCKET") or "").strip()
+SIGNED_URL_EXPIRES_SECONDS = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+
 
 def normalize_status(status: str) -> str:
     if status in POLLING_SAFE_STATUSES:
@@ -153,19 +160,12 @@ def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[st
 
 
 def load_s3_context() -> Dict[str, Any]:
-    s3_endpoint_url = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
-    s3_public_endpoint_url = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
-    s3_access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip()
-    s3_secret_key = (os.environ.get("S3_SECRET_KEY") or "").strip()
-    s3_bucket = (os.environ.get("S3_BUCKET") or "").strip()
-    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-
     if (
-        not s3_endpoint_url
-        or not s3_public_endpoint_url
-        or not s3_access_key
-        or not s3_secret_key
-        or not s3_bucket
+        not S3_ENDPOINT_URL
+        or not S3_PUBLIC_ENDPOINT_URL
+        or not S3_ACCESS_KEY
+        or not S3_SECRET_KEY
+        or not S3_BUCKET
     ):
         raise HTTPException(
             status_code=500,
@@ -176,14 +176,14 @@ def load_s3_context() -> Dict[str, Any]:
             ),
         )
 
-    s3_internal = get_s3_client(s3_endpoint_url)
-    s3_public = get_s3_client(s3_public_endpoint_url)
+    s3_internal = get_s3_client(S3_ENDPOINT_URL)
+    s3_public = get_s3_client(S3_PUBLIC_ENDPOINT_URL)
 
     return {
         "s3_internal": s3_internal,
         "s3_public": s3_public,
-        "bucket": s3_bucket,
-        "expires_seconds": expires_seconds,
+        "bucket": S3_BUCKET,
+        "expires_seconds": SIGNED_URL_EXPIRES_SECONDS,
     }
 
 
