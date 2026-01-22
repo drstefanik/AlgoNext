@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -26,6 +27,8 @@ from app.workers.pipeline import (
     get_s3_client,
     upload_file,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -814,21 +817,40 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
     paginator = s3_internal.get_paginator("list_objects_v2")
 
     items: List[Dict[str, Any]] = []
+    image_suffixes = (".jpg", ".jpeg", ".png", ".webp")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj.get("Key")
             if not key or key.endswith("/"):
                 continue
             name = key.split("/")[-1]
+            if not name.lower().endswith(image_suffixes):
+                continue
             signed_url = presign_get_url(
                 s3_public,
                 bucket,
                 key,
                 expires_seconds,
             )
-            items.append({"name": name, "url": signed_url, "key": key})
+            items.append(
+                {
+                    "name": name,
+                    "url": signed_url,
+                    "key": key,
+                    "width": None,
+                    "height": None,
+                    "time_sec": None,
+                }
+            )
 
-    items.sort(key=lambda item: item["name"])
+    items.sort(key=lambda item: item["key"])
+    logger.info(
+        "frames/list bucket=%s prefix=%s found=%s keys=%s",
+        bucket,
+        prefix,
+        len(items),
+        [item["key"] for item in items[:3]],
+    )
     return ok_response({"items": items}, request)
 
 
