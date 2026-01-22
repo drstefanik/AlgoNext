@@ -7,6 +7,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
+ENV ULTRALYTICS_AUTOINSTALL=0 \
+    ULTRALYTICS_CHECKS=0 \
+    YOLO_AUTOINSTALL=0
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -29,3 +33,5 @@ FROM base AS worker
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY app ./app
+
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt')"
