@@ -604,9 +604,26 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
     return ok_response({"job_id": job.id, "id": job.id, "result": result_payload}, request)
 
 
-@router.post("/jobs/{job_id}/selection")
-def save_selection(
-    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
+def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
+    selections = []
+    for selection in payload.selections:
+        selection_data = selection.dict()
+        selections.append(
+            {
+                "time_sec": selection_data["frame_time_sec"],
+                "bbox": {
+                    "x": selection_data["x"],
+                    "y": selection_data["y"],
+                    "w": selection_data["w"],
+                    "h": selection_data["h"],
+                },
+            }
+        )
+    return {"selections": selections, "tracking": {"status": "PENDING"}}
+
+
+def _save_target_selection(
+    job_id: str, payload: SelectionPayload, request: Request, db: Session
 ):
     job = db.get(AnalysisJob, job_id)
     if not job:
@@ -614,15 +631,7 @@ def save_selection(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
-
-    current_target = job.target or {}
-    player = current_target.get("player") or {}
-    tracking = current_target.get("tracking") or {"status": "PENDING"}
-    job.target = {
-        "player": player,
-        "selections": [selection.dict() for selection in payload.selections],
-        "tracking": tracking,
-    }
+    job.target = _build_target_from_selections(payload)
 
     if job.status == "WAITING_FOR_SELECTION":
         job.status = "CREATED"
@@ -630,6 +639,20 @@ def save_selection(
     db.commit()
     db.refresh(job)
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+
+
+@router.post("/jobs/{job_id}/selection")
+def save_selection(
+    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
+):
+    return _save_target_selection(job_id, payload, request, db)
+
+
+@router.post("/jobs/{job_id}/target")
+def save_target(
+    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
+):
+    return _save_target_selection(job_id, payload, request, db)
 
 
 @router.post("/jobs/{job_id}/player-ref")
@@ -643,16 +666,17 @@ def save_player_ref(
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    player_ref = payload.dict(exclude_none=True)
-    bbox = player_ref.get("bbox") or {}
-    if bbox.get("w", 0) <= 0 or bbox.get("h", 0) <= 0:
+    if payload.w <= 0 or payload.h <= 0:
         raise HTTPException(
             status_code=400,
             detail=error_detail("INVALID_BBOX", "Invalid bbox dimensions"),
         )
 
-    job.player_ref = payload.frame_key
-    job.anchor = player_ref
+    job.anchor = {
+        "time_sec": payload.t,
+        "bbox": {"x": payload.x, "y": payload.y, "w": payload.w, "h": payload.h},
+    }
+    job.player_ref = job.anchor["time_sec"]
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
@@ -828,7 +852,10 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
         )
 
     selections = (job.target or {}).get("selections") or []
-    if len(selections) < 2:
+    player_ref = job.anchor or {}
+    if len(selections) < 1 or not (
+        player_ref.get("bbox") and player_ref.get("time_sec") is not None
+    ):
         raise HTTPException(
             status_code=400,
             detail=error_detail(

@@ -362,16 +362,17 @@ def track_player(
 
     selection_map: Dict[int, Dict[str, float]] = {}
     for selection in selections:
-        sel_time = float(selection.get("t", 0.0))
+        sel_time = float(selection.get("time_sec", 0.0))
+        sel_bbox = selection.get("bbox") or {}
         index = min(
             range(len(samples)),
             key=lambda i: abs(samples[i]["t"] - sel_time),
         )
         selection_map[index] = {
-            "x": float(selection.get("x", 0.0)),
-            "y": float(selection.get("y", 0.0)),
-            "w": float(selection.get("w", 0.0)),
-            "h": float(selection.get("h", 0.0)),
+            "x": float(sel_bbox.get("x", 0.0)),
+            "y": float(sel_bbox.get("y", 0.0)),
+            "w": float(sel_bbox.get("w", 0.0)),
+            "h": float(sel_bbox.get("h", 0.0)),
         }
 
     if selected_track_id is None:
