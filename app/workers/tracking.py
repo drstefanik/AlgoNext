@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import os
@@ -223,6 +224,9 @@ def track_player(
     """
     if not player_ref or "bbox" not in player_ref:
         raise RuntimeError("Missing player_ref for tracking")
+
+    if importlib.util.find_spec("lapx") is None:
+        raise RuntimeError("missing dependency lapx, rebuild image")
 
     s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
