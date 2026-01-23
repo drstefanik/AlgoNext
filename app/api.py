@@ -893,3 +893,8 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     run_analysis.delay(job.id)
 
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+
+
+@router.post("/jobs/{job_id}/confirm-selection")
+def confirm_selection(job_id: str, request: Request, db: Session = Depends(get_db)):
+    return enqueue_job(job_id, request, db)
