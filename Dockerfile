@@ -2,13 +2,14 @@ FROM python:3.11-slim AS base
 
 # System deps:
 # - ffmpeg (video)
-# - build toolchain + numeric libs (needed to build/install lapx on slim)
+# - build toolchain + BLAS/LAPACK (for building lapx wheels on slim)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \
     gfortran \
     python3-dev \
-    libatlas-base-dev \
+    libopenblas-dev \
+    liblapack-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,7 +22,6 @@ ENV ULTRALYTICS_AUTOINSTALL=0 \
 
 COPY requirements.txt .
 
-# Ensure we can build wheels when needed
 RUN pip install --upgrade pip setuptools wheel \
     && pip install -r requirements.txt
 
