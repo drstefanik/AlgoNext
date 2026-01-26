@@ -610,6 +610,7 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_NOT_COMPLETED", "Job not completed yet"),
         )
 
+
     result_payload = normalize_payload(job.result)
     if result_payload:
         context = load_s3_context()
@@ -715,10 +716,11 @@ def save_target(
 @router.post("/jobs/{job_id}/player-ref")
 async def save_player_ref(
     job_id: str,
-    payload: dict = Body(...),
     request: Request,
+    payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
+
     raw_body = await request.body()
     if raw_body:
         logger.info("player-ref body=%s", raw_body.decode("utf-8", errors="replace"))
