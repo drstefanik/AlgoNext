@@ -1,6 +1,6 @@
 from typing import Optional, Dict
 
-from pydantic import BaseModel, Field, conlist, model_validator
+from pydantic import BaseModel, Field, conlist, model_validator, ConfigDict
 
 
 class JobCreate(BaseModel):
@@ -49,7 +49,8 @@ class SelectionPayload(BaseModel):
 
 
 class PlayerRefPayload(BaseModel):
-    t: float = Field(ge=0)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    t: float = Field(ge=0, alias="frameTimeSec")
     x: float = Field(ge=0)
     y: float = Field(ge=0)
     w: float = Field(gt=0)
