@@ -739,7 +739,17 @@ async def save_player_ref(
     try:
         # --- compat: accept flat payload from UI ---
         if isinstance(payload, dict):
-            # case A) UI sends: { frameTimeSec, x, y, w, h }
+            # if payload already has bbox:{x,y,w,h} normalize to bbox_xywh
+            if (
+                "bbox" in payload
+                and "bbox_xywh" not in payload
+                and isinstance(payload.get("bbox"), dict)
+            ):
+                b = payload.get("bbox") or {}
+                if all(k in b for k in ("x", "y", "w", "h")):
+                    payload["bbox_xywh"] = b
+
+            # accept camelCase flat payload too
             if "frameTimeSec" in payload and all(
                 k in payload for k in ("x", "y", "w", "h")
             ):
@@ -753,7 +763,7 @@ async def save_player_ref(
                     },
                 }
 
-            # case B) UI sends snake_case already
+            # accept snake_case flat payload too
             elif "frame_time_sec" in payload and all(
                 k in payload for k in ("x", "y", "w", "h")
             ):
