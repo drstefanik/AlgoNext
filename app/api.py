@@ -794,6 +794,54 @@ async def save_player_ref(
     )
 
 
+@router.post("/jobs/{job_id}/confirm-selection")
+def confirm_selection(
+    job_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    selections = (job.target or {}).get("selections") or []
+    if not selections:
+        raise HTTPException(
+            status_code=422,
+            detail=error_detail("MISSING_SELECTION", "Target selection is missing"),
+        )
+
+    player_ref = job.player_ref or job.anchor or {}
+    if _normalize_player_ref(player_ref) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=error_detail("MISSING_PLAYER_REF", "Player reference is missing"),
+        )
+
+    job.status = "CREATED"
+
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+
+    job.progress = {
+        **progress,
+        "step": "SELECTION_CONFIRMED",
+        "pct": max(current_pct, 15),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    db.commit()
+    db.refresh(job)
+    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+
+
 @router.get("/jobs/{job_id}/frames")
 def get_frames(
     job_id: str, request: Request, count: int = 8, db: Session = Depends(get_db)
