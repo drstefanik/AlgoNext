@@ -20,8 +20,13 @@ except ModuleNotFoundError:
 
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
+from app.core.normalizers import normalize_failure_reason
 
 logger = logging.getLogger(__name__)
+
+
+class TrackingTimeoutError(RuntimeError):
+    pass
 
 
 def _utc_now_iso() -> str:
@@ -69,6 +74,31 @@ def _update_tracking_progress(job_id: str, pct: int, message: str) -> None:
             "step": "TRACKING",
             "pct": max(current_pct, pct),
             "message": message,
+            "updated_at": _utc_now_iso(),
+        }
+        db.commit()
+    finally:
+        db.close()
+
+
+def _mark_tracking_timeout(job_id: str, timeout_seconds: int) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(AnalysisJob, job_id)
+        if not job:
+            return
+        warnings = list(job.warnings or [])
+        if "TRACKING_TIMEOUT" not in warnings:
+            warnings.append("TRACKING_TIMEOUT")
+        job.warnings = warnings
+        job.status = "FAILED"
+        job.failure_reason = normalize_failure_reason("TRACKING_TIMEOUT")
+        job.error = f"Tracking exceeded timeout of {timeout_seconds} seconds"
+        job.progress = {
+            **(job.progress or {}),
+            "step": "FAILED",
+            "pct": 100,
+            "message": "Tracking timeout",
             "updated_at": _utc_now_iso(),
         }
         db.commit()
@@ -290,6 +320,8 @@ def track_player(
     processed_samples = 0
     start_pct = 10
     end_pct = 40
+    tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
+    tracking_started_at = time.monotonic()
 
     frame_index = 0
     try:
@@ -346,6 +378,9 @@ def track_player(
             samples.append({"t": float(timestamp), "detections": detections})
             processed_samples += 1
             now = time.monotonic()
+            if now - tracking_started_at > tracking_timeout_seconds:
+                _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+                raise TrackingTimeoutError("Tracking timeout exceeded")
             if now - last_progress_time >= 10:
                 pct = start_pct + int(
                     (processed_samples / float(total_samples)) * (end_pct - start_pct)
