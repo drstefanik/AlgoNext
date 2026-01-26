@@ -12,8 +12,9 @@ from uuid import uuid4
 
 import requests
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
@@ -713,14 +714,24 @@ def save_target(
 
 @router.post("/jobs/{job_id}/player-ref")
 async def save_player_ref(
-    job_id: str, payload: PlayerRefPayload, request: Request, db: Session = Depends(get_db)
+    job_id: str,
+    payload: dict = Body(...),
+    request: Request,
+    db: Session = Depends(get_db),
 ):
     raw_body = await request.body()
     if raw_body:
         logger.info("player-ref body=%s", raw_body.decode("utf-8", errors="replace"))
     else:
         logger.info("player-ref body=<empty>")
-    logger.info("player-ref payload=%s", payload.model_dump())
+    logger.info("player-ref raw_payload=%s", payload)
+    try:
+        normalized_payload = PlayerRefPayload.model_validate(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    logger.info("player-ref normalized_payload=%s", normalized_payload.model_dump())
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(
@@ -728,23 +739,21 @@ async def save_player_ref(
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    if payload.w <= 0 or payload.h <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail=error_detail("INVALID_BBOX", "Invalid bbox dimensions"),
-        )
+    bbox_xywh = normalized_payload.bbox_xywh
+    bbox_xyxy = normalized_payload.bbox_xyxy
 
     player_ref_payload = {
-        "t": payload.t,
-        "x": payload.x,
-        "y": payload.y,
-        "w": payload.w,
-        "h": payload.h,
+        "t": normalized_payload.frame_time_sec,
+        "x": bbox_xywh["x"],
+        "y": bbox_xywh["y"],
+        "w": bbox_xywh["w"],
+        "h": bbox_xywh["h"],
     }
     job.player_ref = player_ref_payload
     job.anchor = {
-        "time_sec": payload.t,
-        "bbox": {"x": payload.x, "y": payload.y, "w": payload.w, "h": payload.h},
+        "time_sec": normalized_payload.frame_time_sec,
+        "bbox": bbox_xywh,
+        "bbox_xyxy": bbox_xyxy,
     }
 
     selections = (job.target or {}).get("selections") or []
