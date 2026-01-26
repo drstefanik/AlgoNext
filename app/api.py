@@ -464,7 +464,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
         target=target,
         video_meta={},
         anchor={},
-        player_ref=None,
+        player_ref={},
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
         error=None,
@@ -505,7 +505,7 @@ def get_job(job_id: str, request: Request):
 
         selections = (job.target or {}).get("selections") or []
         normalized_selections = [_normalize_selection(sel) for sel in selections]
-        player_ref = _normalize_player_ref(job.anchor or {})
+        player_ref = _normalize_player_ref(job.player_ref or job.anchor or {})
 
         return ok_response(
             {
@@ -652,7 +652,7 @@ def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _normalize_player_ref(anchor: Dict[str, Any]) -> Dict[str, float] | None:
-    if not anchor:
+    if not anchor or isinstance(anchor, str):
         return None
     if {"t", "x", "y", "w", "h"}.issubset(anchor.keys()):
         return {
@@ -685,8 +685,8 @@ def _save_target_selection(
         )
     job.target = _build_target_from_selections(payload)
 
-    player_ref = job.anchor or {}
-    has_player_ref = player_ref.get("bbox") and player_ref.get("time_sec") is not None
+    player_ref = job.player_ref or job.anchor or {}
+    has_player_ref = _normalize_player_ref(player_ref) is not None
     if has_player_ref:
         job.status = "CREATED"
     elif job.status in ["WAITING_FOR_SELECTION", "CREATED"]:
@@ -728,6 +728,14 @@ def save_player_ref(
             detail=error_detail("INVALID_BBOX", "Invalid bbox dimensions"),
         )
 
+    player_ref_payload = {
+        "t": payload.t,
+        "x": payload.x,
+        "y": payload.y,
+        "w": payload.w,
+        "h": payload.h,
+    }
+    job.player_ref = player_ref_payload
     job.anchor = {
         "time_sec": payload.t,
         "bbox": {"x": payload.x, "y": payload.y, "w": payload.w, "h": payload.h},
@@ -753,7 +761,11 @@ def save_player_ref(
     db.commit()
     db.refresh(job)
     return ok_response(
-        {"job_id": job.id, "id": job.id, "player_ref": _normalize_player_ref(job.anchor)},
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "player_ref": _normalize_player_ref(job.player_ref),
+        },
         request,
     )
 
@@ -931,8 +943,8 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
         )
 
     selections = (job.target or {}).get("selections") or []
-    player_ref = job.anchor or {}
-    if not (player_ref.get("bbox") and player_ref.get("time_sec") is not None):
+    player_ref = job.player_ref or job.anchor or {}
+    if _normalize_player_ref(player_ref) is None:
         raise HTTPException(
             status_code=400,
             detail=error_detail("MISSING_PLAYER_REF", "Missing player_ref"),

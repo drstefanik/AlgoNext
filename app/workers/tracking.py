@@ -24,6 +24,29 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_player_ref(player_ref: Dict[str, Any]) -> Dict[str, float] | None:
+    if not player_ref or isinstance(player_ref, str):
+        return None
+    if {"t", "x", "y", "w", "h"}.issubset(player_ref.keys()):
+        return {
+            "t": float(player_ref.get("t", 0.0)),
+            "x": float(player_ref.get("x", 0.0)),
+            "y": float(player_ref.get("y", 0.0)),
+            "w": float(player_ref.get("w", 0.0)),
+            "h": float(player_ref.get("h", 0.0)),
+        }
+    bbox = player_ref.get("bbox") or {}
+    if not bbox:
+        return None
+    return {
+        "t": float(player_ref.get("time_sec", 0.0)),
+        "x": float(bbox.get("x", 0.0)),
+        "y": float(bbox.get("y", 0.0)),
+        "w": float(bbox.get("w", 0.0)),
+        "h": float(bbox.get("h", 0.0)),
+    }
+
+
 def _update_tracking_progress(job_id: str, pct: int, message: str) -> None:
     pct = max(0, min(100, int(pct)))
     db = SessionLocal()
@@ -222,7 +245,8 @@ def track_player(
       "notes": str
     }
     """
-    if not player_ref or "bbox" not in player_ref:
+    player_ref_norm = _normalize_player_ref(player_ref)
+    if player_ref_norm is None:
         raise RuntimeError("Missing player_ref for tracking")
 
     if importlib.util.find_spec("lapx") is None:
@@ -337,14 +361,13 @@ def track_player(
     if not samples:
         raise RuntimeError("No frames sampled for tracking")
 
-    ref_bbox = player_ref.get("bbox") or {}
     ref_norm = {
-        "x": float(ref_bbox.get("x", 0.0)),
-        "y": float(ref_bbox.get("y", 0.0)),
-        "w": float(ref_bbox.get("w", 0.0)),
-        "h": float(ref_bbox.get("h", 0.0)),
+        "x": float(player_ref_norm.get("x", 0.0)),
+        "y": float(player_ref_norm.get("y", 0.0)),
+        "w": float(player_ref_norm.get("w", 0.0)),
+        "h": float(player_ref_norm.get("h", 0.0)),
     }
-    ref_time = float(player_ref.get("time_sec", 0.0))
+    ref_time = float(player_ref_norm.get("t", 0.0))
     ref_index = min(
         range(len(samples)),
         key=lambda i: abs(samples[i]["t"] - ref_time),
@@ -485,7 +508,7 @@ def track_player(
         "coverage_pct": round(coverage_pct, 2),
         "bboxes": bboxes,
         "lost_segments": lost_segments,
-        "anchors_used": {"player_ref": player_ref, "selections": selections},
+        "anchors_used": {"player_ref": player_ref_norm, "selections": selections},
         "notes": "; ".join(notes) if notes else "",
     }
 
