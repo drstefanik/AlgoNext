@@ -1,4 +1,4 @@
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 from pydantic import BaseModel, Field, conlist, model_validator, ConfigDict
 
@@ -50,8 +50,89 @@ class SelectionPayload(BaseModel):
 
 class PlayerRefPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    t: float = Field(gt=0, alias="frameTimeSec")
-    x: float = Field(ge=0)
-    y: float = Field(ge=0)
-    w: float = Field(gt=0)
-    h: float = Field(gt=0)
+    frame_time_sec: float = Field(ge=0, alias="frameTimeSec")
+    bbox_xywh: Dict[str, float]
+    bbox_xyxy: Dict[str, float]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Missing frame_time_sec/frameTimeSec")
+        frame_time_sec = data.get("frame_time_sec", data.get("frameTimeSec"))
+        if frame_time_sec is None:
+            raise ValueError("Missing frame_time_sec/frameTimeSec")
+
+        bbox_xywh = cls._extract_bbox_xywh(data)
+        if bbox_xywh is None:
+            bbox_xywh = cls._extract_bbox_xywh_from_xyxy(data.get("bbox_xyxy"))
+        if bbox_xywh is None:
+            raise ValueError("Missing bbox fields")
+
+        bbox_xywh = cls._validate_bbox_xywh(bbox_xywh)
+        bbox_xyxy = cls._bbox_xywh_to_xyxy(bbox_xywh)
+        return {
+            "frame_time_sec": float(frame_time_sec),
+            "bbox_xywh": bbox_xywh,
+            "bbox_xyxy": bbox_xyxy,
+        }
+
+    @staticmethod
+    def _extract_bbox_xywh(data: Dict[str, Any]) -> Optional[Dict[str, float]]:
+        if {"x", "y", "w", "h"}.issubset(data.keys()):
+            return {
+                "x": float(data["x"]),
+                "y": float(data["y"]),
+                "w": float(data["w"]),
+                "h": float(data["h"]),
+            }
+        bbox = data.get("bbox")
+        if isinstance(bbox, dict) and {"x", "y", "w", "h"}.issubset(bbox.keys()):
+            return {
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x, y, w, h = bbox
+            return {"x": float(x), "y": float(y), "w": float(w), "h": float(h)}
+        return None
+
+    @staticmethod
+    def _extract_bbox_xywh_from_xyxy(bbox_xyxy: Any) -> Optional[Dict[str, float]]:
+        if isinstance(bbox_xyxy, (list, tuple)) and len(bbox_xyxy) == 4:
+            x1, y1, x2, y2 = bbox_xyxy
+            x1_f, y1_f, x2_f, y2_f = map(float, (x1, y1, x2, y2))
+            return {
+                "x": x1_f,
+                "y": y1_f,
+                "w": x2_f - x1_f,
+                "h": y2_f - y1_f,
+            }
+        return None
+
+    @staticmethod
+    def _bbox_xywh_to_xyxy(bbox_xywh: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "x1": bbox_xywh["x"],
+            "y1": bbox_xywh["y"],
+            "x2": bbox_xywh["x"] + bbox_xywh["w"],
+            "y2": bbox_xywh["y"] + bbox_xywh["h"],
+        }
+
+    @staticmethod
+    def _validate_bbox_xywh(bbox_xywh: Dict[str, float]) -> Dict[str, float]:
+        x, y, w, h = (
+            float(bbox_xywh["x"]),
+            float(bbox_xywh["y"]),
+            float(bbox_xywh["w"]),
+            float(bbox_xywh["h"]),
+        )
+        if w <= 0 or h <= 0:
+            raise ValueError("Invalid bbox dimensions")
+        if x < 0 or y < 0 or x > 1 or y > 1:
+            raise ValueError("Invalid bbox dimensions")
+        if x + w > 1 or y + h > 1:
+            raise ValueError("Invalid bbox dimensions")
+        return {"x": x, "y": y, "w": w, "h": h}
