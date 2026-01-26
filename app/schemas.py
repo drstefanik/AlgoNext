@@ -65,7 +65,9 @@ class PlayerRefPayload(BaseModel):
 
         bbox_xywh = cls._extract_bbox_xywh(data)
         if bbox_xywh is None:
-            bbox_xywh = cls._extract_bbox_xywh_from_xyxy(data.get("bbox_xyxy"))
+            bbox_xywh = cls._extract_bbox_xywh_from_xyxy(
+                data.get("bbox_xyxy", data.get("bboxXYXY"))
+            )
         if bbox_xywh is None:
             raise ValueError("Missing bbox fields")
 
@@ -79,6 +81,14 @@ class PlayerRefPayload(BaseModel):
 
     @staticmethod
     def _extract_bbox_xywh(data: Dict[str, Any]) -> Optional[Dict[str, float]]:
+        bbox_xywh = data.get("bbox_xywh", data.get("bboxXYWH"))
+        if isinstance(bbox_xywh, dict) and {"x", "y", "w", "h"}.issubset(bbox_xywh):
+            return {
+                "x": float(bbox_xywh["x"]),
+                "y": float(bbox_xywh["y"]),
+                "w": float(bbox_xywh["w"]),
+                "h": float(bbox_xywh["h"]),
+            }
         if {"x", "y", "w", "h"}.issubset(data.keys()):
             return {
                 "x": float(data["x"]),
