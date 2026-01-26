@@ -737,6 +737,36 @@ async def save_player_ref(
         logger.info("player-ref body=<empty>")
     logger.info("player-ref raw_payload=%s", payload)
     try:
+        # --- compat: accept flat payload from UI ---
+        if isinstance(payload, dict):
+            # case A) UI sends: { frameTimeSec, x, y, w, h }
+            if "frameTimeSec" in payload and all(
+                k in payload for k in ("x", "y", "w", "h")
+            ):
+                payload = {
+                    "frame_time_sec": payload.get("frameTimeSec"),
+                    "bbox_xywh": {
+                        "x": payload.get("x"),
+                        "y": payload.get("y"),
+                        "w": payload.get("w"),
+                        "h": payload.get("h"),
+                    },
+                }
+
+            # case B) UI sends snake_case already
+            elif "frame_time_sec" in payload and all(
+                k in payload for k in ("x", "y", "w", "h")
+            ):
+                payload = {
+                    "frame_time_sec": payload.get("frame_time_sec"),
+                    "bbox_xywh": {
+                        "x": payload.get("x"),
+                        "y": payload.get("y"),
+                        "w": payload.get("w"),
+                        "h": payload.get("h"),
+                    },
+                }
+        # --- end compat ---
         normalized_payload = PlayerRefPayload.model_validate(payload)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -750,60 +780,84 @@ async def save_player_ref(
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    bbox_xywh = normalized_payload.bbox_xywh
-    bbox_xyxy = normalized_payload.bbox_xyxy
-
-    t0 = normalized_payload.frame_time_sec or 0.0
-    player_ref_payload = {
-        "t": float(t0),
-        "x": bbox_xywh["x"],
-        "y": bbox_xywh["y"],
-        "w": bbox_xywh["w"],
-        "h": bbox_xywh["h"],
-    }
-    job.player_ref = player_ref_payload
-    job.anchor = {
-        "time_sec": float(t0),
-        "bbox": bbox_xywh,
-        "bbox_xyxy": bbox_xyxy,
-    }
-
-    selections = (job.target or {}).get("selections") or []
-    if selections:
-        job.status = "CREATED"
-
-    progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
     try:
-        current_pct = int(current_pct)
-    except (TypeError, ValueError):
-        current_pct = 0
-    job.progress = {
-        **progress,
-        "step": "PLAYER_SELECTED",
-        "pct": max(current_pct, 12),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+        bbox_xywh = normalized_payload.bbox_xywh or None
+        bbox_xyxy = normalized_payload.bbox_xyxy or None
 
-    db.commit()
-    db.refresh(job)
-    normalized_player_ref = _normalize_player_ref(job.player_ref or {})
-    if normalized_player_ref is None:
-        raise HTTPException(
-            status_code=500,
-            detail=error_detail(
-                "PLAYER_REF_SAVE_FAILED",
-                "player_ref missing after save",
-            ),
+        # Se arriva solo bbox_xyxy, converti in xywh
+        if (not bbox_xywh) and bbox_xyxy:
+            x1 = float(bbox_xyxy.get("x1", 0.0))
+            y1 = float(bbox_xyxy.get("y1", 0.0))
+            x2 = float(bbox_xyxy.get("x2", 0.0))
+            y2 = float(bbox_xyxy.get("y2", 0.0))
+            bbox_xywh = {
+                "x": x1,
+                "y": y1,
+                "w": max(0.0, x2 - x1),
+                "h": max(0.0, y2 - y1),
+            }
+
+        # Se ancora niente bbox valida -> 422 (non 500)
+        if not bbox_xywh or not all(k in bbox_xywh for k in ("x", "y", "w", "h")):
+            raise HTTPException(
+                status_code=422,
+                detail=error_detail("INVALID_BBOX", "Missing bbox_xywh (or bbox_xyxy)"),
+            )
+
+        t0 = normalized_payload.frame_time_sec or 0.0
+        player_ref_payload = {
+            "t": float(t0),
+            "x": bbox_xywh["x"],
+            "y": bbox_xywh["y"],
+            "w": bbox_xywh["w"],
+            "h": bbox_xywh["h"],
+        }
+        job.player_ref = player_ref_payload
+        job.anchor = {
+            "time_sec": float(t0),
+            "bbox": bbox_xywh,
+            "bbox_xyxy": bbox_xyxy,
+        }
+
+        selections = (job.target or {}).get("selections") or []
+        if selections:
+            job.status = "CREATED"
+
+        progress = job.progress or {}
+        current_pct = progress.get("pct") or 0
+        try:
+            current_pct = int(current_pct)
+        except (TypeError, ValueError):
+            current_pct = 0
+        job.progress = {
+            **progress,
+            "step": "PLAYER_SELECTED",
+            "pct": max(current_pct, 12),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        db.commit()
+        db.refresh(job)
+        normalized_player_ref = _normalize_player_ref(job.player_ref or {})
+        if normalized_player_ref is None:
+            raise HTTPException(
+                status_code=500,
+                detail=error_detail(
+                    "PLAYER_REF_SAVE_FAILED",
+                    "player_ref missing after save",
+                ),
+            )
+        return ok_response(
+            {
+                "job_id": job.id,
+                "id": job.id,
+                "player_ref": normalized_player_ref,
+            },
+            request,
         )
-    return ok_response(
-        {
-            "job_id": job.id,
-            "id": job.id,
-            "player_ref": normalized_player_ref,
-        },
-        request,
-    )
+    except Exception:
+        logger.exception("player-ref failed job_id=%s payload=%s", job_id, payload)
+        raise
 
 
 @router.post("/jobs/{job_id}/confirm-selection")
