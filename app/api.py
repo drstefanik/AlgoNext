@@ -712,9 +712,15 @@ def save_target(
 
 
 @router.post("/jobs/{job_id}/player-ref")
-def save_player_ref(
+async def save_player_ref(
     job_id: str, payload: PlayerRefPayload, request: Request, db: Session = Depends(get_db)
 ):
+    raw_body = await request.body()
+    if raw_body:
+        logger.info("player-ref body=%s", raw_body.decode("utf-8", errors="replace"))
+    else:
+        logger.info("player-ref body=<empty>")
+    logger.info("player-ref payload=%s", payload.model_dump())
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(
@@ -760,11 +766,20 @@ def save_player_ref(
 
     db.commit()
     db.refresh(job)
+    normalized_player_ref = _normalize_player_ref(job.player_ref or {})
+    if normalized_player_ref is None:
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail(
+                "PLAYER_REF_SAVE_FAILED",
+                "player_ref missing after save",
+            ),
+        )
     return ok_response(
         {
             "job_id": job.id,
             "id": job.id,
-            "player_ref": _normalize_player_ref(job.player_ref),
+            "player_ref": normalized_player_ref,
         },
         request,
     )
