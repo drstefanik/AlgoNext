@@ -118,6 +118,55 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
     return result, assets
 
 
+def _build_candidate_payload(
+    candidates_payload: Dict[str, Any], context: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    candidates = candidates_payload.get("candidates") or []
+    if not isinstance(candidates, list):
+        return []
+    s3_public = context["s3_public"]
+    bucket_default = context["bucket"]
+    expires_seconds = context["expires_seconds"]
+    items: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        sample_frames = candidate.get("sample_frames") or []
+        normalized_frames: List[Dict[str, Any]] = []
+        for sample in sample_frames:
+            if not isinstance(sample, dict):
+                continue
+            key = sample.get("key")
+            if not key:
+                continue
+            bucket = sample.get("bucket") or bucket_default
+            signed_url = presign_get_url(
+                s3_public,
+                bucket,
+                key,
+                expires_seconds,
+            )
+            normalized_frames.append(
+                {
+                    "frame_time_sec": float(
+                        sample.get("time_sec", sample.get("frame_time_sec", 0.0))
+                    ),
+                    "image_url": signed_url,
+                    "bbox": sample.get("bbox") or {},
+                }
+            )
+        items.append(
+            {
+                "trackId": candidate.get("track_id"),
+                "coveragePct": candidate.get("coverage_pct"),
+                "stabilityScore": candidate.get("stability_score"),
+                "avgBoxArea": candidate.get("avg_box_area"),
+                "sampleFrames": normalized_frames,
+            }
+        )
+    return items
+
+
 def build_meta(request: Request | None = None) -> dict:
     request_id = getattr(request.state, "request_id", None) if request else None
     return {
@@ -684,6 +733,25 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
         },
         request,
     )
+
+
+@router.get("/jobs/{job_id}/candidates")
+def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    result_payload = normalize_payload(job.result)
+    candidates_payload = result_payload.get("candidates") or {}
+    if not candidates_payload:
+        return ok_response({"candidates": []}, request)
+
+    context = load_s3_context()
+    candidates = _build_candidate_payload(candidates_payload, context)
+    return ok_response({"candidates": candidates}, request)
 
 
 def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:

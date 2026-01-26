@@ -21,7 +21,7 @@ from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.workers.tracking import TrackingTimeoutError, track_player
+from app.workers.tracking import TrackingTimeoutError, track_all_players, track_player
 
 logger = logging.getLogger(__name__)
 
@@ -1083,6 +1083,35 @@ def run_analysis(self, job_id: str):
                 lambda job: (
                     setattr(job, "preview_frames", preview_frames),
                     set_progress(job, "PREVIEWS_READY", 30, "Preview frames ready"),
+                ),
+            )
+
+        job = reload_job(db, job_id)
+        if not job:
+            return
+        existing_candidates = (job.result or {}).get("candidates")
+        if not existing_candidates:
+            update_job(
+                db,
+                job_id,
+                lambda job: set_progress(
+                    job, "TRACKING_CANDIDATES", 32, "Tracking all players"
+                ),
+            )
+            candidates_output = track_all_players(
+                job_id,
+                str(input_path),
+            )
+            update_job(
+                db,
+                job_id,
+                lambda job: setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "candidates": candidates_output,
+                    },
                 ),
             )
 

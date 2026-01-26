@@ -565,3 +565,249 @@ def track_player(
     tracking_output["tracking_url"] = tracking_url
 
     return tracking_output
+
+
+def _select_sample_indices(count: int, min_samples: int = 3, max_samples: int = 6) -> List[int]:
+    if count <= 0:
+        return []
+    target = max(min_samples, min(max_samples, count))
+    if target >= count:
+        return list(range(count))
+    indices = np.linspace(0, count - 1, target)
+    return sorted({int(round(idx)) for idx in indices})
+
+
+def track_all_players(
+    job_id: str,
+    input_video_path: str,
+    *,
+    fps: int = 5,
+    detector_model: str = "yolo11s.pt",
+    tracker: str = "bytetrack.yaml",
+) -> Dict[str, Any]:
+    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
+    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+
+    if (
+        not s3_endpoint_url
+        or not s3_public_endpoint_url
+        or not s3_access_key
+        or not s3_secret_key
+        or not s3_bucket
+    ):
+        raise RuntimeError(
+            "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
+            "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
+        )
+
+    cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open video for tracking")
+
+    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if orig_fps <= 0:
+        orig_fps = 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_interval = max(1, int(round(orig_fps / float(fps))))
+    total_samples = max(1, int(np.ceil(total_frames / frame_interval)))
+
+    model = YOLO(detector_model)
+    samples: List[Dict[str, Any]] = []
+    track_map: Dict[int, List[Dict[str, Any]]] = {}
+
+    last_progress_time = time.monotonic()
+    processed_samples = 0
+    start_pct = 10
+    end_pct = 40
+    tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
+    tracking_started_at = time.monotonic()
+
+    frame_index = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_index % frame_interval != 0:
+                frame_index += 1
+                continue
+
+            height, width = frame.shape[:2]
+            timestamp = frame_index / float(orig_fps)
+            results = model.track(
+                source=frame,
+                persist=True,
+                tracker=tracker,
+                conf=0.25,
+                iou=0.5,
+                classes=[0],
+                verbose=False,
+            )
+            detections: List[Dict[str, Any]] = []
+            if results:
+                boxes = results[0].boxes
+                if boxes is not None and boxes.xyxy is not None:
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
+                    ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+                    for idx in range(len(xyxy)):
+                        if idx >= len(ids):
+                            continue
+                        track_id = ids[idx]
+                        if track_id is None:
+                            continue
+                        bbox_norm = _bbox_xyxy_to_xywh_norm(
+                            tuple(xyxy[idx]), width, height
+                        )
+                        detection = {
+                            "track_id": int(track_id),
+                            "bbox": {
+                                "x": bbox_norm[0],
+                                "y": bbox_norm[1],
+                                "w": bbox_norm[2],
+                                "h": bbox_norm[3],
+                            },
+                            "conf": float(confs[idx]) if idx < len(confs) else 0.0,
+                        }
+                        detections.append(detection)
+                        track_map.setdefault(int(track_id), []).append(
+                            {
+                                "t": float(timestamp),
+                                "bbox": detection["bbox"],
+                                "conf": detection["conf"],
+                                "sample_index": processed_samples,
+                            }
+                        )
+
+            samples.append({"t": float(timestamp), "detections": detections})
+            processed_samples += 1
+            now = time.monotonic()
+            if now - tracking_started_at > tracking_timeout_seconds:
+                _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+                raise TrackingTimeoutError("Tracking timeout exceeded")
+            if now - last_progress_time >= 10:
+                pct = start_pct + int(
+                    (processed_samples / float(total_samples)) * (end_pct - start_pct)
+                )
+                _update_tracking_progress(job_id, pct, "Tracking all players")
+                last_progress_time = now
+
+            frame_index += 1
+    finally:
+        cap.release()
+
+    _update_tracking_progress(job_id, end_pct, "Tracking all players")
+
+    if not samples:
+        raise RuntimeError("No frames sampled for tracking")
+
+    candidates: List[Dict[str, Any]] = []
+    for track_id, detections in track_map.items():
+        detections_sorted = sorted(detections, key=lambda d: d["sample_index"])
+        if len(detections_sorted) < 3:
+            continue
+        coverage_pct = (len(detections_sorted) / float(len(samples))) * 100.0
+        avg_box_area = float(
+            np.mean([det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted])
+        )
+        segments = 1
+        last_index = detections_sorted[0]["sample_index"]
+        for det in detections_sorted[1:]:
+            if det["sample_index"] - last_index > 1:
+                segments += 1
+            last_index = det["sample_index"]
+        id_switches = max(0, segments - 1)
+        normalized_switches = id_switches / float(max(1, len(detections_sorted) - 1))
+        stability_score = max(0.0, 1.0 - normalized_switches)
+        sample_indices = _select_sample_indices(len(detections_sorted))
+        sample_frames = [
+            {
+                "time_sec": float(detections_sorted[idx]["t"]),
+                "bbox": detections_sorted[idx]["bbox"],
+            }
+            for idx in sample_indices
+        ]
+        candidates.append(
+            {
+                "track_id": int(track_id),
+                "coverage_pct": round(coverage_pct, 2),
+                "stability_score": round(float(stability_score), 3),
+                "avg_box_area": round(float(avg_box_area), 6),
+                "id_switches": int(id_switches),
+                "sample_frames": sample_frames,
+            }
+        )
+
+    if not candidates:
+        return {
+            "method": "yolo+bytetrack",
+            "fps": fps,
+            "generated_at": _utc_now_iso(),
+            "candidates": [],
+        }
+
+    candidates.sort(
+        key=lambda item: (
+            item.get("coverage_pct", 0),
+            item.get("stability_score", 0),
+            item.get("avg_box_area", 0),
+        ),
+        reverse=True,
+    )
+
+    s3_internal = _get_s3_client(s3_endpoint_url)
+    s3_public = _get_s3_client(s3_public_endpoint_url)
+    _ensure_bucket_exists(s3_internal, s3_bucket)
+
+    candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(input_video_path))
+    try:
+        for candidate in candidates:
+            sample_frames = candidate.get("sample_frames") or []
+            uploaded_frames: List[Dict[str, Any]] = []
+            for idx, sample in enumerate(sample_frames, start=1):
+                timestamp = float(sample["time_sec"])
+                cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_name = f"track_{candidate['track_id']}_{idx:02d}.jpg"
+                frame_path = candidates_dir / frame_name
+                cv2.imwrite(str(frame_path), frame)
+                frame_key = f"jobs/{job_id}/candidates/{frame_name}"
+                _upload_file(
+                    s3_internal,
+                    s3_bucket,
+                    frame_path,
+                    frame_key,
+                    "image/jpeg",
+                )
+                uploaded_frames.append(
+                    {
+                        "time_sec": timestamp,
+                        "bbox": sample["bbox"],
+                        "bucket": s3_bucket,
+                        "key": frame_key,
+                    }
+                )
+            candidate["sample_frames"] = uploaded_frames
+    finally:
+        cap.release()
+
+    candidates = [c for c in candidates if len(c.get("sample_frames") or []) >= 3]
+
+    return {
+        "method": "yolo+bytetrack",
+        "fps": fps,
+        "generated_at": _utc_now_iso(),
+        "expires_in": expires_seconds,
+        "candidates": candidates,
+        "bucket": s3_bucket,
+        "assets_prefix": f"jobs/{job_id}/candidates/",
+    }
