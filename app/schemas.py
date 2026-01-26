@@ -50,7 +50,7 @@ class SelectionPayload(BaseModel):
 
 class PlayerRefPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    t: float = Field(ge=0, alias="frameTimeSec")
+    t: float = Field(gt=0, alias="frameTimeSec")
     x: float = Field(ge=0)
     y: float = Field(ge=0)
     w: float = Field(gt=0)
