@@ -656,23 +656,32 @@ def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
 def _normalize_player_ref(anchor: Dict[str, Any]) -> Dict[str, float] | None:
     if not anchor or isinstance(anchor, str):
         return None
+
+    def f(v: Any) -> float:
+        try:
+            if v is None:
+                return 0.0
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
     if {"t", "x", "y", "w", "h"}.issubset(anchor.keys()):
         return {
-            "t": float(anchor.get("t", 0.0)),
-            "x": float(anchor.get("x", 0.0)),
-            "y": float(anchor.get("y", 0.0)),
-            "w": float(anchor.get("w", 0.0)),
-            "h": float(anchor.get("h", 0.0)),
+            "t": f(anchor.get("t")),
+            "x": f(anchor.get("x")),
+            "y": f(anchor.get("y")),
+            "w": f(anchor.get("w")),
+            "h": f(anchor.get("h")),
         }
     bbox = anchor.get("bbox") or {}
     if not bbox:
         return None
     return {
-        "t": float(anchor.get("time_sec", 0.0)),
-        "x": float(bbox.get("x", 0.0)),
-        "y": float(bbox.get("y", 0.0)),
-        "w": float(bbox.get("w", 0.0)),
-        "h": float(bbox.get("h", 0.0)),
+        "t": f(anchor.get("time_sec")),
+        "x": f(bbox.get("x")),
+        "y": f(bbox.get("y")),
+        "w": f(bbox.get("w")),
+        "h": f(bbox.get("h")),
     }
 
 
@@ -744,8 +753,9 @@ async def save_player_ref(
     bbox_xywh = normalized_payload.bbox_xywh
     bbox_xyxy = normalized_payload.bbox_xyxy
 
+    t0 = normalized_payload.frame_time_sec or 0.0
     player_ref_payload = {
-        "t": normalized_payload.frame_time_sec,
+        "t": float(t0),
         "x": bbox_xywh["x"],
         "y": bbox_xywh["y"],
         "w": bbox_xywh["w"],
@@ -753,7 +763,7 @@ async def save_player_ref(
     }
     job.player_ref = player_ref_payload
     job.anchor = {
-        "time_sec": normalized_payload.frame_time_sec,
+        "time_sec": float(t0),
         "bbox": bbox_xywh,
         "bbox_xyxy": bbox_xyxy,
     }
