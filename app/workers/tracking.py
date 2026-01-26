@@ -366,8 +366,12 @@ def track_player(
 
     selection_map: Dict[int, Dict[str, float]] = {}
     for selection in selections:
-        sel_time = float(selection.get("time_sec", 0.0))
-        sel_bbox = selection.get("bbox") or {}
+        if "frame_time_sec" in selection:
+            sel_time = float(selection.get("frame_time_sec", 0.0))
+            sel_bbox = selection
+        else:
+            sel_time = float(selection.get("time_sec", 0.0))
+            sel_bbox = selection.get("bbox") or {}
         index = min(
             range(len(samples)),
             key=lambda i: abs(samples[i]["t"] - sel_time),
