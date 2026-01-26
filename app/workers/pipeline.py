@@ -21,7 +21,7 @@ from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.workers.tracking import track_player
+from app.workers.tracking import TrackingTimeoutError, track_player
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,44 @@ def weighted_overall_score(radar: Dict[str, float], role: Optional[str]) -> int:
     value = weighted_sum / w_sum
     value = max(0.0, min(100.0, value))
     return int(round(value))
+
+
+def keys_required_for_role(role: Optional[str]) -> List[str]:
+    role = (role or "").strip()
+    weights = ROLE_WEIGHTS.get(role, DEFAULT_WEIGHTS)
+    return list(weights.keys())
+
+
+def compute_scores(role: str, radar: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    expected_keys = keys_required_for_role(role)
+    if not expected_keys:
+        return {"overall_score": None, "role_score": None}
+
+    if not set(expected_keys).issubset(radar.keys()):
+        return {"overall_score": None, "role_score": None}
+
+    weights = ROLE_WEIGHTS.get(role, DEFAULT_WEIGHTS)
+    pairs: List[Tuple[float, float]] = []
+    for key in expected_keys:
+        try:
+            score = float(radar[key])
+        except Exception:
+            return {"overall_score": None, "role_score": None}
+        score = max(0.0, min(100.0, score))
+        weight = float(weights.get(key, 0.0))
+        if weight <= 0:
+            continue
+        pairs.append((score, weight))
+
+    if not pairs:
+        return {"overall_score": None, "role_score": None}
+
+    weighted_sum = sum(score * weight for score, weight in pairs)
+    weight_sum = sum(weight for _, weight in pairs) or 1.0
+    value = weighted_sum / weight_sum
+    value = max(0.0, min(100.0, value))
+    rounded = round(value, 1)
+    return {"overall_score": rounded, "role_score": rounded}
 
 
 # ----------------------------
@@ -480,7 +518,7 @@ def compute_skill_scores(
     return skills, missing
 
 
-def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
+def extract_clips(input_path: Path, out_dir: Path) -> Tuple[List[Dict], Optional[str]]:
     """
     Clip demo: 2 segmenti (5s ciascuno).
     Se input è troppo corto, ffmpeg può fallire: in quel caso generiamo 1 clip breve.
@@ -493,6 +531,7 @@ def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
     ]
 
     created: List[Dict] = []
+    error: Optional[str] = None
     for c in clips:
         out_path = out_dir / c["name"]
         cmd = [
@@ -517,28 +556,32 @@ def extract_clips(input_path: Path, out_dir: Path) -> List[Dict]:
                     "end": c["start"] + c["duration"],
                 }
             )
-        except Exception:
+        except Exception as exc:
+            error = str(exc)
             if not created:
                 fallback = out_dir / "clip_001.mp4"
-                _run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-ss",
-                        "0",
-                        "-i",
-                        str(input_path),
-                        "-t",
-                        "3",
-                        "-c",
-                        "copy",
-                        str(fallback),
-                    ]
-                )
-                created.append({"file": fallback, "start": 0, "end": 3})
+                try:
+                    _run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-ss",
+                            "0",
+                            "-i",
+                            str(input_path),
+                            "-t",
+                            "3",
+                            "-c",
+                            "copy",
+                            str(fallback),
+                        ]
+                    )
+                    created.append({"file": fallback, "start": 0, "end": 3})
+                except Exception as fallback_exc:
+                    error = f"{error}\n{fallback_exc}"
             break
 
-    return created
+    return created, error
 
 
 def build_motion_segments(
@@ -864,6 +907,7 @@ def run_analysis(self, job_id: str):
                 setattr(job, "status", "RUNNING"),
                 setattr(job, "error", None),
                 setattr(job, "failure_reason", normalize_failure_reason(None)),
+                setattr(job, "warnings", []),
                 set_progress(job, "STARTING", 1, "Job started"),
             ),
         )
@@ -1140,7 +1184,7 @@ def run_analysis(self, job_id: str):
             job_id,
             lambda job: set_progress(job, "EXTRACTING", 55, "Extracting clips"),
         )
-        extracted = extract_clips(input_path, clips_dir)
+        extracted, clip_extraction_error = extract_clips(input_path, clips_dir)
 
         # Upload clips + signed
         update_job(
@@ -1156,11 +1200,14 @@ def run_analysis(self, job_id: str):
             clip_path: Path = c["file"]
             clip_key = f"jobs/{job_id}/clips/{clip_path.name}"
             upload_file(s3_internal, s3_bucket, clip_path, clip_key, "video/mp4")
+            clip_start = c["start"]
+            clip_end = c["end"]
             clips_out.append(
                 {
                     "index": i,
-                    "start": c["start"],
-                    "end": c["end"],
+                    "label": f"{clip_start}s-{clip_end}s",
+                    "start_sec": clip_start,
+                    "end_sec": clip_end,
                     "bucket": s3_bucket,
                     "key": clip_key,
                 }
@@ -1187,7 +1234,9 @@ def run_analysis(self, job_id: str):
 
         skills_computed, skills_missing = compute_skill_scores(video_features)
         radar = {k: v for k, v in skills_computed.items() if v is not None}
-        overall = weighted_overall_score(radar, role)
+        score_payload = compute_scores(role, radar)
+        overall = score_payload.get("overall_score")
+        role_score = score_payload.get("role_score")
 
         # Final result
         update_job(
@@ -1215,22 +1264,45 @@ def run_analysis(self, job_id: str):
             }
             clip_assets = [
                 {
-                    "start": clip["start"],
-                    "end": clip["end"],
+                    "label": clip["label"],
+                    "start_sec": clip["start_sec"],
+                    "end_sec": clip["end_sec"],
                     "bucket": clip["bucket"],
                     "key": clip["key"],
                 }
                 for clip in clips_out
             ]
 
+            warnings: List[str] = list(job.warnings or [])
+            def add_warning(code: str) -> None:
+                if code not in warnings:
+                    warnings.append(code)
+
+            expected_radar_keys = keys_required_for_role(role)
+            if not set(expected_radar_keys).issubset(radar.keys()):
+                add_warning("INCOMPLETE_RADAR")
+            if overall is None:
+                add_warning("MISSING_OVERALL_SCORE")
+            if role_score is None:
+                add_warning("MISSING_ROLE_SCORE")
+            if not clip_assets:
+                add_warning("MISSING_CLIPS")
+            if clip_extraction_error:
+                add_warning("CLIP_EXTRACTION_FAILED")
+            if not input_key:
+                add_warning("MISSING_INPUT_VIDEO")
+
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
                 **existing_result,
-                "schema_version": "1.2",
+                "schema_version": "1.3",
                 "summary": {
                     "player_role": role,
                     "overall_score": overall,
+                    "role_score": role_score,
                 },
+                "overall_score": overall,
+                "role_score": role_score,
                 "radar": radar,
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,
@@ -1240,15 +1312,37 @@ def run_analysis(self, job_id: str):
                     "input_video": input_video,
                     "clips": clip_assets,
                 },
-                "clips": clips_out,
+                "clips": clip_assets,
+                "clip_extraction_error": clip_extraction_error,
             }
 
-            job.status = "COMPLETED"
+            job.warnings = warnings
+            job.status = "COMPLETED" if not warnings else "PARTIAL"
             job.failure_reason = normalize_failure_reason(None)
             set_progress(job, "DONE", 100, "Completed")
 
         update_job(db, job_id, finalize_job)
 
+    except TrackingTimeoutError:
+        try:
+            update_job(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "error", "Tracking timeout exceeded"),
+                    setattr(
+                        job,
+                        "failure_reason",
+                        normalize_failure_reason("TRACKING_TIMEOUT"),
+                    ),
+                    setattr(job, "warnings", list({*(job.warnings or []), "TRACKING_TIMEOUT"})),
+                    set_progress(job, "FAILED", 100, "Tracking timeout"),
+                ),
+            )
+        except Exception:
+            db.rollback()
+        return
     except AnalysisError as e:
         try:
             update_job(

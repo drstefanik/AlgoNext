@@ -40,6 +40,7 @@ POLLING_SAFE_STATUSES = {
     "QUEUED",
     "RUNNING",
     "COMPLETED",
+    "PARTIAL",
     "FAILED",
 }
 
@@ -66,6 +67,55 @@ def normalize_payload(payload: object) -> dict:
     if isinstance(encoded, dict):
         return encoded
     return {"value": encoded}
+
+
+def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
+    start = clip.get("start_sec", clip.get("start"))
+    end = clip.get("end_sec", clip.get("end"))
+    url = clip.get("url") or clip.get("signed_url")
+    label = clip.get("label")
+    if label is None and start is not None and end is not None:
+        label = f"{start}s-{end}s"
+    return {
+        "label": label,
+        "url": url,
+        "startSec": start,
+        "endSec": end,
+    }
+
+
+def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    radar = result_payload.get("radar") or {}
+    overall = (
+        result_payload.get("overall_score")
+        or result_payload.get("overallScore")
+        or (result_payload.get("summary") or {}).get("overall_score")
+    )
+    role_score = (
+        result_payload.get("role_score")
+        or result_payload.get("roleScore")
+        or (result_payload.get("summary") or {}).get("role_score")
+    )
+    result = {
+        "overallScore": overall,
+        "roleScore": role_score,
+        "radar": radar,
+    }
+
+    assets_payload = result_payload.get("assets") or {}
+    input_video_url = (
+        assets_payload.get("input_video_url")
+        or (assets_payload.get("input_video") or {}).get("url")
+        or assets_payload.get("inputVideoUrl")
+    )
+    clips_raw = assets_payload.get("clips") or result_payload.get("clips") or []
+    clips: List[Dict[str, Any]] = []
+    for clip in clips_raw:
+        if isinstance(clip, dict):
+            clips.append(_normalize_clip_asset(clip))
+
+    assets = {"inputVideoUrl": input_video_url, "clips": clips}
+    return result, assets
 
 
 def build_meta(request: Request | None = None) -> dict:
@@ -468,6 +518,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
         player_ref={},
         progress={"step": "CREATED", "pct": 0, "message": "Job created"},
         result={},
+        warnings=[],
         error=None,
         failure_reason=normalize_failure_reason(None),
     )
@@ -508,6 +559,8 @@ def get_job(job_id: str, request: Request):
         normalized_selections = [_normalize_selection(sel) for sel in selections]
         player_ref = _normalize_player_ref(job.player_ref or job.anchor or {})
 
+        result, assets = _build_result_assets(result_payload or {})
+
         return ok_response(
             {
                 "job_id": job.id,
@@ -518,12 +571,14 @@ def get_job(job_id: str, request: Request):
                 "video_url": job.video_url,
                 "preview_frames": preview_frames,
                 "progress": normalize_payload(job.progress),
+                "warnings": list(job.warnings or []),
                 "player_ref": player_ref,
                 "target": {
                     **(job.target or {}),
                     "selections": normalized_selections,
                 },
-                "result": result_payload,
+                "result": result,
+                "assets": assets,
                 "error": job.error,
                 "failure_reason": job.failure_reason,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
@@ -551,6 +606,7 @@ def job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
+            "warnings": list(job.warnings or []),
             "error": job.error,
             "failure_reason": job.failure_reason,
             "updated_at": job.updated_at.isoformat() if job.updated_at else None,
@@ -568,10 +624,11 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    result_payload = job.result if job.status == "COMPLETED" else None
+    result_payload = normalize_payload(job.result)
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
+    result, assets = _build_result_assets(result_payload or {})
 
     return ok_response(
         {
@@ -579,9 +636,11 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
+            "warnings": list(job.warnings or []),
             "error": job.error,
             "failure_reason": job.failure_reason,
-            "result": normalize_payload(result_payload),
+            "result": result,
+            "assets": assets,
             "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         },
         request,
@@ -604,18 +663,27 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_FAILED", job.error or "Job failed"),
         )
 
-    if job.status != "COMPLETED":
+    if job.status not in ("COMPLETED", "PARTIAL"):
         raise HTTPException(
             status_code=409,
             detail=error_detail("JOB_NOT_COMPLETED", "Job not completed yet"),
         )
 
-
     result_payload = normalize_payload(job.result)
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
-    return ok_response({"job_id": job.id, "id": job.id, "result": result_payload}, request)
+    result, assets = _build_result_assets(result_payload or {})
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "result": result,
+            "assets": assets,
+            "warnings": list(job.warnings or []),
+        },
+        request,
+    )
 
 
 def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:

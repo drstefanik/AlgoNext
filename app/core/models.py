@@ -39,6 +39,12 @@ class AnalysisJob(Base):
         nullable=False,
         server_default=text("'[]'::jsonb"),
     )
+    warnings: Mapped[list] = mapped_column(
+        JSONB,
+        default=list,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
