@@ -503,6 +503,10 @@ def get_job(job_id: str, request: Request):
                 {"preview_frames": preview_frames}, context
             ).get("preview_frames", preview_frames)
 
+        selections = (job.target or {}).get("selections") or []
+        normalized_selections = [_normalize_selection(sel) for sel in selections]
+        player_ref = _normalize_player_ref(job.anchor or {})
+
         return ok_response(
             {
                 "job_id": job.id,
@@ -513,6 +517,11 @@ def get_job(job_id: str, request: Request):
                 "video_url": job.video_url,
                 "preview_frames": preview_frames,
                 "progress": normalize_payload(job.progress),
+                "player_ref": player_ref,
+                "target": {
+                    **(job.target or {}),
+                    "selections": normalized_selections,
+                },
                 "result": result_payload,
                 "error": job.error,
                 "failure_reason": job.failure_reason,
@@ -613,16 +622,56 @@ def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
         selection_data = selection.dict()
         selections.append(
             {
-                "time_sec": selection_data["frame_time_sec"],
-                "bbox": {
-                    "x": selection_data["x"],
-                    "y": selection_data["y"],
-                    "w": selection_data["w"],
-                    "h": selection_data["h"],
-                },
+                "frame_time_sec": selection_data["frame_time_sec"],
+                "x": selection_data["x"],
+                "y": selection_data["y"],
+                "w": selection_data["w"],
+                "h": selection_data["h"],
             }
         )
     return {"selections": selections, "tracking": {"status": "PENDING"}}
+
+
+def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
+    if "frame_time_sec" in selection:
+        return {
+            "frame_time_sec": float(selection.get("frame_time_sec", 0.0)),
+            "x": float(selection.get("x", 0.0)),
+            "y": float(selection.get("y", 0.0)),
+            "w": float(selection.get("w", 0.0)),
+            "h": float(selection.get("h", 0.0)),
+        }
+    bbox = selection.get("bbox") or {}
+    return {
+        "frame_time_sec": float(selection.get("time_sec", 0.0)),
+        "x": float(bbox.get("x", 0.0)),
+        "y": float(bbox.get("y", 0.0)),
+        "w": float(bbox.get("w", 0.0)),
+        "h": float(bbox.get("h", 0.0)),
+    }
+
+
+def _normalize_player_ref(anchor: Dict[str, Any]) -> Dict[str, float] | None:
+    if not anchor:
+        return None
+    if {"t", "x", "y", "w", "h"}.issubset(anchor.keys()):
+        return {
+            "t": float(anchor.get("t", 0.0)),
+            "x": float(anchor.get("x", 0.0)),
+            "y": float(anchor.get("y", 0.0)),
+            "w": float(anchor.get("w", 0.0)),
+            "h": float(anchor.get("h", 0.0)),
+        }
+    bbox = anchor.get("bbox") or {}
+    if not bbox:
+        return None
+    return {
+        "t": float(anchor.get("time_sec", 0.0)),
+        "x": float(bbox.get("x", 0.0)),
+        "y": float(bbox.get("y", 0.0)),
+        "w": float(bbox.get("w", 0.0)),
+        "h": float(bbox.get("h", 0.0)),
+    }
 
 
 def _save_target_selection(
@@ -636,8 +685,12 @@ def _save_target_selection(
         )
     job.target = _build_target_from_selections(payload)
 
-    if job.status == "WAITING_FOR_SELECTION":
+    player_ref = job.anchor or {}
+    has_player_ref = player_ref.get("bbox") and player_ref.get("time_sec") is not None
+    if has_player_ref:
         job.status = "CREATED"
+    elif job.status in ["WAITING_FOR_SELECTION", "CREATED"]:
+        job.status = "WAITING_FOR_PLAYER"
 
     db.commit()
     db.refresh(job)
@@ -679,7 +732,10 @@ def save_player_ref(
         "time_sec": payload.t,
         "bbox": {"x": payload.x, "y": payload.y, "w": payload.w, "h": payload.h},
     }
-    job.player_ref = job.anchor["time_sec"]
+
+    selections = (job.target or {}).get("selections") or []
+    if selections:
+        job.status = "CREATED"
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
@@ -697,7 +753,8 @@ def save_player_ref(
     db.commit()
     db.refresh(job)
     return ok_response(
-        {"job_id": job.id, "id": job.id, "player_ref": job.player_ref}, request
+        {"job_id": job.id, "id": job.id, "player_ref": _normalize_player_ref(job.anchor)},
+        request,
     )
 
 
@@ -875,13 +932,16 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
 
     selections = (job.target or {}).get("selections") or []
     player_ref = job.anchor or {}
-    if len(selections) < 1 or not (
-        player_ref.get("bbox") and player_ref.get("time_sec") is not None
-    ):
+    if not (player_ref.get("bbox") and player_ref.get("time_sec") is not None):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("MISSING_PLAYER_REF", "Missing player_ref"),
+        )
+    if len(selections) < 1:
         raise HTTPException(
             status_code=400,
             detail=error_detail(
-                "PLAYER_SELECTION_REQUIRED", "Player selection is required"
+                "MISSING_TARGET_SELECTION", "Missing target selection"
             ),
         )
 
