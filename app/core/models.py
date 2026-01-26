@@ -29,7 +29,7 @@ class AnalysisJob(Base):
     target: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     anchor: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
-    player_ref: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    player_ref: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     progress: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
