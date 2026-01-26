@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import logging
 import os
@@ -13,6 +12,11 @@ import numpy as np
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from ultralytics import YOLO
+
+try:
+    import lapx as lap  # noqa: F401
+except ModuleNotFoundError:
+    import lap  # noqa: F401
 
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
@@ -248,9 +252,6 @@ def track_player(
     player_ref_norm = _normalize_player_ref(player_ref)
     if player_ref_norm is None:
         raise RuntimeError("Missing player_ref for tracking")
-
-    if importlib.util.find_spec("lapx") is None:
-        raise RuntimeError("missing dependency lapx, rebuild image")
 
     s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
