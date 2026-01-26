@@ -719,7 +719,7 @@ async def save_player_ref(
     request: Request,
     payload: dict = Body(...),
     db: Session = Depends(get_db),
-):
+) -> dict:
 
     raw_body = await request.body()
     if raw_body:
