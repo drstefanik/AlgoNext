@@ -114,6 +114,29 @@ def update_job(db: Session, job_id: str, updater: Callable[[AnalysisJob], None])
     return True
 
 
+def _normalize_player_ref(player_ref: Dict[str, Any]) -> Dict[str, float] | None:
+    if not player_ref or isinstance(player_ref, str):
+        return None
+    if {"t", "x", "y", "w", "h"}.issubset(player_ref.keys()):
+        return {
+            "t": float(player_ref.get("t", 0.0)),
+            "x": float(player_ref.get("x", 0.0)),
+            "y": float(player_ref.get("y", 0.0)),
+            "w": float(player_ref.get("w", 0.0)),
+            "h": float(player_ref.get("h", 0.0)),
+        }
+    bbox = player_ref.get("bbox") or {}
+    if not bbox:
+        return None
+    return {
+        "t": float(player_ref.get("time_sec", 0.0)),
+        "x": float(bbox.get("x", 0.0)),
+        "y": float(bbox.get("y", 0.0)),
+        "w": float(bbox.get("w", 0.0)),
+        "h": float(bbox.get("h", 0.0)),
+    }
+
+
 def set_progress(job: AnalysisJob, step: str, pct: int, message: str = "") -> None:
     pct = max(0, min(100, int(pct)))
     job.progress = {
@@ -1023,8 +1046,8 @@ def run_analysis(self, job_id: str):
         job = reload_job(db, job_id)
         if not job:
             return
-        player_ref = job.anchor or {}
-        if not (player_ref.get("bbox") and player_ref.get("time_sec") is not None):
+        player_ref = _normalize_player_ref(job.player_ref or job.anchor or {})
+        if player_ref is None:
             update_job(
                 db,
                 job_id,
