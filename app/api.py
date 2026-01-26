@@ -891,6 +891,20 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
+    preview_frames = job.preview_frames or []
+    preview_lookup: Dict[str, Dict[str, Any]] = {}
+    if isinstance(preview_frames, list):
+        for frame in preview_frames:
+            if not isinstance(frame, dict):
+                continue
+            key = frame.get("key") or frame.get("s3_key")
+            if isinstance(key, str) and key:
+                preview_lookup[key] = frame
+                preview_lookup.setdefault(key.split("/")[-1], frame)
+
+    if not preview_lookup:
+        logger.warning("frames/list no_preview_frames job_id=%s", job_id)
+
     context = load_s3_context()
     s3_internal = context["s3_internal"]
     s3_public = context["s3_public"]
@@ -916,14 +930,21 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
                 key,
                 expires_seconds,
             )
+            preview_frame = preview_lookup.get(key) or preview_lookup.get(name)
+            time_sec = None
+            if isinstance(preview_frame, dict):
+                time_sec = preview_frame.get("time_sec")
+            if time_sec is None:
+                logger.warning("frames/list missing_time_sec key=%s", key)
+                continue
             items.append(
                 {
                     "name": name,
                     "url": signed_url,
                     "key": key,
-                    "width": None,
-                    "height": None,
-                    "time_sec": None,
+                    "width": preview_frame.get("width") if preview_frame else None,
+                    "height": preview_frame.get("height") if preview_frame else None,
+                    "time_sec": float(time_sec),
                 }
             )
 
