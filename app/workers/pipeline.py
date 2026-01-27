@@ -21,7 +21,12 @@ from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.workers.tracking import TrackingTimeoutError, track_all_players, track_player
+from app.workers.tracking import (
+    TrackingTimeoutError,
+    track_all_players,
+    track_all_players_from_frames,
+    track_player,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -871,6 +876,18 @@ def extract_candidates(self, job_id: str) -> None:
                 "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
             )
 
+        base_dir = Path("/tmp/fnh_jobs_candidates") / job_id
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        s3_internal = get_s3_client(s3_endpoint_url)
+        ensure_bucket_exists(s3_internal, s3_bucket)
+
+        preview_frames = list(job.preview_frames or [])
+        if not preview_frames and self.request.retries < max_retries:
+            raise self.retry(countdown=5)
+
         update_job(
             db,
             job_id,
@@ -879,20 +896,28 @@ def extract_candidates(self, job_id: str) -> None:
             ),
         )
 
-        base_dir = Path("/tmp/fnh_jobs_candidates") / job_id
-        if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        input_path = base_dir / "input.mp4"
-
-        s3_internal = get_s3_client(s3_endpoint_url)
-        ensure_bucket_exists(s3_internal, s3_bucket)
-
-        video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
-        download_video(video_source, input_path, s3_internal, source_bucket)
-
-        candidates_output = track_all_players(job_id, str(input_path))
+        if preview_frames:
+            frames_dir = base_dir / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            preview_inputs: List[Dict[str, Any]] = []
+            for index, frame in enumerate(preview_frames, start=1):
+                frame_key = (frame or {}).get("key")
+                if not frame_key:
+                    continue
+                frame_path = frames_dir / f"preview_{index:04d}.jpg"
+                s3_internal.download_file(s3_bucket, frame_key, str(frame_path))
+                preview_inputs.append(
+                    {
+                        "path": frame_path,
+                        "time_sec": float((frame or {}).get("time_sec") or 0.0),
+                    }
+                )
+            candidates_output = track_all_players_from_frames(job_id, preview_inputs)
+        else:
+            input_path = base_dir / "input.mp4"
+            video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
+            download_video(video_source, input_path, s3_internal, source_bucket)
+            candidates_output = track_all_players(job_id, str(input_path))
         update_job(
             db,
             job_id,
@@ -993,6 +1018,14 @@ def run_analysis(self, job_id: str):
                     ),
                 ),
             )
+            try:
+                extract_preview_frames.delay(job_id)
+                extract_candidates.delay(job_id)
+            except Exception:
+                logger.exception(
+                    "run_analysis failed to enqueue preview/candidates job_id=%s",
+                    job_id,
+                )
             return
 
         # RUNNING

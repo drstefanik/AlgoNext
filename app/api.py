@@ -751,9 +751,16 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
     result_payload = normalize_payload(job.result)
     candidates_payload = result_payload.get("candidates") or {}
     if not candidates_payload:
+        progress_step = (job.progress or {}).get("step")
+        if progress_step == "TRACKING_CANDIDATES":
+            status = "PROCESSING"
+        elif progress_step in ("EXTRACTING_PREVIEWS", "PREVIEWS_READY"):
+            status = "PENDING_QUEUE"
+        else:
+            status = "NOT_STARTED"
         return ok_response(
             {
-                "status": "PROCESSING",
+                "status": status,
                 "framesProcessed": 0,
                 "candidates": [],
                 "autodetection": {
