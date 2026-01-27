@@ -32,6 +32,7 @@ MIN_FRAMES_FOR_EVAL = int(os.environ.get("MIN_FRAMES_FOR_EVAL", "30"))
 POLLING_SAFE_STATUSES = {
     "WAITING_FOR_SELECTION",
     "WAITING_FOR_PLAYER",
+    "WAITING_FOR_TARGET",
     "CREATED",
     "QUEUED",
     "RUNNING",
@@ -377,6 +378,55 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
     return hydrated
 
 
+def _hydrate_player_ref_sample_frames(
+    player_ref: Dict[str, Any], context: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    if not isinstance(player_ref, dict):
+        return {}
+    sample_frames = player_ref.get("sample_frames")
+    if not isinstance(sample_frames, list):
+        return player_ref
+
+    if context is None:
+        if not (
+            S3_ENDPOINT_URL
+            and S3_PUBLIC_ENDPOINT_URL
+            and S3_ACCESS_KEY
+            and S3_SECRET_KEY
+            and S3_BUCKET
+        ):
+            return player_ref
+        context = load_s3_context()
+
+    s3_public = context["s3_public"]
+    bucket_default = context["bucket"]
+    expires_seconds = context["expires_seconds"]
+    hydrated_frames: List[Dict[str, Any]] = []
+    for frame in sample_frames:
+        if not isinstance(frame, dict):
+            hydrated_frames.append(frame)
+            continue
+        if frame.get("signed_url") or frame.get("image_url"):
+            hydrated_frames.append(frame)
+            continue
+        key = frame.get("key") or frame.get("s3_key")
+        bucket = frame.get("bucket") or bucket_default
+        if not key or not bucket:
+            hydrated_frames.append(frame)
+            continue
+        signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
+        hydrated_frame = {
+            **frame,
+            "bucket": bucket,
+            "key": key,
+            "signed_url": signed_url,
+        }
+        hydrated_frame.setdefault("image_url", signed_url)
+        hydrated_frames.append(hydrated_frame)
+
+    return {**player_ref, "sample_frames": hydrated_frames}
+
+
 def _run_command(cmd: List[str]) -> str:
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -611,9 +661,17 @@ def get_job(job_id: str, request: Request):
 
         selections = (job.target or {}).get("selections") or []
         normalized_selections = [_normalize_selection(sel) for sel in selections]
-        player_ref = _normalize_player_ref(job.player_ref or job.anchor or {})
+        raw_player_ref = normalize_payload(job.player_ref) if job.player_ref else None
+        if raw_player_ref:
+            if context is None and raw_player_ref.get("sample_frames"):
+                context = load_s3_context()
+            player_ref = _hydrate_player_ref_sample_frames(raw_player_ref, context)
+        else:
+            player_ref = _normalize_player_ref(job.anchor or {})
 
         result, assets = _build_result_assets(result_payload or {})
+        if not assets.get("inputVideoUrl") and job.video_url:
+            assets = {**assets, "inputVideoUrl": job.video_url}
 
         return ok_response(
             {
@@ -966,7 +1024,8 @@ def select_track(
         ],
         "tracking": {"status": "PENDING"},
     }
-    job.status = "WAITING_FOR_SELECTION"
+    job.status = "WAITING_FOR_TARGET"
+    job.updated_at = datetime.now(timezone.utc)
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
