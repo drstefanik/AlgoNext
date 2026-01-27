@@ -194,7 +194,7 @@ class TrackSelectionBox(BaseModel):
 class TrackSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     track_id: int | str = Field(alias="trackId")
-    selection: TrackSelectionBox
+    selection: TrackSelectionBox | None = None
 
 
 class TargetSelectionPayload(BaseModel):
@@ -208,7 +208,7 @@ class TargetSelectionPayload(BaseModel):
     def normalize_payload(cls, data: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("Missing target selection payload")
-        frame_key = data.get("frame_key") or data.get("frameKey")
+        frame_key = data.get("frame_key") or data.get("frameKey") or data.get("key")
         time_sec = data.get("time_sec") or data.get("timeSec")
         bbox = data.get("bbox")
         if not isinstance(bbox, dict):
