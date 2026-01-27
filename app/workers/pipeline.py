@@ -954,6 +954,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     {
                         "path": frame_path,
                         "time_sec": float((frame or {}).get("time_sec") or 0.0),
+                        "key": frame_key,
                     }
                 )
             candidates_output = track_all_players_from_frames(job_id, preview_inputs)
@@ -1021,6 +1022,80 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             raw_tracks = total_tracks
             primary_count = 0
             secondary_count = 0
+
+        def _closest_preview_frame_key(
+            time_sec: Optional[float], frames: List[Dict[str, Any]]
+        ) -> Optional[str]:
+            if time_sec is None or not frames:
+                return None
+            closest = min(
+                frames,
+                key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
+            )
+            return closest.get("key") or closest.get("s3_key")
+
+        if preview_frames and candidates_list:
+            track_tiers = {
+                candidate.get("track_id"): candidate.get("tier")
+                for candidate in candidates_list
+                if isinstance(candidate, dict)
+            }
+            for candidate in candidates_list:
+                if not isinstance(candidate, dict):
+                    continue
+                sample_frames = candidate.get("sample_frames") or []
+                if not sample_frames:
+                    continue
+                best_sample = max(
+                    sample_frames,
+                    key=lambda item: (item.get("bbox") or {}).get("w", 0.0)
+                    * (item.get("bbox") or {}).get("h", 0.0),
+                )
+                best_time = best_sample.get("time_sec")
+                best_key = _closest_preview_frame_key(best_time, preview_frames)
+                if best_key:
+                    candidate["best_preview_frame_key"] = best_key
+                if best_time is not None:
+                    candidate["best_time_sec"] = float(best_time)
+
+            frame_tracks = []
+            if isinstance(candidates_output, dict):
+                frame_tracks = candidates_output.get("frame_tracks") or []
+            tracks_by_key: Dict[str, Dict[str, Any]] = {}
+            for frame_track in frame_tracks:
+                if not isinstance(frame_track, dict):
+                    continue
+                key = frame_track.get("frame_key") or frame_track.get("key")
+                if isinstance(key, str) and key:
+                    tracks_by_key[key] = frame_track
+            for frame in preview_frames:
+                if not isinstance(frame, dict):
+                    continue
+                frame_key = frame.get("key") or frame.get("s3_key")
+                frame_track = tracks_by_key.get(frame_key)
+                if frame_track is None and frame_key:
+                    frame_track = tracks_by_key.get(frame_key.split("/")[-1])
+                if frame_track is None:
+                    continue
+                tracks_payload = []
+                for track in frame_track.get("tracks") or []:
+                    if not isinstance(track, dict):
+                        continue
+                    track_id = track.get("track_id")
+                    tracks_payload.append(
+                        {
+                            "track_id": track_id,
+                            "bbox": track.get("bbox") or {},
+                            "tier": track_tiers.get(track_id),
+                            "score_hint": track.get("score_hint"),
+                        }
+                    )
+                frame["tracks"] = tracks_payload
+            update_job(
+                db,
+                job_id,
+                lambda job: setattr(job, "preview_frames", preview_frames),
+            )
         error_detail = None
         if len(preview_inputs) == 0:
             error_detail = "NO_VALID_PREVIEW_KEYS"
