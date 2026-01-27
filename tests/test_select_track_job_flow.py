@@ -105,6 +105,7 @@ class SelectTrackJobFlowTests(unittest.TestCase):
         self.assertIsNotNone(self.job.player_ref)
         self.assertEqual(self.job.player_ref["track_id"], 8)
         self.assertEqual(self.job.player_ref["tier"], "PRIMARY")
+        self.assertEqual(self.job.target, {})
         self.assertNotEqual(
             self.job.updated_at, datetime(2024, 1, 1, tzinfo=timezone.utc)
         )
@@ -139,6 +140,8 @@ class SelectTrackJobFlowTests(unittest.TestCase):
         self.assertEqual(payload["status"], "WAITING_FOR_TARGET")
         self.assertIsNotNone(payload["player_ref"])
         self.assertEqual(payload["player_ref"]["track_id"], 8)
+        self.assertTrue(payload["playerSaved"])
+        self.assertFalse(payload["targetSaved"])
         sample_frame = payload["player_ref"]["sample_frames"][0]
         self.assertIn("signed_url", sample_frame)
         self.assertEqual(payload["assets"]["inputVideoUrl"], self.job.video_url)
