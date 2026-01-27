@@ -884,11 +884,34 @@ def select_track(
         candidates = candidates_payload_raw.get("candidates") or []
     else:
         candidates = []
+
+    def _track_id_variants(value: Any) -> set[Any]:
+        if value is None or isinstance(value, bool):
+            return set()
+        variants: set[Any] = set()
+        if isinstance(value, int):
+            variants.add(value)
+            variants.add(str(value))
+            return variants
+        if isinstance(value, str):
+            trimmed = value.strip()
+            variants.add(trimmed)
+            if trimmed.isdigit():
+                variants.add(int(trimmed))
+            return variants
+        try:
+            variants.add(str(value))
+        except Exception:
+            pass
+        return variants
+
+    selected_ids = _track_id_variants(payload.track_id)
     candidate = next(
         (
             item
             for item in candidates
-            if isinstance(item, dict) and item.get("track_id") == payload.track_id
+            if isinstance(item, dict)
+            and _track_id_variants(item.get("track_id")) & selected_ids
         ),
         None,
     )
@@ -898,50 +921,15 @@ def select_track(
             detail=error_detail("TRACK_NOT_FOUND", "Track not found"),
         )
 
-    sample_frames = candidate.get("sample_frames") or []
-    selections: List[Dict[str, Any]] = []
-    for sample in sample_frames[:5]:
-        if not isinstance(sample, dict):
-            continue
-        bbox = sample.get("bbox") or {}
-        if not {"x", "y", "w", "h"}.issubset(bbox.keys()):
-            continue
-        timestamp = sample.get("time_sec", sample.get("frame_time_sec", 0.0))
-        selections.append(
-            {
-                "frame_time_sec": float(timestamp or 0.0),
-                "x": float(bbox.get("x", 0.0)),
-                "y": float(bbox.get("y", 0.0)),
-                "w": float(bbox.get("w", 0.0)),
-                "h": float(bbox.get("h", 0.0)),
-            }
-        )
-
-    if not selections:
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail("TRACK_SAMPLES_MISSING", "Track has no samples"),
-        )
-
-    primary_selection = selections[0]
-    job.target = {"selections": selections, "tracking": {"status": "PENDING"}}
-    job.player_ref = {
-        "t": float(primary_selection.get("frame_time_sec", 0.0)),
-        "x": float(primary_selection.get("x", 0.0)),
-        "y": float(primary_selection.get("y", 0.0)),
-        "w": float(primary_selection.get("w", 0.0)),
-        "h": float(primary_selection.get("h", 0.0)),
+    player_ref_payload: Dict[str, Any] = {
+        "track_id": candidate.get("track_id", payload.track_id)
     }
-    job.anchor = {
-        "time_sec": float(primary_selection.get("frame_time_sec", 0.0)),
-        "bbox": {
-            "x": float(primary_selection.get("x", 0.0)),
-            "y": float(primary_selection.get("y", 0.0)),
-            "w": float(primary_selection.get("w", 0.0)),
-            "h": float(primary_selection.get("h", 0.0)),
-        },
-    }
-    job.status = "CREATED"
+    for key, value in candidate.items():
+        if key == "track_id":
+            continue
+        player_ref_payload[key] = value
+    job.player_ref = player_ref_payload
+    job.status = "WAITING_FOR_SELECTION"
 
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
@@ -951,7 +939,7 @@ def select_track(
         current_pct = 0
     job.progress = {
         **progress,
-        "step": "TRACK_SELECTED",
+        "step": "WAITING_FOR_TARGET",
         "pct": max(current_pct, 14),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -964,6 +952,8 @@ def select_track(
             "job_id": job.id,
             "id": job.id,
             "status": job.status,
+            "playerSaved": True,
+            "playerRef": job.player_ref,
             "player_ref": normalized_player_ref,
         },
         request,
