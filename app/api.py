@@ -22,12 +22,6 @@ from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
 from app.schemas import JobCreate, PlayerRefPayload, SelectionPayload, TrackSelectionPayload
-from app.workers.pipeline import extract_preview_frames, run_analysis
-from app.workers.pipeline import (
-    ensure_bucket_exists,
-    get_s3_client,
-    upload_file,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +142,13 @@ def _build_candidate_payload(
                 key,
                 expires_seconds,
             )
+            frame_time_sec = float(
+                sample.get("time_sec", sample.get("frame_time_sec", 0.0))
+            )
             normalized_frames.append(
                 {
-                    "frame_time_sec": float(
-                        sample.get("time_sec", sample.get("frame_time_sec", 0.0))
-                    ),
+                    "frame_time_sec": frame_time_sec,
+                    "time_sec": frame_time_sec,
                     "image_url": signed_url,
                     "bbox": sample.get("bbox") or {},
                 }
@@ -268,6 +264,8 @@ def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[st
 
 
 def load_s3_context() -> Dict[str, Any]:
+    from app.workers.pipeline import get_s3_client
+
     if (
         not S3_ENDPOINT_URL
         or not S3_PUBLIC_ENDPOINT_URL
@@ -581,6 +579,8 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
     db.commit()
     db.refresh(job)
 
+    from app.workers.pipeline import extract_preview_frames
+
     extract_preview_frames.delay(job.id)
 
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
@@ -862,13 +862,37 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
     )
 
 
+def _parse_track_selection_payload(payload: Any) -> TrackSelectionPayload:
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_PAYLOAD",
+                "Invalid select-track payload",
+                {"errors": [{"field": "payload", "message": "Payload must be an object"}]},
+            ),
+        )
+    try:
+        return TrackSelectionPayload.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_PAYLOAD",
+                "Invalid select-track payload",
+                {"errors": exc.errors()},
+            ),
+        ) from exc
+
+
 @router.post("/jobs/{job_id}/select-track")
 def select_track(
     job_id: str,
-    payload: TrackSelectionPayload,
     request: Request,
+    payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
+    normalized_payload = _parse_track_selection_payload(payload)
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(
@@ -905,7 +929,7 @@ def select_track(
             pass
         return variants
 
-    selected_ids = _track_id_variants(payload.track_id)
+    selected_ids = _track_id_variants(normalized_payload.track_id)
     candidate = next(
         (
             item
@@ -922,13 +946,26 @@ def select_track(
         )
 
     player_ref_payload: Dict[str, Any] = {
-        "track_id": candidate.get("track_id", payload.track_id)
+        "track_id": candidate.get("track_id", normalized_payload.track_id)
     }
     for key, value in candidate.items():
         if key == "track_id":
             continue
         player_ref_payload[key] = value
     job.player_ref = player_ref_payload
+    selection = normalized_payload.selection
+    job.target = {
+        "selections": [
+            {
+                "frame_time_sec": selection.frame_time_sec,
+                "x": selection.x,
+                "y": selection.y,
+                "w": selection.w,
+                "h": selection.h,
+            }
+        ],
+        "tracking": {"status": "PENDING"},
+    }
     job.status = "WAITING_FOR_SELECTION"
 
     progress = job.progress or {}
@@ -1264,6 +1301,8 @@ def confirm_selection(
 def get_frames(
     job_id: str, request: Request, count: int = 8, db: Session = Depends(get_db)
 ):
+    from app.workers.pipeline import ensure_bucket_exists, upload_file
+
     if count < 1:
         raise HTTPException(
             status_code=400,
@@ -1472,6 +1511,8 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     job.error = None
     db.commit()
     db.refresh(job)
+
+    from app.workers.pipeline import run_analysis
 
     run_analysis.delay(job.id)
 
