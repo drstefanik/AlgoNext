@@ -567,14 +567,30 @@ def track_player(
     return tracking_output
 
 
-def _select_sample_indices(count: int, min_samples: int = 3, max_samples: int = 6) -> List[int]:
-    if count <= 0:
+def _select_candidate_samples(
+    detections_sorted: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not detections_sorted:
         return []
-    target = max(min_samples, min(max_samples, count))
-    if target >= count:
-        return list(range(count))
-    indices = np.linspace(0, count - 1, target)
-    return sorted({int(round(idx)) for idx in indices})
+    count = len(detections_sorted)
+    third_points = [
+        int(round((count - 1) * (1 / 3))),
+        int(round((count - 1) * (2 / 3))),
+        count - 1,
+    ]
+    areas = [det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted]
+    best_index = int(np.argmax(areas)) if areas else 0
+    indices = []
+    for idx in [third_points[0], third_points[1], third_points[2], best_index]:
+        if idx not in indices and 0 <= idx < count:
+            indices.append(idx)
+    if len(indices) < 4:
+        for idx in range(count):
+            if idx not in indices:
+                indices.append(idx)
+            if len(indices) >= 4:
+                break
+    return [detections_sorted[idx] for idx in indices[:4]]
 
 
 def track_all_players(
@@ -706,11 +722,12 @@ def track_all_players(
         raise RuntimeError("No frames sampled for tracking")
 
     candidates: List[Dict[str, Any]] = []
+    total_tracks = len(track_map)
     for track_id, detections in track_map.items():
         detections_sorted = sorted(detections, key=lambda d: d["sample_index"])
-        if len(detections_sorted) < 3:
+        if len(detections_sorted) < 4:
             continue
-        coverage_pct = (len(detections_sorted) / float(len(samples))) * 100.0
+        coverage_pct = len(detections_sorted) / float(len(samples))
         avg_box_area = float(
             np.mean([det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted])
         )
@@ -723,21 +740,28 @@ def track_all_players(
         id_switches = max(0, segments - 1)
         normalized_switches = id_switches / float(max(1, len(detections_sorted) - 1))
         stability_score = max(0.0, 1.0 - normalized_switches)
-        sample_indices = _select_sample_indices(len(detections_sorted))
+        selected_samples = _select_candidate_samples(detections_sorted)
         sample_frames = [
             {
-                "time_sec": float(detections_sorted[idx]["t"]),
-                "bbox": detections_sorted[idx]["bbox"],
+                "time_sec": float(sample["t"]),
+                "bbox": sample["bbox"],
             }
-            for idx in sample_indices
+            for sample in selected_samples
         ]
+        if coverage_pct >= 0.05:
+            tier = "PRIMARY"
+        elif coverage_pct >= 0.02:
+            tier = "SECONDARY"
+        else:
+            continue
         candidates.append(
             {
                 "track_id": int(track_id),
-                "coverage_pct": round(coverage_pct, 2),
+                "coverage_pct": round(coverage_pct, 4),
                 "stability_score": round(float(stability_score), 3),
                 "avg_box_area": round(float(avg_box_area), 6),
                 "id_switches": int(id_switches),
+                "tier": tier,
                 "sample_frames": sample_frames,
             }
         )
@@ -748,16 +772,35 @@ def track_all_players(
             "fps": fps,
             "generated_at": _utc_now_iso(),
             "candidates": [],
+            "autodetection": {
+                "totalTracks": total_tracks,
+                "primaryCount": 0,
+                "secondaryCount": 0,
+                "thresholdPct": 0.05,
+            },
+            "autodetection_status": "LOW_COVERAGE",
         }
 
-    candidates.sort(
+    primary = [c for c in candidates if c.get("tier") == "PRIMARY"]
+    secondary = [c for c in candidates if c.get("tier") == "SECONDARY"]
+
+    primary.sort(
         key=lambda item: (
-            item.get("coverage_pct", 0),
             item.get("stability_score", 0),
+            item.get("coverage_pct", 0),
             item.get("avg_box_area", 0),
         ),
         reverse=True,
     )
+    secondary.sort(
+        key=lambda item: (
+            item.get("stability_score", 0),
+            item.get("coverage_pct", 0),
+            item.get("avg_box_area", 0),
+        ),
+        reverse=True,
+    )
+    candidates = primary + secondary
 
     s3_internal = _get_s3_client(s3_endpoint_url)
     s3_public = _get_s3_client(s3_public_endpoint_url)
@@ -800,7 +843,10 @@ def track_all_players(
     finally:
         cap.release()
 
-    candidates = [c for c in candidates if len(c.get("sample_frames") or []) >= 3]
+    candidates = [c for c in candidates if len(c.get("sample_frames") or []) >= 4]
+    primary_count = len([c for c in candidates if c.get("tier") == "PRIMARY"])
+    secondary_count = len([c for c in candidates if c.get("tier") == "SECONDARY"])
+    autodetection_status = "LOW_COVERAGE" if primary_count == 0 else "OK"
 
     return {
         "method": "yolo+bytetrack",
@@ -808,6 +854,13 @@ def track_all_players(
         "generated_at": _utc_now_iso(),
         "expires_in": expires_seconds,
         "candidates": candidates,
+        "autodetection": {
+            "totalTracks": total_tracks,
+            "primaryCount": primary_count,
+            "secondaryCount": secondary_count,
+            "thresholdPct": 0.05,
+        },
+        "autodetection_status": autodetection_status,
         "bucket": s3_bucket,
         "assets_prefix": f"jobs/{job_id}/candidates/",
     }
