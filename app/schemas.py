@@ -37,7 +37,9 @@ class JobStatusOut(BaseModel):
 
 
 class SelectionBox(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     frame_time_sec: float = Field(ge=0)
+    frame_key: Optional[str] = Field(default=None, alias="frameKey")
     x: float = Field(ge=0)
     y: float = Field(ge=0)
     w: float = Field(gt=0)

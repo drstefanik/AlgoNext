@@ -13,6 +13,7 @@ from uuid import uuid4
 import requests
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -1179,18 +1180,36 @@ def select_target(
 
 def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
     selections = []
+    selection_payload = None
     for selection in payload.selections:
         selection_data = selection.dict()
-        selections.append(
-            {
-                "frame_time_sec": selection_data["frame_time_sec"],
-                "x": selection_data["x"],
-                "y": selection_data["y"],
-                "w": selection_data["w"],
-                "h": selection_data["h"],
+        selection_entry = {
+            "frame_time_sec": selection_data["frame_time_sec"],
+            "x": selection_data["x"],
+            "y": selection_data["y"],
+            "w": selection_data["w"],
+            "h": selection_data["h"],
+        }
+        if selection_data.get("frame_key"):
+            selection_entry["frame_key"] = selection_data["frame_key"]
+        selections.append(selection_entry)
+        if selection_payload is None:
+            selection_payload = {
+                "frame_key": selection_data.get("frame_key"),
+                "time_sec": selection_data["frame_time_sec"],
+                "bbox": {
+                    "x": selection_data["x"],
+                    "y": selection_data["y"],
+                    "w": selection_data["w"],
+                    "h": selection_data["h"],
+                },
             }
-        )
-    return {"selections": selections, "tracking": {"status": "PENDING"}}
+    return {
+        "confirmed": True,
+        "selection": selection_payload,
+        "selections": selections,
+        "tracking": {"status": "PENDING"},
+    }
 
 
 def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
@@ -1268,9 +1287,28 @@ def _save_target_selection(
     player_ref = job.player_ref or job.anchor or {}
     has_player_ref = _normalize_player_ref(player_ref) is not None
     if has_player_ref:
-        job.status = "CREATED"
-    elif job.status in ["WAITING_FOR_SELECTION", "CREATED"]:
+        job.status = "READY_TO_ENQUEUE"
+    else:
         job.status = "WAITING_FOR_PLAYER"
+
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    if job.status == "READY_TO_ENQUEUE":
+        progress_step = "READY_TO_ENQUEUE"
+        progress_pct = max(current_pct, 16)
+    else:
+        progress_step = "WAITING_FOR_PLAYER"
+        progress_pct = max(current_pct, 10)
+    job.progress = {
+        **progress,
+        "step": progress_step,
+        "pct": progress_pct,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     db.commit()
     db.refresh(job)
@@ -1398,9 +1436,15 @@ async def save_player_ref(
             "bbox_xyxy": bbox_xyxy,
         }
 
-        selections = (job.target or {}).get("selections") or []
-        if selections:
-            job.status = "CREATED"
+        target_payload = job.target or {}
+        selections = target_payload.get("selections") or []
+        target_confirmed = bool(target_payload.get("confirmed"))
+        if selections and target_confirmed:
+            job.status = "READY_TO_ENQUEUE"
+        elif selections:
+            job.status = "WAITING_FOR_TARGET"
+        else:
+            job.status = "WAITING_FOR_TARGET"
 
         progress = job.progress or {}
         current_pct = progress.get("pct") or 0
@@ -1408,10 +1452,19 @@ async def save_player_ref(
             current_pct = int(current_pct)
         except (TypeError, ValueError):
             current_pct = 0
+        if job.status == "READY_TO_ENQUEUE":
+            progress_step = "READY_TO_ENQUEUE"
+            progress_pct = max(current_pct, 16)
+        elif job.status == "WAITING_FOR_TARGET":
+            progress_step = "WAITING_FOR_TARGET"
+            progress_pct = max(current_pct, 14)
+        else:
+            progress_step = "PLAYER_SELECTED"
+            progress_pct = max(current_pct, 12)
         job.progress = {
             **progress,
-            "step": "PLAYER_SELECTED",
-            "pct": max(current_pct, 12),
+            "step": progress_step,
+            "pct": progress_pct,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1685,17 +1738,29 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     if not target_confirmed or len(selections) < 1:
         missing.append("target")
     if missing:
-        raise HTTPException(
+        return JSONResponse(
             status_code=400,
-            detail=error_detail(
-                "NOT_READY",
-                "Job not ready to enqueue",
-                {"missing": sorted(set(missing))},
-            ),
+            content={
+                "ok": False,
+                "error": {"code": "NOT_READY", "missing": sorted(set(missing))},
+                "meta": build_meta(request),
+            },
         )
 
     job.status = "QUEUED"
     job.error = None
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    job.progress = {
+        **progress,
+        "step": "QUEUED",
+        "pct": max(current_pct, 20),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
     db.commit()
     db.refresh(job)
 
