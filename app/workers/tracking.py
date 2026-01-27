@@ -81,6 +81,23 @@ def _update_tracking_progress(job_id: str, pct: int, message: str) -> None:
         db.close()
 
 
+def _update_candidates_frames_processed(job_id: str, frames_processed: int) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(AnalysisJob, job_id)
+        if not job:
+            return
+        result = dict(job.result or {})
+        candidates = dict(result.get("candidates") or {})
+        candidates["frames_processed"] = int(frames_processed)
+        result["candidates"] = candidates
+        job.result = result
+        job.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+
 def _mark_tracking_timeout(job_id: str, timeout_seconds: int) -> None:
     db = SessionLocal()
     try:
@@ -701,6 +718,8 @@ def track_all_players(
 
             samples.append({"t": float(timestamp), "detections": detections})
             processed_samples += 1
+            if processed_samples % 2 == 0 or processed_samples == total_samples:
+                _update_candidates_frames_processed(job_id, processed_samples)
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
                 _mark_tracking_timeout(job_id, tracking_timeout_seconds)
@@ -853,6 +872,274 @@ def track_all_players(
     return {
         "method": "yolo+bytetrack",
         "fps": fps,
+        "generated_at": _utc_now_iso(),
+        "expires_in": expires_seconds,
+        "candidates": candidates,
+        "frames_processed": frames_processed,
+        "autodetection": {
+            "totalTracks": total_tracks,
+            "primaryCount": primary_count,
+            "secondaryCount": secondary_count,
+            "thresholdPct": 0.05,
+        },
+        "autodetection_status": autodetection_status,
+        "bucket": s3_bucket,
+        "assets_prefix": f"jobs/{job_id}/candidates/",
+    }
+
+
+def track_all_players_from_frames(
+    job_id: str,
+    frames: List[Dict[str, Any]],
+    *,
+    detector_model: str = "yolo11s.pt",
+    tracker: str = "bytetrack.yaml",
+) -> Dict[str, Any]:
+    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
+    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+
+    if (
+        not s3_endpoint_url
+        or not s3_public_endpoint_url
+        or not s3_access_key
+        or not s3_secret_key
+        or not s3_bucket
+    ):
+        raise RuntimeError(
+            "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
+            "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
+        )
+
+    if not frames:
+        raise RuntimeError("No preview frames available for tracking")
+
+    model = YOLO(detector_model)
+    samples: List[Dict[str, Any]] = []
+    track_map: Dict[int, List[Dict[str, Any]]] = {}
+    total_samples = len(frames)
+
+    last_progress_time = time.monotonic()
+    processed_samples = 0
+    start_pct = 10
+    end_pct = 40
+    tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
+    tracking_started_at = time.monotonic()
+
+    for frame_info in frames:
+        frame_path = frame_info["path"]
+        timestamp = float(frame_info.get("time_sec") or 0.0)
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            continue
+        height, width = frame.shape[:2]
+        results = model.track(
+            source=frame,
+            persist=True,
+            tracker=tracker,
+            conf=0.25,
+            iou=0.5,
+            classes=[0],
+            verbose=False,
+        )
+        detections: List[Dict[str, Any]] = []
+        if results:
+            boxes = results[0].boxes
+            if boxes is not None and boxes.xyxy is not None:
+                xyxy = boxes.xyxy.cpu().numpy()
+                confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
+                ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+                for idx in range(len(xyxy)):
+                    if idx >= len(ids):
+                        continue
+                    track_id = ids[idx]
+                    if track_id is None:
+                        continue
+                    bbox_norm = _bbox_xyxy_to_xywh_norm(
+                        tuple(xyxy[idx]), width, height
+                    )
+                    detection = {
+                        "track_id": int(track_id),
+                        "bbox": {
+                            "x": bbox_norm[0],
+                            "y": bbox_norm[1],
+                            "w": bbox_norm[2],
+                            "h": bbox_norm[3],
+                        },
+                        "conf": float(confs[idx]) if idx < len(confs) else 0.0,
+                    }
+                    detections.append(detection)
+                    track_map.setdefault(int(track_id), []).append(
+                        {
+                            "t": float(timestamp),
+                            "bbox": detection["bbox"],
+                            "conf": detection["conf"],
+                            "sample_index": processed_samples,
+                        }
+                    )
+
+        samples.append({"t": float(timestamp), "detections": detections})
+        processed_samples += 1
+        if processed_samples % 2 == 0 or processed_samples == total_samples:
+            _update_candidates_frames_processed(job_id, processed_samples)
+        now = time.monotonic()
+        if now - tracking_started_at > tracking_timeout_seconds:
+            _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+            raise TrackingTimeoutError("Tracking timeout exceeded")
+        if now - last_progress_time >= 10:
+            pct = start_pct + int(
+                (processed_samples / float(total_samples)) * (end_pct - start_pct)
+            )
+            _update_tracking_progress(job_id, pct, "Tracking all players")
+            last_progress_time = now
+
+    _update_tracking_progress(job_id, end_pct, "Tracking all players")
+
+    if not samples:
+        raise RuntimeError("No frames sampled for tracking")
+
+    candidates: List[Dict[str, Any]] = []
+    total_tracks = len(track_map)
+    frames_processed = len(samples)
+    for track_id, detections in track_map.items():
+        detections_sorted = sorted(detections, key=lambda d: d["sample_index"])
+        if len(detections_sorted) < 4:
+            continue
+        coverage_pct = len(detections_sorted) / float(len(samples))
+        avg_box_area = float(
+            np.mean([det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted])
+        )
+        segments = 1
+        last_index = detections_sorted[0]["sample_index"]
+        for det in detections_sorted[1:]:
+            if det["sample_index"] - last_index > 1:
+                segments += 1
+            last_index = det["sample_index"]
+        id_switches = max(0, segments - 1)
+        normalized_switches = id_switches / float(max(1, len(detections_sorted) - 1))
+        stability_score = max(0.0, 1.0 - normalized_switches)
+        selected_samples = _select_candidate_samples(detections_sorted)
+        sample_frames = [
+            {
+                "time_sec": float(sample["t"]),
+                "bbox": sample["bbox"],
+            }
+            for sample in selected_samples
+        ]
+        if coverage_pct >= 0.05:
+            tier = "PRIMARY"
+        elif coverage_pct >= 0.02:
+            tier = "SECONDARY"
+        else:
+            continue
+        candidates.append(
+            {
+                "track_id": int(track_id),
+                "coverage_pct": round(coverage_pct, 4),
+                "stability_score": round(float(stability_score), 3),
+                "avg_box_area": round(float(avg_box_area), 6),
+                "id_switches": int(id_switches),
+                "tier": tier,
+                "sample_frames": sample_frames,
+            }
+        )
+
+    if not candidates:
+        return {
+            "method": "yolo+bytetrack",
+            "fps": len(frames),
+            "generated_at": _utc_now_iso(),
+            "candidates": [],
+            "frames_processed": frames_processed,
+            "autodetection": {
+                "totalTracks": total_tracks,
+                "primaryCount": 0,
+                "secondaryCount": 0,
+                "thresholdPct": 0.05,
+            },
+            "autodetection_status": "LOW_COVERAGE",
+        }
+
+    primary = [c for c in candidates if c.get("tier") == "PRIMARY"]
+    secondary = [c for c in candidates if c.get("tier") == "SECONDARY"]
+
+    primary.sort(
+        key=lambda item: (
+            item.get("stability_score", 0),
+            item.get("coverage_pct", 0),
+            item.get("avg_box_area", 0),
+        ),
+        reverse=True,
+    )
+    secondary.sort(
+        key=lambda item: (
+            item.get("stability_score", 0),
+            item.get("coverage_pct", 0),
+            item.get("avg_box_area", 0),
+        ),
+        reverse=True,
+    )
+    candidates = primary + secondary
+
+    s3_internal = _get_s3_client(s3_endpoint_url)
+    s3_public = _get_s3_client(s3_public_endpoint_url)
+    _ensure_bucket_exists(s3_internal, s3_bucket)
+
+    candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_lookup: List[Tuple[float, Path]] = [
+        (float(item.get("time_sec") or 0.0), Path(item["path"])) for item in frames
+    ]
+
+    def _find_frame_path(timestamp: float) -> Optional[Path]:
+        if not frame_lookup:
+            return None
+        return min(frame_lookup, key=lambda item: abs(item[0] - timestamp))[1]
+
+    for candidate in candidates:
+        sample_frames = candidate.get("sample_frames") or []
+        uploaded_frames: List[Dict[str, Any]] = []
+        for idx, sample in enumerate(sample_frames, start=1):
+            timestamp = float(sample["time_sec"])
+            frame_path = _find_frame_path(timestamp)
+            if frame_path is None or not frame_path.exists():
+                continue
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                continue
+            frame_name = f"track_{candidate['track_id']}_{idx:02d}.jpg"
+            output_path = candidates_dir / frame_name
+            cv2.imwrite(str(output_path), frame)
+            frame_key = f"jobs/{job_id}/candidates/{frame_name}"
+            _upload_file(
+                s3_internal,
+                s3_bucket,
+                output_path,
+                frame_key,
+                "image/jpeg",
+            )
+            uploaded_frames.append(
+                {
+                    "time_sec": timestamp,
+                    "bbox": sample["bbox"],
+                    "bucket": s3_bucket,
+                    "key": frame_key,
+                }
+            )
+        candidate["sample_frames"] = uploaded_frames
+
+    candidates = [c for c in candidates if len(c.get("sample_frames") or []) >= 4]
+    primary_count = len([c for c in candidates if c.get("tier") == "PRIMARY"])
+    secondary_count = len([c for c in candidates if c.get("tier") == "SECONDARY"])
+    autodetection_status = "LOW_COVERAGE" if primary_count == 0 else "OK"
+
+    return {
+        "method": "yolo+bytetrack",
+        "fps": len(frames),
         "generated_at": _utc_now_iso(),
         "expires_in": expires_seconds,
         "candidates": candidates,
