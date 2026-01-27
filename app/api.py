@@ -164,6 +164,8 @@ def _build_candidate_payload(
                 "stabilityScore": candidate.get("stability_score"),
                 "avgBoxArea": candidate.get("avg_box_area"),
                 "tier": candidate.get("tier"),
+                "quality": candidate.get("quality"),
+                "lowCoverage": candidate.get("lowCoverage"),
                 "sampleFrames": normalized_frames,
             }
         )
@@ -748,7 +750,13 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
         )
 
     result_payload = normalize_payload(job.result)
-    candidates_payload = result_payload.get("candidates") or {}
+    candidates_payload_raw = result_payload.get("candidates") or {}
+    if isinstance(candidates_payload_raw, list):
+        candidates_payload = {"candidates": candidates_payload_raw}
+    elif isinstance(candidates_payload_raw, dict):
+        candidates_payload = candidates_payload_raw
+    else:
+        candidates_payload = {}
     if not candidates_payload:
         progress_step = (job.progress or {}).get("step")
         if progress_step == "TRACKING_CANDIDATES":
@@ -764,9 +772,13 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
                 "candidates": [],
                 "autodetection": {
                     "totalTracks": 0,
+                    "rawTracks": 0,
                     "primaryCount": 0,
                     "secondaryCount": 0,
                     "thresholdPct": 0.05,
+                    "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
+                    "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+                    "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
                 },
                 "autodetection_status": "PROCESSING",
                 "error_detail": None,
@@ -775,20 +787,61 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
         )
 
     context = load_s3_context()
-    frames_processed = int(candidates_payload.get("frames_processed") or 0)
-    autodetection = candidates_payload.get("autodetection") or {
-        "totalTracks": 0,
-        "primaryCount": 0,
-        "secondaryCount": 0,
-        "thresholdPct": 0.05,
-    }
+    frames_processed = int(
+        candidates_payload.get("framesProcessed")
+        or candidates_payload.get("frames_processed")
+        or result_payload.get("framesProcessed")
+        or 0
+    )
+    autodetection = (
+        candidates_payload.get("autodetection")
+        or result_payload.get("autodetection")
+        or {
+            "totalTracks": 0,
+            "rawTracks": 0,
+            "primaryCount": 0,
+            "secondaryCount": 0,
+            "thresholdPct": 0.05,
+            "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
+            "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+            "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
+        }
+    )
+    if "thresholdPct" not in autodetection:
+        autodetection["thresholdPct"] = 0.05
+    autodetection.setdefault(
+        "minHits", int(os.environ.get("CANDIDATE_MIN_HITS", "2"))
+    )
+    autodetection.setdefault(
+        "minSeconds", float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0)
+    )
+    autodetection.setdefault(
+        "topN", int(os.environ.get("CANDIDATE_TOP_N", "5"))
+    )
+    if "totalTracks" not in autodetection:
+        autodetection["totalTracks"] = (
+            result_payload.get("totalTracks") or len(candidates_payload.get("candidates") or [])
+        )
+    autodetection.setdefault(
+        "rawTracks", result_payload.get("rawTracks") or autodetection["totalTracks"]
+    )
+    if "primaryCount" not in autodetection:
+        autodetection["primaryCount"] = result_payload.get("primaryCount") or 0
+    if "secondaryCount" not in autodetection:
+        autodetection["secondaryCount"] = result_payload.get("secondaryCount") or 0
     autodetection_status = candidates_payload.get("autodetection_status") or "PROCESSING"
     error_detail_payload = candidates_payload.get("error_detail")
     candidates = _build_candidate_payload(candidates_payload, context)
     if autodetection_status == "FAILED":
         status = "FAILED"
         candidates = []
-    elif frames_processed < MIN_FRAMES_FOR_EVAL:
+    elif (
+        autodetection_status in {"PROCESSING", "PENDING_QUEUE"}
+        and not candidates
+    ):
+        status = "PROCESSING"
+        candidates = []
+    elif frames_processed < MIN_FRAMES_FOR_EVAL and not candidates:
         status = "PROCESSING"
         candidates = []
         autodetection_status = "PROCESSING"
@@ -824,8 +877,13 @@ def select_track(
         )
 
     result_payload = normalize_payload(job.result)
-    candidates_payload = result_payload.get("candidates") or {}
-    candidates = candidates_payload.get("candidates") or []
+    candidates_payload_raw = result_payload.get("candidates") or {}
+    if isinstance(candidates_payload_raw, list):
+        candidates = candidates_payload_raw
+    elif isinstance(candidates_payload_raw, dict):
+        candidates = candidates_payload_raw.get("candidates") or []
+    else:
+        candidates = []
     candidate = next(
         (
             item
