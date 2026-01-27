@@ -838,6 +838,102 @@ def extract_preview_frames(self, job_id: str) -> None:
         db.close()
 
 
+@celery.task(name="app.workers.pipeline.extract_candidates", bind=True)
+def extract_candidates(self, job_id: str) -> None:
+    db: Session = SessionLocal()
+    base_dir: Optional[Path] = None
+
+    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
+
+    max_retries = int(os.environ.get("CANDIDATES_TASK_RETRIES", "2"))
+    try:
+        job = reload_job(db, job_id)
+        if not job:
+            return
+
+        existing_candidates = (job.result or {}).get("candidates")
+        if existing_candidates:
+            return
+
+        if (
+            not s3_endpoint_url
+            or not s3_public_endpoint_url
+            or not s3_access_key
+            or not s3_secret_key
+            or not s3_bucket
+        ):
+            raise RuntimeError(
+                "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
+                "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
+            )
+
+        update_job(
+            db,
+            job_id,
+            lambda job: set_progress(
+                job, "TRACKING_CANDIDATES", 18, "Tracking all players"
+            ),
+        )
+
+        base_dir = Path("/tmp/fnh_jobs_candidates") / job_id
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = base_dir / "input.mp4"
+
+        s3_internal = get_s3_client(s3_endpoint_url)
+        ensure_bucket_exists(s3_internal, s3_bucket)
+
+        video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
+        download_video(video_source, input_path, s3_internal, source_bucket)
+
+        candidates_output = track_all_players(job_id, str(input_path))
+        update_job(
+            db,
+            job_id,
+            lambda job: (
+                setattr(
+                    job,
+                    "result",
+                    {
+                        **(job.result or {}),
+                        "candidates": candidates_output,
+                    },
+                ),
+                set_progress(
+                    job, "CANDIDATES_READY", 22, "Candidate tracks ready"
+                ),
+            ),
+        )
+    except Exception as exc:
+        logger.exception("extract_candidates failed job_id=%s", job_id)
+        if max_retries > 0:
+            try:
+                raise self.retry(exc=exc, countdown=15, max_retries=max_retries)
+            except Exception:
+                pass
+        update_job(
+            db,
+            job_id,
+            lambda job: (
+                setattr(job, "warnings", list({*(job.warnings or []), "CANDIDATES_FAILED"})),
+                set_progress(job, "CANDIDATES_FAILED", 18, "Candidates extraction failed"),
+            ),
+        )
+    finally:
+        if base_dir is not None and base_dir.exists():
+            try:
+                shutil.rmtree(base_dir)
+            except Exception:
+                pass
+        db.close()
+
+
 @celery.task(name="app.workers.pipeline.run_analysis", bind=True)
 def run_analysis(self, job_id: str):
     db: Session = SessionLocal()
