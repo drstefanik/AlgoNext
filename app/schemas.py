@@ -146,3 +146,8 @@ class PlayerRefPayload(BaseModel):
         if x + w > 1 or y + h > 1:
             raise ValueError("Invalid bbox dimensions")
         return {"x": x, "y": y, "w": w, "h": h}
+
+
+class TrackSelectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    track_id: int = Field(alias="trackId", ge=0)
