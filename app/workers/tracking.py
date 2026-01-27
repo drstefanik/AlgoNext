@@ -723,6 +723,7 @@ def track_all_players(
 
     candidates: List[Dict[str, Any]] = []
     total_tracks = len(track_map)
+    frames_processed = len(samples)
     for track_id, detections in track_map.items():
         detections_sorted = sorted(detections, key=lambda d: d["sample_index"])
         if len(detections_sorted) < 4:
@@ -772,6 +773,7 @@ def track_all_players(
             "fps": fps,
             "generated_at": _utc_now_iso(),
             "candidates": [],
+            "frames_processed": frames_processed,
             "autodetection": {
                 "totalTracks": total_tracks,
                 "primaryCount": 0,
@@ -854,6 +856,7 @@ def track_all_players(
         "generated_at": _utc_now_iso(),
         "expires_in": expires_seconds,
         "candidates": candidates,
+        "frames_processed": frames_processed,
         "autodetection": {
             "totalTracks": total_tracks,
             "primaryCount": primary_count,

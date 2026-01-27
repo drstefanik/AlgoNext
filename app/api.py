@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+MIN_FRAMES_FOR_EVAL = int(os.environ.get("MIN_FRAMES_FOR_EVAL", "30"))
+
 POLLING_SAFE_STATUSES = {
     "WAITING_FOR_SELECTION",
     "WAITING_FOR_PLAYER",
@@ -751,6 +753,8 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
     if not candidates_payload:
         return ok_response(
             {
+                "status": "PROCESSING",
+                "framesProcessed": 0,
                 "candidates": [],
                 "autodetection": {
                     "totalTracks": 0,
@@ -758,18 +762,36 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
                     "secondaryCount": 0,
                     "thresholdPct": 0.05,
                 },
-                "autodetection_status": "LOW_COVERAGE",
+                "autodetection_status": "PROCESSING",
             },
             request,
         )
 
     context = load_s3_context()
+    frames_processed = int(candidates_payload.get("frames_processed") or 0)
+    autodetection = candidates_payload.get("autodetection") or {
+        "totalTracks": 0,
+        "primaryCount": 0,
+        "secondaryCount": 0,
+        "thresholdPct": 0.05,
+    }
+    autodetection_status = candidates_payload.get("autodetection_status") or "PROCESSING"
     candidates = _build_candidate_payload(candidates_payload, context)
+    if frames_processed < MIN_FRAMES_FOR_EVAL:
+        status = "PROCESSING"
+        candidates = []
+        autodetection_status = "PROCESSING"
+    elif autodetection_status == "LOW_COVERAGE":
+        status = "LOW_COVERAGE"
+    else:
+        status = "READY"
     return ok_response(
         {
+            "status": status,
+            "framesProcessed": frames_processed,
             "candidates": candidates,
-            "autodetection": candidates_payload.get("autodetection"),
-            "autodetection_status": candidates_payload.get("autodetection_status"),
+            "autodetection": autodetection,
+            "autodetection_status": autodetection_status,
         },
         request,
     )
