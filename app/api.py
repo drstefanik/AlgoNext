@@ -161,6 +161,7 @@ def _build_candidate_payload(
                 "coveragePct": candidate.get("coverage_pct"),
                 "stabilityScore": candidate.get("stability_score"),
                 "avgBoxArea": candidate.get("avg_box_area"),
+                "tier": candidate.get("tier"),
                 "sampleFrames": normalized_frames,
             }
         )
@@ -747,11 +748,30 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
     result_payload = normalize_payload(job.result)
     candidates_payload = result_payload.get("candidates") or {}
     if not candidates_payload:
-        return ok_response({"candidates": []}, request)
+        return ok_response(
+            {
+                "candidates": [],
+                "autodetection": {
+                    "totalTracks": 0,
+                    "primaryCount": 0,
+                    "secondaryCount": 0,
+                    "thresholdPct": 0.05,
+                },
+                "autodetection_status": "LOW_COVERAGE",
+            },
+            request,
+        )
 
     context = load_s3_context()
     candidates = _build_candidate_payload(candidates_payload, context)
-    return ok_response({"candidates": candidates}, request)
+    return ok_response(
+        {
+            "candidates": candidates,
+            "autodetection": candidates_payload.get("autodetection"),
+            "autodetection_status": candidates_payload.get("autodetection_status"),
+        },
+        request,
+    )
 
 
 def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
