@@ -984,22 +984,41 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             candidates_output = track_all_players(job_id, str(input_path))
         if isinstance(candidates_output, dict):
             candidates_list = list(candidates_output.get("candidates") or [])
-            frames_processed = candidates_output.get("framesProcessed")
+            frames_processed = (
+                candidates_output.get("framesProcessed")
+                or candidates_output.get("frames_processed")
+            )
             if frames_processed is None:
                 frames_processed = len(preview_inputs)
             total_tracks = candidates_output.get("totalTracks")
             if total_tracks is None:
-                total_tracks = len(candidates_list) if candidates_list else 0
+                total_tracks = (
+                    (candidates_output.get("autodetection") or {}).get("totalTracks")
+                    or (len(candidates_list) if candidates_list else 0)
+                )
+            raw_tracks = candidates_output.get("rawTracks")
+            if raw_tracks is None:
+                raw_tracks = (
+                    (candidates_output.get("autodetection") or {}).get("rawTracks")
+                    or total_tracks
+                )
             primary_count = candidates_output.get("primaryCount")
             if primary_count is None:
-                primary_count = 0
+                primary_count = (
+                    (candidates_output.get("autodetection") or {}).get("primaryCount")
+                    or 0
+                )
             secondary_count = candidates_output.get("secondaryCount")
             if secondary_count is None:
-                secondary_count = 0
+                secondary_count = (
+                    (candidates_output.get("autodetection") or {}).get("secondaryCount")
+                    or 0
+                )
         else:
             candidates_list = list(candidates_output or [])
             frames_processed = len(preview_inputs)
             total_tracks = len(candidates_list)
+            raw_tracks = total_tracks
             primary_count = 0
             secondary_count = 0
         error_detail = None
@@ -1010,6 +1029,22 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
         autodetection_status = (
             "READY" if primary_count > 0 and not error_detail else "LOW_COVERAGE"
         )
+        candidates_payload = {
+            "candidates": candidates_list,
+            "framesProcessed": frames_processed,
+            "autodetection": {
+                "totalTracks": total_tracks,
+                "rawTracks": raw_tracks,
+                "primaryCount": primary_count,
+                "secondaryCount": secondary_count,
+                "thresholdPct": 0.05,
+                "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
+                "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+                "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
+            },
+            "autodetection_status": autodetection_status,
+            "error_detail": error_detail,
+        }
         update_job(
             db,
             job_id,
@@ -1019,16 +1054,12 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     "result",
                     {
                         **(job.result or {}),
-                        "candidates": candidates_list,
-                        "autodetection": {
-                            "framesProcessed": frames_processed,
-                            "totalTracks": total_tracks,
-                            "primaryCount": primary_count,
-                            "secondaryCount": secondary_count,
-                            "thresholdPct": 0.05,
-                        },
-                        "autodetection_status": autodetection_status,
-                        "error_detail": error_detail,
+                        "candidates": candidates_payload,
+                        "framesProcessed": frames_processed,
+                        "totalTracks": total_tracks,
+                        "rawTracks": raw_tracks,
+                        "primaryCount": primary_count,
+                        "secondaryCount": secondary_count,
                     },
                 ),
                 set_progress(
@@ -1059,12 +1090,16 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             setattr(job, "warnings", warnings)
             candidates_payload = {
                 "candidates": [],
-                "frames_processed": 0,
+                "framesProcessed": 0,
                 "autodetection": {
                     "totalTracks": 0,
+                    "rawTracks": 0,
                     "primaryCount": 0,
                     "secondaryCount": 0,
                     "thresholdPct": 0.05,
+                    "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
+                    "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+                    "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
                 },
                 "autodetection_status": "FAILED",
                 "error_detail": error_detail,
@@ -1072,7 +1107,15 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             setattr(
                 job,
                 "result",
-                {**(job.result or {}), "candidates": candidates_payload},
+                {
+                    **(job.result or {}),
+                    "candidates": candidates_payload,
+                    "framesProcessed": 0,
+                    "totalTracks": 0,
+                    "rawTracks": 0,
+                    "primaryCount": 0,
+                    "secondaryCount": 0,
+                },
             )
             if preview_frames:
                 set_progress(
