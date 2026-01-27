@@ -148,6 +148,48 @@ class PlayerRefPayload(BaseModel):
         return {"x": x, "y": y, "w": w, "h": h}
 
 
+class TrackSelectionBox(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    frame_time_sec: float = Field(ge=0, alias="time_sec")
+    x: float = Field(ge=0)
+    y: float = Field(ge=0)
+    w: float = Field(gt=0)
+    h: float = Field(gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Missing selection payload")
+        frame_time_sec = (
+            data.get("frame_time_sec")
+            or data.get("time_sec")
+            or data.get("frameTimeSec")
+        )
+        if frame_time_sec is None:
+            raise ValueError("Missing selection time_sec")
+
+        bbox = data.get("bbox")
+        if not isinstance(bbox, dict):
+            bbox = {
+                "x": data.get("x"),
+                "y": data.get("y"),
+                "w": data.get("w"),
+                "h": data.get("h"),
+            }
+        if not isinstance(bbox, dict) or not {"x", "y", "w", "h"}.issubset(bbox):
+            raise ValueError("Missing selection bbox")
+
+        return {
+            "frame_time_sec": float(frame_time_sec),
+            "x": float(bbox["x"]),
+            "y": float(bbox["y"]),
+            "w": float(bbox["w"]),
+            "h": float(bbox["h"]),
+        }
+
+
 class TrackSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     track_id: int | str = Field(alias="trackId")
+    selection: TrackSelectionBox
