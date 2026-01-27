@@ -193,3 +193,43 @@ class TrackSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     track_id: int | str = Field(alias="trackId")
     selection: TrackSelectionBox
+
+
+class TargetSelectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    frame_key: Optional[str] = Field(default=None, alias="frameKey")
+    time_sec: Optional[float] = Field(default=None, alias="timeSec")
+    bbox: Dict[str, float]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Missing target selection payload")
+        frame_key = data.get("frame_key") or data.get("frameKey")
+        time_sec = data.get("time_sec") or data.get("timeSec")
+        bbox = data.get("bbox")
+        if not isinstance(bbox, dict):
+            bbox = {
+                "x": data.get("x"),
+                "y": data.get("y"),
+                "w": data.get("w"),
+                "h": data.get("h"),
+            }
+        if not isinstance(bbox, dict) or not {"x", "y", "w", "h"}.issubset(bbox):
+            raise ValueError("Missing target bbox")
+        bbox = PlayerRefPayload._validate_bbox_xywh(
+            {
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        )
+        if frame_key is None and time_sec is None:
+            raise ValueError("Missing frame_key or time_sec")
+        return {
+            "frame_key": frame_key,
+            "time_sec": float(time_sec) if time_sec is not None else None,
+            "bbox": bbox,
+        }

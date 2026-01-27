@@ -21,7 +21,13 @@ from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.schemas import JobCreate, PlayerRefPayload, SelectionPayload, TrackSelectionPayload
+from app.schemas import (
+    JobCreate,
+    PlayerRefPayload,
+    SelectionPayload,
+    TargetSelectionPayload,
+    TrackSelectionPayload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,7 @@ POLLING_SAFE_STATUSES = {
     "WAITING_FOR_SELECTION",
     "WAITING_FOR_PLAYER",
     "WAITING_FOR_TARGET",
+    "READY_TO_ENQUEUE",
     "CREATED",
     "QUEUED",
     "RUNNING",
@@ -163,6 +170,7 @@ def _build_candidate_payload(
                 "tier": candidate.get("tier"),
                 "quality": candidate.get("quality"),
                 "lowCoverage": candidate.get("lowCoverage"),
+                "bestPreviewFrameKey": candidate.get("best_preview_frame_key"),
                 "sampleFrames": normalized_frames,
             }
         )
@@ -1012,18 +1020,12 @@ def select_track(
         player_ref_payload[key] = value
     job.player_ref = player_ref_payload
     selection = normalized_payload.selection
-    job.target = {
-        "selections": [
-            {
-                "frame_time_sec": selection.frame_time_sec,
-                "x": selection.x,
-                "y": selection.y,
-                "w": selection.w,
-                "h": selection.h,
-            }
-        ],
-        "tracking": {"status": "PENDING"},
-    }
+    target_payload = {**(job.target or {})}
+    target_payload["confirmed"] = False
+    target_payload["selection"] = None
+    target_payload["selections"] = []
+    target_payload.setdefault("tracking", {"status": "PENDING"})
+    job.target = target_payload
     job.status = "WAITING_FOR_TARGET"
     job.updated_at = datetime.now(timezone.utc)
 
@@ -1043,6 +1045,15 @@ def select_track(
     db.commit()
     db.refresh(job)
     normalized_player_ref = _normalize_player_ref(job.player_ref or {})
+    target_suggestion = {
+        "time_sec": selection.frame_time_sec,
+        "bbox": {
+            "x": selection.x,
+            "y": selection.y,
+            "w": selection.w,
+            "h": selection.h,
+        },
+    }
     return ok_response(
         {
             "job_id": job.id,
@@ -1051,6 +1062,116 @@ def select_track(
             "playerSaved": True,
             "playerRef": job.player_ref,
             "player_ref": normalized_player_ref,
+            "target": None,
+            "target_suggestion": target_suggestion,
+            "progress": normalize_payload(job.progress),
+        },
+        request,
+    )
+
+
+@router.post("/jobs/{job_id}/select-target")
+def select_target(
+    job_id: str,
+    request: Request,
+    payload: TargetSelectionPayload,
+    db: Session = Depends(get_db),
+):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    preview_frames = job.preview_frames or []
+    preview_lookup: Dict[str, Dict[str, Any]] = {}
+    if isinstance(preview_frames, list):
+        for frame in preview_frames:
+            if not isinstance(frame, dict):
+                continue
+            key = frame.get("key") or frame.get("s3_key")
+            if isinstance(key, str) and key:
+                preview_lookup[key] = frame
+                preview_lookup.setdefault(key.split("/")[-1], frame)
+
+    frame_key = payload.frame_key
+    time_sec = payload.time_sec
+    selected_frame = None
+    if frame_key:
+        selected_frame = preview_lookup.get(frame_key)
+        if selected_frame is None and preview_lookup:
+            raise HTTPException(
+                status_code=422,
+                detail=error_detail(
+                    "FRAME_NOT_FOUND", "Frame key not found", {"frame_key": frame_key}
+                ),
+            )
+        if selected_frame and selected_frame.get("key"):
+            frame_key = selected_frame.get("key")
+        if selected_frame and selected_frame.get("time_sec") is not None:
+            time_sec = float(selected_frame.get("time_sec"))
+    elif preview_lookup and time_sec is not None:
+        selected_frame = min(
+            preview_lookup.values(),
+            key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
+        )
+        frame_key = selected_frame.get("key") or frame_key
+        time_sec = float(selected_frame.get("time_sec") or time_sec)
+
+    if time_sec is None:
+        raise HTTPException(
+            status_code=422,
+            detail=error_detail("MISSING_TIME", "Missing time_sec for target selection"),
+        )
+
+    selection_payload = {
+        "frame_key": frame_key,
+        "time_sec": float(time_sec),
+        "bbox": payload.bbox,
+    }
+    selections_payload = [
+        {
+            "frame_key": frame_key,
+            "frame_time_sec": float(time_sec),
+            "x": payload.bbox["x"],
+            "y": payload.bbox["y"],
+            "w": payload.bbox["w"],
+            "h": payload.bbox["h"],
+        }
+    ]
+    target_payload = {**(job.target or {})}
+    target_payload["confirmed"] = True
+    target_payload["selection"] = selection_payload
+    target_payload["selections"] = selections_payload
+    target_payload.setdefault("tracking", {"status": "PENDING"})
+    job.target = target_payload
+    job.status = "READY_TO_ENQUEUE"
+    job.updated_at = datetime.now(timezone.utc)
+
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    job.progress = {
+        **progress,
+        "step": "READY_TO_ENQUEUE",
+        "pct": max(current_pct, 16),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    db.commit()
+    db.refresh(job)
+
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": job.status,
+            "target": job.target,
+            "progress": normalize_payload(job.progress),
         },
         request,
     )
@@ -1073,22 +1194,32 @@ def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
 
 
 def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
-    if "frame_time_sec" in selection:
-        return {
-            "frame_time_sec": float(selection.get("frame_time_sec", 0.0)),
+    if "frame_time_sec" in selection or "frame_key" in selection:
+        frame_time_sec = float(selection.get("frame_time_sec", 0.0))
+        normalized = {
+            "frame_time_sec": frame_time_sec,
+            "time_sec": frame_time_sec,
             "x": float(selection.get("x", 0.0)),
             "y": float(selection.get("y", 0.0)),
             "w": float(selection.get("w", 0.0)),
             "h": float(selection.get("h", 0.0)),
         }
+        if selection.get("frame_key"):
+            normalized["frame_key"] = selection.get("frame_key")
+        return normalized
     bbox = selection.get("bbox") or {}
-    return {
-        "frame_time_sec": float(selection.get("time_sec", 0.0)),
+    frame_time_sec = float(selection.get("time_sec", 0.0))
+    normalized = {
+        "frame_time_sec": frame_time_sec,
+        "time_sec": frame_time_sec,
         "x": float(bbox.get("x", 0.0)),
         "y": float(bbox.get("y", 0.0)),
         "w": float(bbox.get("w", 0.0)),
         "h": float(bbox.get("h", 0.0)),
     }
+    if selection.get("frame_key"):
+        normalized["frame_key"] = selection.get("frame_key")
+    return normalized
 
 
 def _normalize_player_ref(anchor: Dict[str, Any]) -> Dict[str, float] | None:
@@ -1545,24 +1676,21 @@ def enqueue_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     if job.status in ["QUEUED", "RUNNING", "COMPLETED", "FAILED"]:
         return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
-    if job.status not in ["WAITING_FOR_SELECTION", "CREATED", "WAITING_FOR_PLAYER"]:
-        raise HTTPException(
-            status_code=400,
-            detail=error_detail("JOB_NOT_ENQUEUEABLE", "Job not enqueueable"),
-        )
-
     selections = (job.target or {}).get("selections") or []
+    target_confirmed = bool((job.target or {}).get("confirmed"))
     player_ref = job.player_ref or job.anchor or {}
+    missing: List[str] = []
     if _normalize_player_ref(player_ref) is None:
-        raise HTTPException(
-            status_code=400,
-            detail=error_detail("MISSING_PLAYER_REF", "Missing player_ref"),
-        )
-    if len(selections) < 1:
+        missing.append("player_ref")
+    if not target_confirmed or len(selections) < 1:
+        missing.append("target")
+    if missing:
         raise HTTPException(
             status_code=400,
             detail=error_detail(
-                "MISSING_TARGET_SELECTION", "Missing target selection"
+                "NOT_READY",
+                "Job not ready to enqueue",
+                {"missing": sorted(set(missing))},
             ),
         )
 

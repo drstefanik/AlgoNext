@@ -1033,6 +1033,7 @@ def track_all_players_from_frames(
     model = YOLO(detector_model)
     track_map: Dict[int, List[Dict[str, Any]]] = {}
     total_samples = len(frames)
+    frame_tracks: List[Dict[str, Any]] = []
 
     last_progress_time = time.monotonic()
     processed_samples = 0
@@ -1044,11 +1045,15 @@ def track_all_players_from_frames(
     for frame_index, frame_info in enumerate(frames):
         frame_path = frame_info["path"]
         timestamp = float(frame_info.get("time_sec") or 0.0)
+        frame_key = frame_info.get("key") or frame_info.get("frame_key")
         frame = cv2.imread(str(frame_path))
         if frame is None:
             processed_samples += 1
             if processed_samples % 2 == 0 or processed_samples == total_samples:
                 _update_candidates_frames_processed(job_id, processed_samples)
+            frame_tracks.append(
+                {"frame_key": frame_key, "time_sec": timestamp, "tracks": []}
+            )
             continue
         height, width = frame.shape[:2]
         results = model.track(
@@ -1096,6 +1101,20 @@ def track_all_players_from_frames(
                         }
                     )
 
+        frame_tracks.append(
+            {
+                "frame_key": frame_key,
+                "time_sec": timestamp,
+                "tracks": [
+                    {
+                        "track_id": det["track_id"],
+                        "bbox": det["bbox"],
+                        "score_hint": det.get("conf", 0.0),
+                    }
+                    for det in detections
+                ],
+            }
+        )
         processed_samples += 1
         if processed_samples % 2 == 0 or processed_samples == total_samples:
             _update_candidates_frames_processed(job_id, processed_samples)
@@ -1132,6 +1151,7 @@ def track_all_players_from_frames(
             "rawTracks": raw_tracks,
             "primaryCount": 0,
             "secondaryCount": 0,
+            "frame_tracks": frame_tracks,
             "autodetection": {
                 "totalTracks": total_tracks,
                 "rawTracks": raw_tracks,
@@ -1209,6 +1229,7 @@ def track_all_players_from_frames(
         "rawTracks": raw_tracks,
         "primaryCount": primary_count,
         "secondaryCount": secondary_count,
+        "frame_tracks": frame_tracks,
         "autodetection": {
             "totalTracks": total_tracks,
             "rawTracks": raw_tracks,
