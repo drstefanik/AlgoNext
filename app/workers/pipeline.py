@@ -709,7 +709,7 @@ def extract_preview_frames(self, job_id: str) -> None:
     try:
         job = reload_job(db, job_id)
         if not job:
-            return
+            return {}
 
         if job.preview_frames:
             return
@@ -876,7 +876,7 @@ def _build_candidates_error_detail(exc: Exception) -> Dict[str, Any]:
 
 
 @celery.task(name="app.workers.pipeline.extract_candidates", bind=True)
-def extract_candidates(self, job_id: str) -> None:
+def extract_candidates(self, job_id: str) -> Dict[str, Any]:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
 
@@ -890,11 +890,11 @@ def extract_candidates(self, job_id: str) -> None:
     try:
         job = reload_job(db, job_id)
         if not job:
-            return
+            return {}
 
         existing_candidates = (job.result or {}).get("candidates")
         if existing_candidates:
-            return
+            return {}
 
         if (
             not s3_endpoint_url
@@ -924,7 +924,7 @@ def extract_candidates(self, job_id: str) -> None:
                 "extract_candidates exiting: preview_frames_missing job_id=%s",
                 job_id,
             )
-            return
+            return {}
 
         update_job(
             db,
@@ -934,10 +934,16 @@ def extract_candidates(self, job_id: str) -> None:
             ),
         )
 
+        preview_inputs: List[Dict[str, Any]] = []
         if preview_frames:
             frames_dir = base_dir / "frames"
             frames_dir.mkdir(parents=True, exist_ok=True)
-            preview_inputs: List[Dict[str, Any]] = []
+            valid_keys = sum(1 for frame in preview_frames if (frame or {}).get("key"))
+            logger.info(
+                "extract_candidates: preview_frames=%d valid_keys=%d",
+                len(preview_frames),
+                valid_keys,
+            )
             for index, frame in enumerate(preview_frames, start=1):
                 frame_key = (frame or {}).get("key")
                 if not frame_key:
@@ -951,11 +957,59 @@ def extract_candidates(self, job_id: str) -> None:
                     }
                 )
             candidates_output = track_all_players_from_frames(job_id, preview_inputs)
+            logger.info(
+                "extract_candidates: preview_inputs=%d", len(preview_inputs)
+            )
+            logger.info(
+                "extract_candidates: candidates_output type=%s",
+                type(candidates_output),
+            )
+            try:
+                logger.info(
+                    "extract_candidates: candidates_output keys=%s",
+                    list(candidates_output.keys()),
+                )
+            except Exception:
+                logger.info(
+                    "extract_candidates: candidates_output is not dict-like"
+                )
+            logger.info(
+                "extract_candidates: candidates_output preview=%s",
+                str(candidates_output)[:1200],
+            )
         else:
             input_path = base_dir / "input.mp4"
             video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
             download_video(video_source, input_path, s3_internal, source_bucket)
             candidates_output = track_all_players(job_id, str(input_path))
+        if isinstance(candidates_output, dict):
+            candidates_list = list(candidates_output.get("candidates") or [])
+            frames_processed = candidates_output.get("framesProcessed")
+            if frames_processed is None:
+                frames_processed = len(preview_inputs)
+            total_tracks = candidates_output.get("totalTracks")
+            if total_tracks is None:
+                total_tracks = len(candidates_list) if candidates_list else 0
+            primary_count = candidates_output.get("primaryCount")
+            if primary_count is None:
+                primary_count = 0
+            secondary_count = candidates_output.get("secondaryCount")
+            if secondary_count is None:
+                secondary_count = 0
+        else:
+            candidates_list = list(candidates_output or [])
+            frames_processed = len(preview_inputs)
+            total_tracks = len(candidates_list)
+            primary_count = 0
+            secondary_count = 0
+        error_detail = None
+        if len(preview_inputs) == 0:
+            error_detail = "NO_VALID_PREVIEW_KEYS"
+        elif total_tracks == 0:
+            error_detail = "NO_TRACKS_RETURNED"
+        autodetection_status = (
+            "READY" if primary_count > 0 and not error_detail else "LOW_COVERAGE"
+        )
         update_job(
             db,
             job_id,
@@ -965,7 +1019,16 @@ def extract_candidates(self, job_id: str) -> None:
                     "result",
                     {
                         **(job.result or {}),
-                        "candidates": candidates_output,
+                        "candidates": candidates_list,
+                        "autodetection": {
+                            "framesProcessed": frames_processed,
+                            "totalTracks": total_tracks,
+                            "primaryCount": primary_count,
+                            "secondaryCount": secondary_count,
+                            "thresholdPct": 0.05,
+                        },
+                        "autodetection_status": autodetection_status,
+                        "error_detail": error_detail,
                     },
                 ),
                 set_progress(
@@ -973,6 +1036,11 @@ def extract_candidates(self, job_id: str) -> None:
                 ),
             ),
         )
+        return {
+            "framesProcessed": frames_processed,
+            "totalTracks": total_tracks,
+            "primaryCount": primary_count,
+        }
     except Exception as exc:
         logger.exception("extract_candidates failed job_id=%s", job_id)
         if max_retries > 0:
@@ -1014,6 +1082,11 @@ def extract_candidates(self, job_id: str) -> None:
                     "Waiting for player selection",
                 )
         update_job(db, job_id, lambda job: _update_failed(job))
+        return {
+            "framesProcessed": 0,
+            "totalTracks": 0,
+            "primaryCount": 0,
+        }
     finally:
         if base_dir is not None and base_dir.exists():
             try:
