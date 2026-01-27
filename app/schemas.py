@@ -150,4 +150,4 @@ class PlayerRefPayload(BaseModel):
 
 class TrackSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    track_id: int = Field(alias="trackId", ge=0)
+    track_id: int | str = Field(alias="trackId")
