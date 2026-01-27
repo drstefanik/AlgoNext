@@ -22,7 +22,7 @@ from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
 from app.schemas import JobCreate, PlayerRefPayload, SelectionPayload, TrackSelectionPayload
-from app.workers.pipeline import extract_candidates, extract_preview_frames, run_analysis
+from app.workers.pipeline import extract_preview_frames, run_analysis
 from app.workers.pipeline import (
     ensure_bucket_exists,
     get_s3_client,
@@ -580,7 +580,6 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
     db.refresh(job)
 
     extract_preview_frames.delay(job.id)
-    extract_candidates.delay(job.id)
 
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
@@ -770,6 +769,7 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
                     "thresholdPct": 0.05,
                 },
                 "autodetection_status": "PROCESSING",
+                "error_detail": None,
             },
             request,
         )
@@ -783,8 +783,12 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
         "thresholdPct": 0.05,
     }
     autodetection_status = candidates_payload.get("autodetection_status") or "PROCESSING"
+    error_detail_payload = candidates_payload.get("error_detail")
     candidates = _build_candidate_payload(candidates_payload, context)
-    if frames_processed < MIN_FRAMES_FOR_EVAL:
+    if autodetection_status == "FAILED":
+        status = "FAILED"
+        candidates = []
+    elif frames_processed < MIN_FRAMES_FOR_EVAL:
         status = "PROCESSING"
         candidates = []
         autodetection_status = "PROCESSING"
@@ -799,6 +803,7 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
             "candidates": candidates,
             "autodetection": autodetection,
             "autodetection_status": autodetection_status,
+            "error_detail": error_detail_payload,
         },
         request,
     )

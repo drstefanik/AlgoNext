@@ -1,4 +1,5 @@
 import os
+import traceback
 import time
 import json
 import shutil
@@ -812,6 +813,13 @@ def extract_preview_frames(self, job_id: str) -> None:
                 ),
             )
             logger.info("Preview frames generated for job %s", job_id)
+            try:
+                extract_candidates.delay(job_id)
+            except Exception:
+                logger.exception(
+                    "Failed to enqueue candidates extraction after previews job_id=%s",
+                    job_id,
+                )
     except Exception as exc:
         logger.exception("Failed to generate preview frames for job %s", job_id)
         if self.request.retries < max_retries:
@@ -841,6 +849,30 @@ def extract_preview_frames(self, job_id: str) -> None:
             except Exception:
                 pass
         db.close()
+
+
+def _truncate_stack(stack: str, limit: int = 2000) -> str:
+    if not stack:
+        return ""
+    if len(stack) <= limit:
+        return stack
+    return stack[: limit - 3] + "..."
+
+
+def _build_candidates_error_detail(exc: Exception) -> Dict[str, Any]:
+    message = str(exc) if str(exc) else exc.__class__.__name__
+    stack = _truncate_stack(traceback.format_exc())
+    code = "CANDIDATES_ERROR"
+    lower_message = message.lower()
+    if isinstance(exc, (ImportError, ModuleNotFoundError)):
+        code = "YOLO_IMPORT_ERROR"
+    elif "ultralytics" in lower_message or "yolo" in lower_message:
+        code = "YOLO_IMPORT_ERROR"
+    elif "model" in lower_message and "not found" in lower_message:
+        code = "MODEL_NOT_FOUND"
+    elif "cuda" in lower_message:
+        code = "CUDA"
+    return {"message": message, "stack": stack, "code": code}
 
 
 @celery.task(name="app.workers.pipeline.extract_candidates", bind=True)
@@ -885,8 +917,14 @@ def extract_candidates(self, job_id: str) -> None:
         ensure_bucket_exists(s3_internal, s3_bucket)
 
         preview_frames = list(job.preview_frames or [])
-        if not preview_frames and self.request.retries < max_retries:
-            raise self.retry(countdown=5)
+        if not preview_frames:
+            if self.request.retries < max_retries:
+                raise self.retry(countdown=5)
+            logger.warning(
+                "extract_candidates exiting: preview_frames_missing job_id=%s",
+                job_id,
+            )
+            return
 
         update_job(
             db,
@@ -942,14 +980,40 @@ def extract_candidates(self, job_id: str) -> None:
                 raise self.retry(exc=exc, countdown=15, max_retries=max_retries)
             except Exception:
                 pass
-        update_job(
-            db,
-            job_id,
-            lambda job: (
-                setattr(job, "warnings", list({*(job.warnings or []), "CANDIDATES_FAILED"})),
-                set_progress(job, "CANDIDATES_FAILED", 18, "Candidates extraction failed"),
-            ),
-        )
+        try:
+            job = reload_job(db, job_id)
+            preview_frames = list(job.preview_frames or []) if job else []
+        except Exception:
+            preview_frames = []
+        error_detail = _build_candidates_error_detail(exc)
+        def _update_failed(job: AnalysisJob) -> None:
+            warnings = list({*(job.warnings or []), "CANDIDATES_FAILED"})
+            setattr(job, "warnings", warnings)
+            candidates_payload = {
+                "candidates": [],
+                "frames_processed": 0,
+                "autodetection": {
+                    "totalTracks": 0,
+                    "primaryCount": 0,
+                    "secondaryCount": 0,
+                    "thresholdPct": 0.05,
+                },
+                "autodetection_status": "FAILED",
+                "error_detail": error_detail,
+            }
+            setattr(
+                job,
+                "result",
+                {**(job.result or {}), "candidates": candidates_payload},
+            )
+            if preview_frames:
+                set_progress(
+                    job,
+                    "WAITING_FOR_SELECTION",
+                    20,
+                    "Waiting for player selection",
+                )
+        update_job(db, job_id, lambda job: _update_failed(job))
     finally:
         if base_dir is not None and base_dir.exists():
             try:
@@ -1020,10 +1084,9 @@ def run_analysis(self, job_id: str):
             )
             try:
                 extract_preview_frames.delay(job_id)
-                extract_candidates.delay(job_id)
             except Exception:
                 logger.exception(
-                    "run_analysis failed to enqueue preview/candidates job_id=%s",
+                    "run_analysis failed to enqueue preview job_id=%s",
                     job_id,
                 )
             return
