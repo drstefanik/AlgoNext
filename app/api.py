@@ -2306,6 +2306,8 @@ def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db))
         )
 
     preview_frames = job.preview_frames or []
+    progress_step = (job.progress or {}).get("step")
+    overlay_ready = bool(preview_frames) and progress_step == "CANDIDATES_READY"
     context = None
     if preview_frames:
         context = load_s3_context()
@@ -2320,11 +2322,29 @@ def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db))
         ]
         preview_frames = _normalize_preview_frames(preview_frames)
 
+    items: List[Dict[str, Any]] = []
+    for frame in preview_frames:
+        if not isinstance(frame, dict):
+            continue
+        frame_key = frame.get("key") or frame.get("s3_key")
+        if not frame_key:
+            continue
+        tracks = frame.get("tracks") if overlay_ready else []
+        items.append(
+            {
+                "frame_key": frame_key,
+                "signed_url": frame.get("signed_url"),
+                "time_sec": frame.get("time_sec"),
+                "width": frame.get("width"),
+                "height": frame.get("height"),
+                "tracks": tracks if isinstance(tracks, list) else [],
+            }
+        )
+
     return ok_response(
         {
-            "job_id": job.id,
-            "id": job.id,
-            "preview_frames": preview_frames,
+            "items": items,
+            "overlay_ready": overlay_ready,
         },
         request,
     )
