@@ -691,6 +691,7 @@ def get_job(job_id: str, request: Request):
                 else frame
                 for frame in preview_frames
             ]
+            preview_frames = _normalize_preview_frames(preview_frames)
 
         return ok_response(
             {
@@ -1027,6 +1028,63 @@ def _find_preview_frame(preview_lookup: Dict[str, Dict[str, Any]], frame_key: st
     return preview_lookup.get(frame_key)
 
 
+def _normalize_bbox_xywh(bbox: Dict[str, Any]) -> Dict[str, float]:
+    if not isinstance(bbox, dict):
+        return {}
+    if {"x", "y", "w", "h"}.issubset(bbox):
+        try:
+            return {
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        except (TypeError, ValueError):
+            return {}
+    if {"x1", "y1", "x2", "y2"}.issubset(bbox):
+        try:
+            x1 = float(bbox["x1"])
+            y1 = float(bbox["y1"])
+            x2 = float(bbox["x2"])
+            y2 = float(bbox["y2"])
+        except (TypeError, ValueError):
+            return {}
+        return {
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1,
+        }
+    return {}
+
+
+def _normalize_preview_frames(preview_frames: list) -> list:
+    normalized_frames = []
+    for frame in preview_frames or []:
+        if not isinstance(frame, dict):
+            normalized_frames.append(frame)
+            continue
+        tracks = frame.get("tracks")
+        if not isinstance(tracks, list):
+            tracks = []
+        normalized_tracks = []
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            normalized_tracks.append(
+                {
+                    **track,
+                    "bbox": _normalize_bbox_xywh(track.get("bbox") or {}),
+                }
+            )
+        normalized_frames.append(
+            {
+                **frame,
+                "tracks": normalized_tracks,
+            }
+        )
+    return normalized_frames
+
 def _bbox_iou(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
     try:
         ax1 = float(box_a.get("x", 0.0))
@@ -1287,6 +1345,202 @@ def pick_player(
             "status": job.status,
             "player_ref": job.player_ref,
             "target": job.target,
+            "progress": normalize_payload(job.progress),
+        },
+        request,
+    )
+
+
+@router.post("/jobs/{job_id}/analyze-player")
+def analyze_player(
+    job_id: str,
+    request: Request,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    normalized_payload = _parse_pick_player_payload(payload)
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    preview_lookup = _build_preview_lookup(job.preview_frames or [])
+    selected_frame = _find_preview_frame(preview_lookup, normalized_payload.frame_key)
+    if not selected_frame:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_SELECTION",
+                "frame_key not present in preview frames",
+                {"frame_key": normalized_payload.frame_key},
+            ),
+        )
+
+    tracks = selected_frame.get("tracks") or []
+    selected_ids = _track_id_variants(normalized_payload.track_id)
+    selected_track = next(
+        (
+            track
+            for track in tracks
+            if isinstance(track, dict)
+            and _track_id_variants(track.get("track_id")) & selected_ids
+        ),
+        None,
+    )
+    if not selected_track:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_SELECTION",
+                "track_id not present in frame",
+                {
+                    "frame_key": normalized_payload.frame_key,
+                    "track_id": normalized_payload.track_id,
+                },
+            ),
+        )
+
+    track_id = selected_track.get("track_id", normalized_payload.track_id)
+    track_id_key = str(track_id)
+    existing_result = job.result or {}
+    player_runs = (
+        existing_result.get("player_runs")
+        if isinstance(existing_result, dict)
+        else None
+    )
+    if isinstance(player_runs, dict):
+        existing_run = player_runs.get(track_id_key)
+        if isinstance(existing_run, dict) and existing_run.get("status") in {
+            "COMPLETED",
+            "PARTIAL",
+        }:
+            return ok_response(
+                {
+                    "job_id": job.id,
+                    "id": job.id,
+                    "status": existing_run.get("status"),
+                    "progress": normalize_payload(job.progress),
+                    "result": existing_run.get("result"),
+                },
+                request,
+            )
+
+    current_track = (
+        (job.player_ref or {}).get("track_id") if isinstance(job.player_ref, dict) else None
+    )
+    if (
+        job.status in {"COMPLETED", "PARTIAL"}
+        and _track_id_variants(current_track) & _track_id_variants(track_id)
+    ):
+        return ok_response(
+            {
+                "job_id": job.id,
+                "id": job.id,
+                "status": job.status,
+                "progress": normalize_payload(job.progress),
+                "result": normalize_payload(job.result),
+            },
+            request,
+        )
+    if (
+        job.status in {"QUEUED", "RUNNING"}
+        and _track_id_variants(current_track) & _track_id_variants(track_id)
+    ):
+        return ok_response(
+            {
+                "job_id": job.id,
+                "id": job.id,
+                "status": job.status,
+                "progress": normalize_payload(job.progress),
+            },
+            request,
+        )
+
+    frame_key = selected_frame.get("key") or selected_frame.get("s3_key")
+    time_sec = selected_frame.get("time_sec")
+    bbox = _normalize_bbox_xywh(selected_track.get("bbox") or {})
+    player_ref_payload = {
+        "track_id": track_id,
+        "tier": selected_track.get("tier") or "UNKNOWN",
+        "best_preview_frame_key": frame_key,
+        "best_time_sec": float(time_sec) if time_sec is not None else None,
+        "bbox": bbox,
+        "selection_source": "preview_frame_click",
+    }
+    if time_sec is not None and {"x", "y", "w", "h"}.issubset(bbox):
+        player_ref_payload.update(
+            {
+                "t": float(time_sec),
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        )
+    job.player_ref = player_ref_payload
+
+    target_payload = {
+        "confirmed": True,
+        "selection": {
+            "frame_key": frame_key,
+            "time_sec": float(time_sec) if time_sec is not None else None,
+            "bbox": bbox,
+        },
+        "selections": [
+            {
+                "frame_key": frame_key,
+                "frame_time_sec": float(time_sec) if time_sec is not None else None,
+                "x": float(bbox.get("x", 0.0)),
+                "y": float(bbox.get("y", 0.0)),
+                "w": float(bbox.get("w", 0.0)),
+                "h": float(bbox.get("h", 0.0)),
+            }
+        ],
+        "tracking": {"status": "PENDING"},
+    }
+    job.target = target_payload
+
+    job.status = "QUEUED"
+    job.error = None
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    job.progress = {
+        **progress,
+        "step": "QUEUED",
+        "pct": max(current_pct, 20),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    player_runs = player_runs if isinstance(player_runs, dict) else {}
+    player_runs[track_id_key] = {
+        "track_id": track_id,
+        "status": "QUEUED",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    job.result = {
+        **existing_result,
+        "player_runs": player_runs,
+    }
+    job.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(job)
+
+    from app.workers.pipeline import run_analysis
+
+    run_analysis.delay(job.id)
+
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": job.status,
             "progress": normalize_payload(job.progress),
         },
         request,
@@ -2040,6 +2294,40 @@ def list_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
         [item["key"] for item in items[:3]],
     )
     return ok_response({"items": items}, request)
+
+
+@router.get("/jobs/{job_id}/frames/overlay")
+def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    preview_frames = job.preview_frames or []
+    context = None
+    if preview_frames:
+        context = load_s3_context()
+        preview_frames = attach_presigned_urls(
+            {"preview_frames": preview_frames}, context
+        ).get("preview_frames", preview_frames)
+        preview_frames = [
+            {**frame, "key": frame.get("key") or frame.get("s3_key")}
+            if isinstance(frame, dict)
+            else frame
+            for frame in preview_frames
+        ]
+        preview_frames = _normalize_preview_frames(preview_frames)
+
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "preview_frames": preview_frames,
+        },
+        request,
+    )
 
 
 @router.post("/jobs/{job_id}/enqueue")

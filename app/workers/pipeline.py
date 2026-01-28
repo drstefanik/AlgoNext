@@ -684,6 +684,7 @@ def extract_preview_frames(self, job_id: str) -> None:
                     "key": frame_key,
                     "width": width,
                     "height": height,
+                    "tracks": [],
                 }
             )
 
@@ -759,6 +760,36 @@ def _build_candidates_error_detail(exc: Exception) -> Dict[str, Any]:
     return {"message": message, "stack": stack, "code": code}
 
 
+def _normalize_bbox_xywh(bbox: Dict[str, Any]) -> Dict[str, float]:
+    if not isinstance(bbox, dict):
+        return {}
+    if {"x", "y", "w", "h"}.issubset(bbox):
+        try:
+            return {
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        except (TypeError, ValueError):
+            return {}
+    if {"x1", "y1", "x2", "y2"}.issubset(bbox):
+        try:
+            x1 = float(bbox["x1"])
+            y1 = float(bbox["y1"])
+            x2 = float(bbox["x2"])
+            y2 = float(bbox["y2"])
+        except (TypeError, ValueError):
+            return {}
+        return {
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1,
+        }
+    return {}
+
+
 @celery.task(name="app.workers.pipeline.extract_candidates", bind=True)
 def extract_candidates(self, job_id: str) -> Dict[str, Any]:
     db: Session = SessionLocal()
@@ -809,6 +840,9 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 job_id,
             )
             return {}
+        for frame in preview_frames:
+            if isinstance(frame, dict) and "tracks" not in frame:
+                frame["tracks"] = []
 
         update_job(
             db,
@@ -969,12 +1003,14 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     tracks_payload.append(
                         {
                             "track_id": track_id,
-                            "bbox": track.get("bbox") or {},
+                            "bbox": _normalize_bbox_xywh(track.get("bbox") or {}),
                             "tier": track_tiers.get(track_id),
                             "score_hint": track.get("score_hint"),
                         }
                     )
                 frame["tracks"] = tracks_payload
+                if "tracks" not in frame:
+                    frame["tracks"] = []
             update_job(
                 db,
                 job_id,
@@ -1595,6 +1631,31 @@ def run_analysis(self, job_id: str):
             if not input_key:
                 add_warning("MISSING_INPUT_VIDEO")
 
+            run_status = "COMPLETED" if not warnings else "PARTIAL"
+            player_runs = (
+                existing_result.get("player_runs")
+                if isinstance(existing_result, dict)
+                else None
+            )
+            if not isinstance(player_runs, dict):
+                player_runs = {}
+            player_track_id = None
+            if isinstance(job.player_ref, dict):
+                player_track_id = job.player_ref.get("track_id")
+            if player_track_id is not None:
+                player_runs[str(player_track_id)] = {
+                    "track_id": player_track_id,
+                    "status": run_status,
+                    "result": {
+                        "overallScore": overall,
+                        "overall_score": overall,
+                        "roleScore": role_score,
+                        "role_score": role_score,
+                        "radar": radar,
+                    },
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }
+
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
                 **existing_result,
@@ -1619,10 +1680,11 @@ def run_analysis(self, job_id: str):
                 },
                 "clips": clip_assets,
                 "clip_extraction_error": clip_extraction_error,
+                "player_runs": player_runs,
             }
 
             job.warnings = warnings
-            job.status = "COMPLETED" if not warnings else "PARTIAL"
+            job.status = run_status
             job.failure_reason = normalize_failure_reason(None)
             set_progress(job, "DONE", 100, "Completed")
 
