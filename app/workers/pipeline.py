@@ -736,6 +736,14 @@ def extract_preview_frames(self, job_id: str) -> None:
         db.close()
 
 
+@celery.task(name="app.workers.pipeline.kickoff_job", bind=True)
+def kickoff_job(self, job_id: str) -> None:
+    try:
+        extract_preview_frames.delay(job_id)
+    except Exception:
+        logger.exception("kickoff_job failed to enqueue tasks job_id=%s", job_id)
+
+
 def _truncate_stack(stack: str, limit: int = 2000) -> str:
     if not stack:
         return ""
@@ -1141,6 +1149,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             db,
             job_id,
             lambda job: (
+                setattr(job, "status", "WAITING_FOR_SELECTION"),
                 setattr(
                     job,
                     "result",

@@ -619,7 +619,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
 
     job = AnalysisJob(
         id=job_id,
-        status="WAITING_FOR_SELECTION",
+        status="CREATED",
         category=payload.category,
         role=payload.role,
         video_url=video_url,
@@ -640,9 +640,9 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
     db.commit()
     db.refresh(job)
 
-    from app.workers.pipeline import extract_preview_frames
+    from app.workers.pipeline import kickoff_job
 
-    extract_preview_frames.delay(job.id)
+    kickoff_job.delay(job.id)
 
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
