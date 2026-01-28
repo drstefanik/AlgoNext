@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import socket
 import subprocess
@@ -1551,7 +1552,7 @@ def analyze_player(
 def select_target(
     job_id: str,
     request: Request,
-    payload: TargetSelectionPayload,
+    payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
     return _confirm_target_selection(job_id, payload, request, db)
@@ -1591,150 +1592,413 @@ def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
     }
 
 
+class _InvalidTargetPayload(Exception):
+    def __init__(self, missing: List[str]) -> None:
+        super().__init__("Invalid target payload")
+        self.missing = missing
+
+
+def _preview_time_epsilon(frames: List[Dict[str, Any]]) -> float:
+    if len(frames) < 2:
+        return 0.5
+    times = sorted(
+        float(frame.get("time_sec") or 0.0)
+        for frame in frames
+        if isinstance(frame, dict)
+    )
+    diffs = [
+        next_time - prev_time
+        for prev_time, next_time in zip(times, times[1:])
+        if next_time > prev_time
+    ]
+    if not diffs:
+        return 0.5
+    return max(0.25, min(diffs) / 2.0)
+
+
+def _normalize_target_payload(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, TargetSelectionPayload):
+        return {
+            "frame_key": payload.frame_key,
+            "time_sec": payload.time_sec,
+            "bbox": payload.bbox,
+            "track_id": payload.track_id,
+            "force": payload.force,
+        }
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump()
+    if not isinstance(payload, dict):
+        raise _InvalidTargetPayload(["payload"])
+
+    frame_key = payload.get("frame_key") or payload.get("frameKey") or payload.get("key")
+    time_sec = (
+        payload.get("time_sec")
+        or payload.get("timeSec")
+        or payload.get("frame_time_sec")
+        or payload.get("frameTimeSec")
+    )
+    track_id = payload.get("track_id") or payload.get("trackId")
+    force = bool(payload.get("force")) if "force" in payload else False
+
+    bbox = payload.get("bbox")
+    if not isinstance(bbox, dict):
+        bbox = {
+            "x": payload.get("x"),
+            "y": payload.get("y"),
+            "w": payload.get("w"),
+            "h": payload.get("h"),
+        }
+
+    missing: List[str] = []
+    if frame_key is None and time_sec is None:
+        missing.extend(["frame_key", "time_sec"])
+    if track_id is None:
+        missing.append("track_id")
+    if not isinstance(bbox, dict):
+        missing.append("bbox")
+    else:
+        for key in ("x", "y", "w", "h"):
+            if bbox.get(key) is None:
+                missing.append(f"bbox.{key}")
+
+    if missing:
+        raise _InvalidTargetPayload(sorted(set(missing)))
+
+    try:
+        time_value = float(time_sec) if time_sec is not None else None
+    except (TypeError, ValueError):
+        raise _InvalidTargetPayload(["time_sec"])
+
+    bbox = PlayerRefPayload._validate_bbox_xywh(
+        {
+            "x": float(bbox["x"]),
+            "y": float(bbox["y"]),
+            "w": float(bbox["w"]),
+            "h": float(bbox["h"]),
+        }
+    )
+
+    return {
+        "frame_key": frame_key,
+        "time_sec": time_value,
+        "bbox": bbox,
+        "track_id": track_id,
+        "force": force,
+    }
+
+
+def _error_response(
+    code: str,
+    message: str,
+    request: Request,
+    status_code: int,
+    details: dict | None = None,
+) -> JSONResponse:
+    meta = build_meta(request)
+    error_payload: Dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error_payload["details"] = details
+    payload = {
+        "ok": False,
+        "error": error_payload,
+        "meta": meta,
+        "request_id": meta.get("request_id"),
+    }
+    return JSONResponse(status_code=status_code, content=payload)
+
+
 def _confirm_target_selection(
     job_id: str,
-    payload: TargetSelectionPayload,
+    payload: Any,
     request: Request,
     db: Session,
 ):
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
-        )
-
-    preview_lookup = _build_preview_lookup(job.preview_frames or [])
-
-    frame_key = payload.frame_key
-    time_sec = payload.time_sec
-    selected_frame = None
-    if frame_key:
-        selected_frame = preview_lookup.get(frame_key)
-        if selected_frame is None and preview_lookup:
-            raise HTTPException(
-                status_code=422,
-                detail=error_detail(
-                    "FRAME_NOT_FOUND", "Frame key not found", {"frame_key": frame_key}
-                ),
-            )
-        if selected_frame and selected_frame.get("key"):
-            frame_key = selected_frame.get("key")
-        if selected_frame and selected_frame.get("time_sec") is not None:
-            time_sec = float(selected_frame.get("time_sec"))
-    elif preview_lookup and time_sec is not None:
-        selected_frame = min(
-            preview_lookup.values(),
-            key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
-        )
-        frame_key = selected_frame.get("key") or frame_key
-        time_sec = float(selected_frame.get("time_sec") or time_sec)
-    elif time_sec is not None and not preview_lookup:
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail(
-                "FRAME_KEY_REQUIRED",
-                "frame_key is required when preview frames are unavailable",
-            ),
-        )
-
-    if time_sec is None:
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail("MISSING_TIME", "Missing time_sec for target selection"),
-        )
-
-    player_ref = job.player_ref or {}
-    expected_track_id = player_ref.get("track_id") if isinstance(player_ref, dict) else None
-    mismatch = False
-    if expected_track_id is not None and selected_frame and selected_frame.get("tracks"):
-        track = next(
-            (
-                track
-                for track in selected_frame.get("tracks") or []
-                if isinstance(track, dict)
-                and _track_id_variants(track.get("track_id"))
-                & _track_id_variants(expected_track_id)
-            ),
-            None,
-        )
-        if track is None:
-            mismatch = True
-        else:
-            iou = _bbox_iou(payload.bbox, track.get("bbox") or {})
-            if iou < 0.2:
-                mismatch = True
-    if mismatch and not payload.force:
-        raise HTTPException(
-            status_code=409,
-            detail=error_detail(
-                "TARGET_MISMATCH",
-                "target does not match selected player",
-                {
-                    "expected_track_id": expected_track_id,
-                    "frame_key": frame_key,
-                },
-            ),
-        )
-
-    selection_payload = {
-        "frame_key": frame_key,
-        "time_sec": float(time_sec),
-        "bbox": payload.bbox,
-    }
-    selections_payload = [
-        {
-            "frame_key": frame_key,
-            "frame_time_sec": float(time_sec),
-            "x": payload.bbox["x"],
-            "y": payload.bbox["y"],
-            "w": payload.bbox["w"],
-            "h": payload.bbox["h"],
-        }
-    ]
-    target_payload = {**(job.target or {})}
-    target_payload["confirmed"] = True
-    target_payload["selection"] = selection_payload
-    target_payload["selections"] = selections_payload
-    target_payload.setdefault("tracking", {"status": "PENDING"})
-    job.target = target_payload
-    job.status = "READY_TO_ENQUEUE"
-    job.updated_at = datetime.now(timezone.utc)
-
-    warnings: List[str] = list(job.warnings or [])
-    if mismatch:
-        if "TARGET_MISMATCH" not in warnings:
-            warnings.append("TARGET_MISMATCH")
-    job.warnings = warnings
-
-    progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
+    request_id = getattr(request.state, "request_id", None)
     try:
-        current_pct = int(current_pct)
-    except (TypeError, ValueError):
-        current_pct = 0
-    job.progress = {
-        **progress,
-        "step": "READY_TO_ENQUEUE",
-        "pct": max(current_pct, 16),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+        job = db.get(AnalysisJob, job_id)
+        if not job:
+            return _error_response(
+                "JOB_NOT_FOUND",
+                "Job not found",
+                request,
+                status_code=404,
+            )
 
-    db.commit()
-    db.refresh(job)
+        normalized_payload = _normalize_target_payload(payload)
+        logger.info(
+            "confirm-target payload job_id=%s request_id=%s payload=%s",
+            job_id,
+            request_id,
+            normalized_payload,
+        )
 
-    return ok_response(
-        {
-            "job_id": job.id,
-            "id": job.id,
-            "status": job.status,
-            "target": job.target,
-            "targetRef": job.target,
-            "warnings": list(job.warnings or []),
-            "progress": normalize_payload(job.progress),
-        },
-        request,
-    )
+        preview_frames = job.preview_frames or []
+        preview_lookup = _build_preview_lookup(preview_frames)
+
+        frame_key = normalized_payload["frame_key"]
+        time_sec = normalized_payload["time_sec"]
+        bbox = normalized_payload["bbox"]
+        track_id = normalized_payload["track_id"]
+        force = normalized_payload["force"]
+
+        logger.info(
+            "confirm-target frame_key_received job_id=%s frame_key=%s time_sec=%s",
+            job_id,
+            frame_key,
+            time_sec,
+        )
+
+        selected_frame = None
+        if frame_key:
+            selected_frame = preview_lookup.get(frame_key)
+            if selected_frame is None and preview_lookup:
+                logger.info(
+                    "confirm-target frame_not_found job_id=%s frame_key=%s",
+                    job_id,
+                    frame_key,
+                )
+                return _error_response(
+                    "INVALID_FRAME_KEY",
+                    "Frame key not found",
+                    request,
+                    status_code=400,
+                    details={"frame_key": frame_key},
+                )
+            if selected_frame:
+                logger.info(
+                    "confirm-target frame_found job_id=%s frame_key=%s",
+                    job_id,
+                    selected_frame.get("key"),
+                )
+                frame_key = selected_frame.get("key") or frame_key
+                if selected_frame.get("time_sec") is not None:
+                    time_sec = float(selected_frame.get("time_sec"))
+        elif preview_lookup and time_sec is not None:
+            selected_frame = min(
+                preview_lookup.values(),
+                key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
+            )
+            closest_time = float(selected_frame.get("time_sec") or 0.0)
+            if abs(closest_time - float(time_sec)) > _preview_time_epsilon(preview_frames):
+                logger.info(
+                    "confirm-target frame_time_mismatch job_id=%s time_sec=%s",
+                    job_id,
+                    time_sec,
+                )
+                return _error_response(
+                    "INVALID_FRAME_KEY",
+                    "Frame time does not match preview frames",
+                    request,
+                    status_code=400,
+                    details={"time_sec": time_sec},
+                )
+            frame_key = selected_frame.get("key") or frame_key
+            time_sec = float(selected_frame.get("time_sec") or time_sec)
+        elif time_sec is not None and not preview_lookup:
+            return _error_response(
+                "INVALID_PAYLOAD",
+                "frame_key is required when preview frames are unavailable",
+                request,
+                status_code=400,
+                details={"missing": ["frame_key"]},
+            )
+
+        if time_sec is None:
+            return _error_response(
+                "INVALID_PAYLOAD",
+                "Missing time_sec for target selection",
+                request,
+                status_code=400,
+                details={"missing": ["time_sec"]},
+            )
+
+        logger.info(
+            "confirm-target player_ref job_id=%s present=%s track_id=%s",
+            job_id,
+            bool(job.player_ref),
+            track_id,
+        )
+
+        if selected_frame:
+            tracks = selected_frame.get("tracks") or []
+            if not tracks:
+                logger.info(
+                    "confirm-target no_tracks_in_frame job_id=%s frame_key=%s",
+                    job_id,
+                    frame_key,
+                )
+                if not force:
+                    return _error_response(
+                        "NO_TRACKS_IN_FRAME",
+                        "Pick another frame.",
+                        request,
+                        status_code=409,
+                        details={"frame_key": frame_key},
+                    )
+
+            track = next(
+                (
+                    track
+                    for track in tracks
+                    if isinstance(track, dict)
+                    and _track_id_variants(track.get("track_id"))
+                    & _track_id_variants(track_id)
+                ),
+                None,
+            )
+            if track is None:
+                logger.info(
+                    "confirm-target track_not_in_frame job_id=%s frame_key=%s track_id=%s",
+                    job_id,
+                    frame_key,
+                    track_id,
+                )
+                if not force:
+                    return _error_response(
+                        "TRACK_NOT_IN_FRAME",
+                        "Selected track not present in frame",
+                        request,
+                        status_code=409,
+                        details={
+                            "track_id": track_id,
+                            "frame_key": frame_key,
+                        },
+                    )
+            else:
+                track_bbox = track.get("bbox") or {}
+                logger.info(
+                    "confirm-target track_bbox_found job_id=%s frame_key=%s",
+                    job_id,
+                    frame_key,
+                )
+                iou = _bbox_iou(bbox, track_bbox)
+                logger.info(
+                    "confirm-target iou_calculated job_id=%s iou=%s",
+                    job_id,
+                    iou,
+                )
+                if iou < 0.2 and not force:
+                    return _error_response(
+                        "TARGET_MISMATCH",
+                        "Target box does not match selected player in this frame.",
+                        request,
+                        status_code=409,
+                        details={
+                            "track_id": track_id,
+                            "iou": iou,
+                        },
+                    )
+
+        selection_payload = {
+            "frame_key": frame_key,
+            "time_sec": float(time_sec),
+            "bbox": bbox,
+        }
+
+        existing_selection = (job.target or {}).get("selection") or {}
+        if (job.target or {}).get("confirmed") and _selection_matches(
+            existing_selection, selection_payload
+        ):
+            logger.info(
+                "confirm-target idempotent job_id=%s frame_key=%s",
+                job_id,
+                frame_key,
+            )
+            return ok_response(
+                {
+                    "job_id": job.id,
+                    "id": job.id,
+                    "status": job.status,
+                    "target": job.target,
+                    "targetRef": job.target,
+                    "warnings": list(job.warnings or []),
+                    "progress": normalize_payload(job.progress),
+                },
+                request,
+            )
+
+        selections_payload = [
+            {
+                "frame_key": frame_key,
+                "frame_time_sec": float(time_sec),
+                "x": bbox["x"],
+                "y": bbox["y"],
+                "w": bbox["w"],
+                "h": bbox["h"],
+            }
+        ]
+        target_payload = {**(job.target or {})}
+        target_payload["confirmed"] = True
+        target_payload["selection"] = selection_payload
+        target_payload["selections"] = selections_payload
+        target_payload.setdefault("tracking", {"status": "PENDING"})
+        job.target = target_payload
+        job.status = "READY_TO_ENQUEUE"
+        job.updated_at = datetime.now(timezone.utc)
+
+        warnings: List[str] = list(job.warnings or [])
+        if "TARGET_MISMATCH" in warnings and force:
+            warnings = [warning for warning in warnings if warning != "TARGET_MISMATCH"]
+        job.warnings = warnings
+
+        progress = job.progress or {}
+        current_pct = progress.get("pct") or 0
+        try:
+            current_pct = int(current_pct)
+        except (TypeError, ValueError):
+            current_pct = 0
+        job.progress = {
+            **progress,
+            "step": "READY_TO_ENQUEUE",
+            "pct": max(current_pct, 16),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        db.commit()
+        db.refresh(job)
+
+        return ok_response(
+            {
+                "job_id": job.id,
+                "id": job.id,
+                "status": job.status,
+                "target": job.target,
+                "targetRef": job.target,
+                "warnings": list(job.warnings or []),
+                "progress": normalize_payload(job.progress),
+            },
+            request,
+        )
+    except _InvalidTargetPayload as exc:
+        logger.info(
+            "confirm-target invalid_payload job_id=%s payload=%s missing=%s",
+            job_id,
+            payload,
+            exc.missing,
+        )
+        return _error_response(
+            "INVALID_PAYLOAD",
+            "Missing required fields",
+            request,
+            status_code=400,
+            details={"missing": exc.missing},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "confirm-target failed job_id=%s request_id=%s payload=%s",
+            job_id,
+            request_id,
+            payload,
+        )
+        return _error_response(
+            "INTERNAL_ERROR",
+            str(exc),
+            request,
+            status_code=500,
+            details={"hint": "Unexpected error while confirming target."},
+        )
 
 
 def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
@@ -1764,6 +2028,28 @@ def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
     if selection.get("frame_key"):
         normalized["frame_key"] = selection.get("frame_key")
     return normalized
+
+
+def _selection_matches(existing: Dict[str, Any], incoming: Dict[str, Any]) -> bool:
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return False
+    if existing.get("frame_key") != incoming.get("frame_key"):
+        return False
+    existing_time = existing.get("time_sec")
+    incoming_time = incoming.get("time_sec")
+    if existing_time is not None and incoming_time is not None:
+        if not math.isclose(float(existing_time), float(incoming_time), rel_tol=1e-3):
+            return False
+    existing_bbox = existing.get("bbox") or {}
+    incoming_bbox = incoming.get("bbox") or {}
+    for key in ("x", "y", "w", "h"):
+        if key not in existing_bbox or key not in incoming_bbox:
+            return False
+        if not math.isclose(
+            float(existing_bbox[key]), float(incoming_bbox[key]), rel_tol=1e-3
+        ):
+            return False
+    return True
 
 
 def _normalize_player_ref(anchor: Dict[str, Any]) -> Dict[str, float] | None:
@@ -1904,7 +2190,7 @@ def save_selection(
 
 @router.post("/jobs/{job_id}/target")
 def save_target(
-    job_id: str, payload: TargetSelectionPayload, request: Request, db: Session = Depends(get_db)
+    job_id: str, payload: dict = Body(...), request: Request, db: Session = Depends(get_db)
 ):
     return _confirm_target_selection(job_id, payload, request, db)
 

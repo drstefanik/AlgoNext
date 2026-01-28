@@ -1,12 +1,11 @@
+import json
 import unittest
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from fastapi import HTTPException
 from starlette.requests import Request
 
 from app import api
-from app.schemas import TargetSelectionPayload
 
 
 @dataclass
@@ -94,13 +93,12 @@ class PickPlayerFlowTests(unittest.TestCase):
 
     def test_confirm_target_valid(self):
         self.job.player_ref = {"track_id": 9}
-        payload = TargetSelectionPayload.model_validate(
-            {
-                "frame_key": "jobs/job-789/frames/frame_0001.jpg",
-                "time_sec": 15.0,
-                "bbox": {"x": 0.12, "y": 0.22, "w": 0.2, "h": 0.3},
-            }
-        )
+        payload = {
+            "frame_key": "jobs/job-789/frames/frame_0001.jpg",
+            "time_sec": 15.0,
+            "bbox": {"x": 0.12, "y": 0.22, "w": 0.2, "h": 0.3},
+            "track_id": 9,
+        }
 
         response = api.save_target(self.job.id, payload, self.request, self.session)
 
@@ -110,18 +108,82 @@ class PickPlayerFlowTests(unittest.TestCase):
 
     def test_confirm_target_mismatch_raises(self):
         self.job.player_ref = {"track_id": 9}
-        payload = TargetSelectionPayload.model_validate(
+        payload = {
+            "frame_key": "jobs/job-789/frames/frame_0001.jpg",
+            "time_sec": 15.0,
+            "bbox": {"x": 0.7, "y": 0.7, "w": 0.2, "h": 0.2},
+            "track_id": 9,
+        }
+
+        response = api.save_target(self.job.id, payload, self.request, self.session)
+
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "TARGET_MISMATCH")
+
+    def test_confirm_target_invalid_frame_key(self):
+        self.job.player_ref = {"track_id": 9}
+        payload = {
+            "frame_key": "jobs/job-789/frames/missing.jpg",
+            "time_sec": 15.0,
+            "bbox": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+            "track_id": 9,
+        }
+
+        response = api.save_target(self.job.id, payload, self.request, self.session)
+
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "INVALID_FRAME_KEY")
+
+    def test_confirm_target_no_tracks_in_frame(self):
+        self.job.player_ref = {"track_id": 9}
+        self.job.preview_frames[0]["tracks"] = []
+        payload = {
+            "frame_key": "jobs/job-789/frames/frame_0001.jpg",
+            "time_sec": 15.0,
+            "bbox": {"x": 0.12, "y": 0.22, "w": 0.2, "h": 0.3},
+            "track_id": 9,
+        }
+
+        response = api.save_target(self.job.id, payload, self.request, self.session)
+
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "NO_TRACKS_IN_FRAME")
+
+    def test_confirm_target_track_not_in_frame(self):
+        self.job.player_ref = {"track_id": 9}
+        self.job.preview_frames[0]["tracks"] = [
             {
-                "frame_key": "jobs/job-789/frames/frame_0001.jpg",
-                "time_sec": 15.0,
-                "bbox": {"x": 0.7, "y": 0.7, "w": 0.2, "h": 0.2},
+                "track_id": 12,
+                "bbox": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.3},
             }
-        )
+        ]
+        payload = {
+            "frame_key": "jobs/job-789/frames/frame_0001.jpg",
+            "time_sec": 15.0,
+            "bbox": {"x": 0.12, "y": 0.22, "w": 0.2, "h": 0.3},
+            "track_id": 9,
+        }
 
-        with self.assertRaises(HTTPException) as ctx:
-            api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, payload, self.request, self.session)
 
-        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "TRACK_NOT_IN_FRAME")
+
+    def test_confirm_target_invalid_payload(self):
+        payload = {"frame_key": "jobs/job-789/frames/frame_0001.jpg"}
+
+        response = api.save_target(self.job.id, payload, self.request, self.session)
+
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "INVALID_PAYLOAD")
+        missing_fields = " ".join(payload["error"]["details"]["missing"])
+        self.assertIn("bbox", missing_fields)
+        self.assertIn("track_id", missing_fields)
 
 
 if __name__ == "__main__":
