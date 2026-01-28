@@ -305,12 +305,34 @@ def load_s3_context() -> Dict[str, Any]:
     }
 
 
+def _get_public_s3_client():
+    from app.workers.pipeline import get_s3_client
+
+    if not S3_PUBLIC_ENDPOINT_URL:
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail(
+                "S3_CONFIG_MISSING",
+                "Missing S3 env vars: S3_PUBLIC_ENDPOINT_URL",
+            ),
+        )
+    return get_s3_client(S3_PUBLIC_ENDPOINT_URL)
+
+
+def _ensure_public_s3_client(s3_client):
+    endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
+    if endpoint_url.rstrip("/") != S3_PUBLIC_ENDPOINT_URL.rstrip("/"):
+        return _get_public_s3_client()
+    return s3_client
+
+
 def presign_get_url(
     s3_public,
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
+    s3_public = _ensure_public_s3_client(s3_public)
     return s3_public.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
@@ -560,11 +582,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                 ),
             )
         expires_seconds = context["expires_seconds"]
-        video_url = s3_public.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": payload.video_key},
-            ExpiresIn=expires_seconds,
-        )
+        video_url = presign_get_url(s3_public, bucket, payload.video_key, expires_seconds)
         video_bucket = bucket
         video_key = payload.video_key
     elif video_url:
@@ -599,11 +617,7 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                     ),
                 )
             expires_seconds = context["expires_seconds"]
-            video_url = s3_public.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket, "Key": video_url},
-                ExpiresIn=expires_seconds,
-            )
+            video_url = presign_get_url(s3_public, bucket, video_url, expires_seconds)
             video_bucket = bucket
             video_key = payload.video_url
 
