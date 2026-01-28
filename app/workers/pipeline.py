@@ -840,9 +840,21 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 job_id,
             )
             return {}
+        preview_time_index: List[Tuple[float, Dict[str, Any]]] = []
         for frame in preview_frames:
-            if isinstance(frame, dict) and "tracks" not in frame:
+            if not isinstance(frame, dict):
+                continue
+            frame_key = frame.get("key") or frame.get("s3_key")
+            if isinstance(frame_key, str) and frame_key:
+                frame["key"] = frame_key
+            if "tracks" not in frame or not isinstance(frame.get("tracks"), list):
                 frame["tracks"] = []
+            time_sec = frame.get("time_sec")
+            if time_sec is not None:
+                try:
+                    preview_time_index.append((float(time_sec), frame))
+                except (TypeError, ValueError):
+                    continue
 
         update_job(
             db,
@@ -952,6 +964,33 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             )
             return closest.get("key") or closest.get("s3_key")
 
+        def _preview_time_epsilon() -> float:
+            if len(preview_time_index) < 2:
+                return 0.5
+            sorted_times = sorted(time for time, _ in preview_time_index)
+            diffs = [
+                next_time - prev_time
+                for prev_time, next_time in zip(sorted_times, sorted_times[1:])
+                if next_time > prev_time
+            ]
+            if not diffs:
+                return 0.5
+            return max(0.25, min(diffs) / 2.0)
+
+        def _preview_frame_for_time(time_sec: Optional[float]) -> Optional[Dict[str, Any]]:
+            if time_sec is None or not preview_time_index:
+                return None
+            try:
+                target = float(time_sec)
+            except (TypeError, ValueError):
+                return None
+            closest_time, closest_frame = min(
+                preview_time_index, key=lambda item: abs(item[0] - target)
+            )
+            if abs(closest_time - target) <= _preview_time_epsilon():
+                return closest_frame
+            return None
+
         if preview_frames and candidates_list:
             track_tiers = {
                 candidate.get("track_id"): candidate.get("tier")
@@ -1008,9 +1047,67 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                             "score_hint": track.get("score_hint"),
                         }
                     )
-                frame["tracks"] = tracks_payload
-                if "tracks" not in frame:
-                    frame["tracks"] = []
+                frame_tracks_list = frame.get("tracks")
+                if not isinstance(frame_tracks_list, list):
+                    frame_tracks_list = []
+                    frame["tracks"] = frame_tracks_list
+                if tracks_payload:
+                    frame_tracks_list.extend(tracks_payload)
+
+            def _track_id_variants(value: Any) -> set[Any]:
+                if value is None or isinstance(value, bool):
+                    return set()
+                if isinstance(value, int):
+                    return {value, str(value)}
+                if isinstance(value, str):
+                    trimmed = value.strip()
+                    variants = {trimmed}
+                    if trimmed.isdigit():
+                        variants.add(int(trimmed))
+                    return variants
+                try:
+                    return {str(value)}
+                except Exception:
+                    return set()
+
+            def _frame_has_track(tracks: list, track_id: Any) -> bool:
+                if not tracks:
+                    return False
+                track_variants = _track_id_variants(track_id)
+                for item in tracks:
+                    if not isinstance(item, dict):
+                        continue
+                    if _track_id_variants(item.get("track_id")) & track_variants:
+                        return True
+                return False
+
+            for candidate in candidates_list:
+                if not isinstance(candidate, dict):
+                    continue
+                track_id = candidate.get("track_id")
+                tier = candidate.get("tier")
+                score_hint = candidate.get("score_hint")
+                for sample in candidate.get("sample_frames") or []:
+                    if not isinstance(sample, dict):
+                        continue
+                    frame = _preview_frame_for_time(sample.get("time_sec"))
+                    if frame is None:
+                        continue
+                    frame_tracks_list = frame.get("tracks")
+                    if not isinstance(frame_tracks_list, list):
+                        frame_tracks_list = []
+                        frame["tracks"] = frame_tracks_list
+                    if _frame_has_track(frame_tracks_list, track_id):
+                        continue
+                    frame_tracks_list.append(
+                        {
+                            "track_id": track_id,
+                            "tier": tier,
+                            "score_hint": score_hint or sample.get("score_hint"),
+                            "bbox": _normalize_bbox_xywh(sample.get("bbox") or {}),
+                        }
+                    )
+        if preview_frames:
             update_job(
                 db,
                 job_id,
