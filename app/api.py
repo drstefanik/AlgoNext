@@ -1829,11 +1829,14 @@ def _confirm_target_selection(
                 )
                 if not force:
                     return _error_response(
-                        "NO_TRACKS_IN_FRAME",
-                        "Pick another frame.",
+                        "TRACK_NOT_IN_FRAME",
+                        "Selected track not present in frame",
                         request,
                         status_code=409,
-                        details={"frame_key": frame_key},
+                        details={
+                            "track_id": track_id,
+                            "frame_key": frame_key,
+                        },
                     )
 
             track = next(
