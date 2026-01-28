@@ -197,11 +197,31 @@ class TrackSelectionPayload(BaseModel):
     selection: TrackSelectionBox | None = None
 
 
+class PickPlayerPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    frame_key: str = Field(alias="frameKey")
+    track_id: int | str = Field(alias="trackId")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Missing pick-player payload")
+        frame_key = data.get("frame_key") or data.get("frameKey")
+        track_id = data.get("track_id") or data.get("trackId")
+        if not frame_key:
+            raise ValueError("Missing frame_key")
+        if track_id is None:
+            raise ValueError("Missing track_id")
+        return {"frame_key": frame_key, "track_id": track_id}
+
+
 class TargetSelectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     frame_key: Optional[str] = Field(default=None, alias="frameKey")
     time_sec: Optional[float] = Field(default=None, alias="timeSec")
     bbox: Dict[str, float]
+    force: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -210,6 +230,7 @@ class TargetSelectionPayload(BaseModel):
             raise ValueError("Missing target selection payload")
         frame_key = data.get("frame_key") or data.get("frameKey") or data.get("key")
         time_sec = data.get("time_sec") or data.get("timeSec")
+        force = bool(data.get("force")) if "force" in data else False
         bbox = data.get("bbox")
         if not isinstance(bbox, dict):
             bbox = {
@@ -234,4 +255,5 @@ class TargetSelectionPayload(BaseModel):
             "frame_key": frame_key,
             "time_sec": float(time_sec) if time_sec is not None else None,
             "bbox": bbox,
+            "force": force,
         }
