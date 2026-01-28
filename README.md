@@ -24,7 +24,7 @@ cp .env.example .env
 
 ```bash
 S3_ENDPOINT_URL=http://minio:9000
-S3_PUBLIC_ENDPOINT_URL=http://46.224.249.136:9000
+S3_PUBLIC_ENDPOINT_URL=https://s3.nextgroupintl.com
 S3_ACCESS_KEY=minioadmin
 S3_SECRET_KEY=minioadmin
 S3_BUCKET=fnh
