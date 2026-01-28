@@ -340,6 +340,25 @@ def presign_get_url(
     )
 
 
+def build_public_video_url(
+    job: AnalysisJob,
+    context: Dict[str, Any] | None,
+) -> str | None:
+    if not job.video_url and not job.video_key:
+        return None
+    if context is None:
+        return job.video_url
+    bucket = job.video_bucket or context["bucket"]
+    s3_public = context["s3_public"]
+    expires_seconds = context["expires_seconds"]
+    if job.video_key and bucket:
+        return presign_get_url(s3_public, bucket, job.video_key, expires_seconds)
+    if job.video_url and not job.video_url.lower().startswith(("http://", "https://")):
+        if bucket:
+            return presign_get_url(s3_public, bucket, job.video_url, expires_seconds)
+    return job.video_url
+
+
 def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     s3_public = context["s3_public"]
     bucket_default = context["bucket"]
@@ -439,23 +458,20 @@ def _hydrate_player_ref_sample_frames(
         if not isinstance(frame, dict):
             hydrated_frames.append(frame)
             continue
-        if frame.get("signed_url") or frame.get("image_url"):
-            hydrated_frames.append(frame)
-            continue
         key = frame.get("key") or frame.get("s3_key")
         bucket = frame.get("bucket") or bucket_default
-        if not key or not bucket:
+        if key and bucket:
+            signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
+            hydrated_frame = {
+                **frame,
+                "bucket": bucket,
+                "key": key,
+                "signed_url": signed_url,
+            }
+            hydrated_frame.setdefault("image_url", signed_url)
+            hydrated_frames.append(hydrated_frame)
+        else:
             hydrated_frames.append(frame)
-            continue
-        signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
-        hydrated_frame = {
-            **frame,
-            "bucket": bucket,
-            "key": key,
-            "signed_url": signed_url,
-        }
-        hydrated_frame.setdefault("image_url", signed_url)
-        hydrated_frames.append(hydrated_frame)
 
     return {**player_ref, "sample_frames": hydrated_frames}
 
@@ -696,9 +712,20 @@ def get_job(job_id: str, request: Request):
         player_saved = _has_player_ref(job.player_ref)
         target_confirmed = bool((job.target or {}).get("confirmed"))
 
+        needs_video_presign = bool(
+            job.video_key
+            or (
+                job.video_url
+                and not job.video_url.startswith(("http://", "https://"))
+            )
+        )
+        if needs_video_presign and context is None:
+            context = load_s3_context()
+        public_video_url = build_public_video_url(job, context)
+
         result, assets = _build_result_assets(result_payload or {})
-        if not assets.get("inputVideoUrl") and job.video_url:
-            assets = {**assets, "inputVideoUrl": job.video_url}
+        if not assets.get("inputVideoUrl") and public_video_url:
+            assets = {**assets, "inputVideoUrl": public_video_url}
         if preview_frames:
             preview_frames = [
                 {**frame, "key": frame.get("key") or frame.get("s3_key")}
@@ -715,7 +742,7 @@ def get_job(job_id: str, request: Request):
                 "status": normalize_status(job.status),
                 "category": job.category,
                 "role": job.role,
-                "video_url": job.video_url,
+                "video_url": public_video_url or job.video_url,
                 "preview_frames": preview_frames,
                 "progress": normalize_payload(job.progress),
                 "warnings": list(job.warnings or []),
