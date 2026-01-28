@@ -1534,6 +1534,12 @@ def run_analysis(self, job_id: str):
         overall = evaluation.get("overall_score")
         role_score = evaluation.get("role_score")
         radar = evaluation.get("radar") or {}
+        if overall is None:
+            overall = 0.0
+        if role_score is None:
+            role_score = float(overall)
+        if not radar:
+            radar = {"tracking_quality": 0.0, "activity_proxy": 0.0, "visibility": 0.0, "consistency": 0.0}
 
         # Final result
         update_job(
@@ -1599,7 +1605,9 @@ def run_analysis(self, job_id: str):
                     "role_score": role_score,
                 },
                 "overall_score": overall,
+                "overallScore": overall,
                 "role_score": role_score,
+                "roleScore": role_score,
                 "radar": radar,
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,

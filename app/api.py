@@ -25,6 +25,7 @@ from app.core.normalizers import normalize_failure_reason
 from app.schemas import (
     JobCreate,
     PlayerRefPayload,
+    PickPlayerPayload,
     SelectionPayload,
     TargetSelectionPayload,
     TrackSelectionPayload,
@@ -963,6 +964,98 @@ def _parse_track_selection_payload(payload: Any) -> TrackSelectionPayload:
         ) from exc
 
 
+def _parse_pick_player_payload(payload: Any) -> PickPlayerPayload:
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_PAYLOAD",
+                "Invalid pick-player payload",
+                {"errors": [{"field": "payload", "message": "Payload must be an object"}]},
+            ),
+        )
+    try:
+        return PickPlayerPayload.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_PAYLOAD",
+                "Invalid pick-player payload",
+                {"errors": exc.errors()},
+            ),
+        ) from exc
+
+
+def _track_id_variants(value: Any) -> set[Any]:
+    if value is None or isinstance(value, bool):
+        return set()
+    variants: set[Any] = set()
+    if isinstance(value, int):
+        variants.add(value)
+        variants.add(str(value))
+        return variants
+    if isinstance(value, str):
+        trimmed = value.strip()
+        variants.add(trimmed)
+        if trimmed.isdigit():
+            variants.add(int(trimmed))
+        return variants
+    try:
+        variants.add(str(value))
+    except Exception:
+        pass
+    return variants
+
+
+def _build_preview_lookup(preview_frames: list) -> Dict[str, Dict[str, Any]]:
+    preview_lookup: Dict[str, Dict[str, Any]] = {}
+    if isinstance(preview_frames, list):
+        for frame in preview_frames:
+            if not isinstance(frame, dict):
+                continue
+            key = frame.get("key") or frame.get("s3_key")
+            if isinstance(key, str) and key:
+                preview_lookup[key] = frame
+                preview_lookup.setdefault(key.split("/")[-1], frame)
+    return preview_lookup
+
+
+def _find_preview_frame(preview_lookup: Dict[str, Dict[str, Any]], frame_key: str) -> Dict[str, Any] | None:
+    if not frame_key:
+        return None
+    return preview_lookup.get(frame_key)
+
+
+def _bbox_iou(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
+    try:
+        ax1 = float(box_a.get("x", 0.0))
+        ay1 = float(box_a.get("y", 0.0))
+        ax2 = ax1 + float(box_a.get("w", 0.0))
+        ay2 = ay1 + float(box_a.get("h", 0.0))
+        bx1 = float(box_b.get("x", 0.0))
+        by1 = float(box_b.get("y", 0.0))
+        bx2 = bx1 + float(box_b.get("w", 0.0))
+        by2 = by1 + float(box_b.get("h", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter_area
+    if denom <= 0:
+        return 0.0
+    return inter_area / denom
+
 @router.post("/jobs/{job_id}/select-track")
 def select_track(
     job_id: str,
@@ -986,26 +1079,6 @@ def select_track(
         candidates = candidates_payload_raw.get("candidates") or []
     else:
         candidates = []
-
-    def _track_id_variants(value: Any) -> set[Any]:
-        if value is None or isinstance(value, bool):
-            return set()
-        variants: set[Any] = set()
-        if isinstance(value, int):
-            variants.add(value)
-            variants.add(str(value))
-            return variants
-        if isinstance(value, str):
-            trimmed = value.strip()
-            variants.add(trimmed)
-            if trimmed.isdigit():
-                variants.add(int(trimmed))
-            return variants
-        try:
-            variants.add(str(value))
-        except Exception:
-            pass
-        return variants
 
     selected_ids = _track_id_variants(normalized_payload.track_id)
     candidate = next(
@@ -1106,12 +1179,169 @@ def select_track(
     )
 
 
+@router.post("/jobs/{job_id}/pick-player")
+def pick_player(
+    job_id: str,
+    request: Request,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    normalized_payload = _parse_pick_player_payload(payload)
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    preview_lookup = _build_preview_lookup(job.preview_frames or [])
+    selected_frame = _find_preview_frame(preview_lookup, normalized_payload.frame_key)
+    if not selected_frame:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_SELECTION",
+                "frame_key not present in preview frames",
+                {"frame_key": normalized_payload.frame_key},
+            ),
+        )
+
+    tracks = selected_frame.get("tracks") or []
+    selected_ids = _track_id_variants(normalized_payload.track_id)
+    selected_track = next(
+        (
+            track
+            for track in tracks
+            if isinstance(track, dict)
+            and _track_id_variants(track.get("track_id")) & selected_ids
+        ),
+        None,
+    )
+    if not selected_track:
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail(
+                "INVALID_SELECTION",
+                "track_id not present in frame",
+                {
+                    "frame_key": normalized_payload.frame_key,
+                    "track_id": normalized_payload.track_id,
+                },
+            ),
+        )
+
+    frame_key = selected_frame.get("key") or selected_frame.get("s3_key")
+    time_sec = selected_frame.get("time_sec")
+    bbox = selected_track.get("bbox") or {}
+    player_ref_payload = {
+        "track_id": selected_track.get("track_id", normalized_payload.track_id),
+        "tier": selected_track.get("tier") or "UNKNOWN",
+        "best_preview_frame_key": frame_key,
+        "best_time_sec": float(time_sec) if time_sec is not None else None,
+        "bbox": bbox,
+        "selection_source": "preview_frame_pick",
+    }
+    if time_sec is not None and {"x", "y", "w", "h"}.issubset(bbox):
+        player_ref_payload.update(
+            {
+                "t": float(time_sec),
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        )
+    job.player_ref = player_ref_payload
+
+    target_payload = {**(job.target or {})}
+    target_payload["confirmed"] = False
+    target_payload["selection"] = {
+        "frame_key": frame_key,
+        "time_sec": float(time_sec) if time_sec is not None else None,
+        "bbox": bbox,
+    }
+    job.target = target_payload
+    job.status = "WAITING_FOR_TARGET"
+    job.updated_at = datetime.now(timezone.utc)
+
+    progress = job.progress or {}
+    current_pct = progress.get("pct") or 0
+    try:
+        current_pct = int(current_pct)
+    except (TypeError, ValueError):
+        current_pct = 0
+    job.progress = {
+        **progress,
+        "step": "WAITING_FOR_TARGET_CONFIRMATION",
+        "pct": max(current_pct, 14),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    db.commit()
+    db.refresh(job)
+
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": job.status,
+            "player_ref": job.player_ref,
+            "target": job.target,
+            "progress": normalize_payload(job.progress),
+        },
+        request,
+    )
+
+
 @router.post("/jobs/{job_id}/select-target")
 def select_target(
     job_id: str,
     request: Request,
     payload: TargetSelectionPayload,
     db: Session = Depends(get_db),
+):
+    return _confirm_target_selection(job_id, payload, request, db)
+
+
+def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
+    selections = []
+    selection_payload = None
+    for selection in payload.selections:
+        selection_data = selection.dict()
+        selection_entry = {
+            "frame_time_sec": selection_data["frame_time_sec"],
+            "x": selection_data["x"],
+            "y": selection_data["y"],
+            "w": selection_data["w"],
+            "h": selection_data["h"],
+        }
+        if selection_data.get("frame_key"):
+            selection_entry["frame_key"] = selection_data["frame_key"]
+        selections.append(selection_entry)
+        if selection_payload is None:
+            selection_payload = {
+                "frame_key": selection_data.get("frame_key"),
+                "time_sec": selection_data["frame_time_sec"],
+                "bbox": {
+                    "x": selection_data["x"],
+                    "y": selection_data["y"],
+                    "w": selection_data["w"],
+                    "h": selection_data["h"],
+                },
+            }
+    return {
+        "confirmed": True,
+        "selection": selection_payload,
+        "selections": selections,
+        "tracking": {"status": "PENDING"},
+    }
+
+
+def _confirm_target_selection(
+    job_id: str,
+    payload: TargetSelectionPayload,
+    request: Request,
+    db: Session,
 ):
     job = db.get(AnalysisJob, job_id)
     if not job:
@@ -1120,16 +1350,7 @@ def select_target(
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    preview_frames = job.preview_frames or []
-    preview_lookup: Dict[str, Dict[str, Any]] = {}
-    if isinstance(preview_frames, list):
-        for frame in preview_frames:
-            if not isinstance(frame, dict):
-                continue
-            key = frame.get("key") or frame.get("s3_key")
-            if isinstance(key, str) and key:
-                preview_lookup[key] = frame
-                preview_lookup.setdefault(key.split("/")[-1], frame)
+    preview_lookup = _build_preview_lookup(job.preview_frames or [])
 
     frame_key = payload.frame_key
     time_sec = payload.time_sec
@@ -1169,6 +1390,39 @@ def select_target(
             detail=error_detail("MISSING_TIME", "Missing time_sec for target selection"),
         )
 
+    player_ref = job.player_ref or {}
+    expected_track_id = player_ref.get("track_id") if isinstance(player_ref, dict) else None
+    mismatch = False
+    if expected_track_id is not None and selected_frame and selected_frame.get("tracks"):
+        track = next(
+            (
+                track
+                for track in selected_frame.get("tracks") or []
+                if isinstance(track, dict)
+                and _track_id_variants(track.get("track_id"))
+                & _track_id_variants(expected_track_id)
+            ),
+            None,
+        )
+        if track is None:
+            mismatch = True
+        else:
+            iou = _bbox_iou(payload.bbox, track.get("bbox") or {})
+            if iou < 0.2:
+                mismatch = True
+    if mismatch and not payload.force:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail(
+                "TARGET_MISMATCH",
+                "target does not match selected player",
+                {
+                    "expected_track_id": expected_track_id,
+                    "frame_key": frame_key,
+                },
+            ),
+        )
+
     selection_payload = {
         "frame_key": frame_key,
         "time_sec": float(time_sec),
@@ -1193,6 +1447,12 @@ def select_target(
     job.status = "READY_TO_ENQUEUE"
     job.updated_at = datetime.now(timezone.utc)
 
+    warnings: List[str] = list(job.warnings or [])
+    if mismatch:
+        if "TARGET_MISMATCH" not in warnings:
+            warnings.append("TARGET_MISMATCH")
+    job.warnings = warnings
+
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
     try:
@@ -1216,44 +1476,11 @@ def select_target(
             "status": job.status,
             "target": job.target,
             "targetRef": job.target,
+            "warnings": list(job.warnings or []),
             "progress": normalize_payload(job.progress),
         },
         request,
     )
-
-
-def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
-    selections = []
-    selection_payload = None
-    for selection in payload.selections:
-        selection_data = selection.dict()
-        selection_entry = {
-            "frame_time_sec": selection_data["frame_time_sec"],
-            "x": selection_data["x"],
-            "y": selection_data["y"],
-            "w": selection_data["w"],
-            "h": selection_data["h"],
-        }
-        if selection_data.get("frame_key"):
-            selection_entry["frame_key"] = selection_data["frame_key"]
-        selections.append(selection_entry)
-        if selection_payload is None:
-            selection_payload = {
-                "frame_key": selection_data.get("frame_key"),
-                "time_sec": selection_data["frame_time_sec"],
-                "bbox": {
-                    "x": selection_data["x"],
-                    "y": selection_data["y"],
-                    "w": selection_data["w"],
-                    "h": selection_data["h"],
-                },
-            }
-    return {
-        "confirmed": True,
-        "selection": selection_payload,
-        "selections": selections,
-        "tracking": {"status": "PENDING"},
-    }
 
 
 def _normalize_selection(selection: Dict[str, Any]) -> Dict[str, float]:
@@ -1423,9 +1650,9 @@ def save_selection(
 
 @router.post("/jobs/{job_id}/target")
 def save_target(
-    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
+    job_id: str, payload: TargetSelectionPayload, request: Request, db: Session = Depends(get_db)
 ):
-    return _save_target_selection(job_id, payload, request, db)
+    return _confirm_target_selection(job_id, payload, request, db)
 
 
 @router.post("/jobs/{job_id}/player-ref")

@@ -117,15 +117,67 @@ def compute_scores(role: str, radar: Dict[str, Any]) -> Dict[str, Optional[float
 
 
 def _fallback_radar_from_tracking(tracking: Dict[str, Any] | None) -> Dict[str, float]:
+    def clamp(value: float) -> float:
+        return max(0.0, min(100.0, value))
+
     if not isinstance(tracking, dict):
-        return {}
+        return {
+            "tracking_quality": 0.0,
+            "activity_proxy": 0.0,
+            "visibility": 0.0,
+            "consistency": 0.0,
+            "stability": 0.0,
+        }
+
     coverage_pct = float(tracking.get("coverage_pct") or 0.0)
     lost_segments = tracking.get("lost_segments") or []
     stability_penalty = min(100.0, float(len(lost_segments)) * 10.0)
     stability_score = max(0.0, 100.0 - stability_penalty)
+
+    bboxes = tracking.get("bboxes") or []
+    centers = []
+    for bbox in bboxes:
+        try:
+            cx = float(bbox.get("x", 0.0)) + float(bbox.get("w", 0.0)) / 2.0
+            cy = float(bbox.get("y", 0.0)) + float(bbox.get("h", 0.0)) / 2.0
+            t = float(bbox.get("t", 0.0))
+        except (TypeError, ValueError):
+            continue
+        centers.append((t, cx, cy))
+
+    centers.sort(key=lambda item: item[0])
+    distances = []
+    speeds = []
+    for idx in range(1, len(centers)):
+        t0, x0, y0 = centers[idx - 1]
+        t1, x1, y1 = centers[idx]
+        dt = max(0.0, t1 - t0)
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = (dx * dx + dy * dy) ** 0.5
+        distances.append(dist)
+        if dt > 0:
+            speeds.append(dist / dt)
+
+    avg_speed = sum(speeds) / float(len(speeds)) if speeds else 0.0
+    speed_score = clamp((avg_speed / 0.05) * 100.0)  # normalized motion proxy
+
+    if distances:
+        median_distance = sorted(distances)[len(distances) // 2]
+        outliers = sum(1 for d in distances if d > max(0.01, median_distance * 3))
+        consistency_score = clamp(100.0 - (outliers / float(len(distances))) * 100.0)
+    else:
+        consistency_score = 0.0
+
+    visibility_score = clamp(coverage_pct)
+    tracking_quality = clamp((visibility_score + stability_score) / 2.0)
+
     return {
-        "coverage": max(0.0, min(100.0, coverage_pct)),
-        "stability": max(0.0, min(100.0, stability_score)),
+        "tracking_quality": tracking_quality,
+        "activity_proxy": speed_score,
+        "visibility": visibility_score,
+        "consistency": consistency_score,
+        "stability": clamp(stability_score),
     }
 
 
