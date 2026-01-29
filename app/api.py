@@ -4,6 +4,7 @@ import math
 import os
 import socket
 import subprocess
+from functools import lru_cache
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 import requests
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
@@ -319,6 +320,11 @@ def _get_public_s3_client():
     return get_s3_client(S3_PUBLIC_ENDPOINT_URL)
 
 
+@lru_cache(maxsize=1)
+def _get_presign_s3_client():
+    return _get_public_s3_client()
+
+
 def _ensure_public_s3_client(s3_client):
     endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
     if endpoint_url.rstrip("/") != S3_PUBLIC_ENDPOINT_URL.rstrip("/"):
@@ -332,12 +338,21 @@ def presign_get_url(
     key: str,
     expires_seconds: int,
 ) -> str:
-    s3_public = _ensure_public_s3_client(s3_public)
-    return s3_public.generate_presigned_url(
+    presign_client = _get_presign_s3_client()
+    return presign_client.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
+
+
+def enqueue_job(job_id: str) -> None:
+    from app.workers.pipeline import kickoff_job
+
+    try:
+        kickoff_job.delay(job_id)
+    except Exception:
+        logger.exception("create_job enqueue failed job_id=%s", job_id)
 
 
 def build_public_video_url(
@@ -580,47 +595,18 @@ def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
 
 
 @router.post("/jobs")
-def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_db)):
+def create_job(
+    payload: JobCreate,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     job_id = str(uuid4())
-    video_url = payload.video_url
-    video_bucket = None
-    video_key = None
-    if payload.video_key:
-        context = load_s3_context()
-        s3_public = context["s3_public"]
-        bucket = payload.video_bucket or context["bucket"]
-        if not bucket:
-            raise HTTPException(
-                status_code=400,
-                detail=error_detail(
-                    "VIDEO_BUCKET_MISSING",
-                    "video_bucket is required when using video_key.",
-                ),
-            )
-        expires_seconds = context["expires_seconds"]
-        video_url = presign_get_url(s3_public, bucket, payload.video_key, expires_seconds)
-        video_bucket = bucket
-        video_key = payload.video_key
-    elif video_url:
-        if video_url.lower().startswith(("http://", "https://")):
-            parsed = urlsplit(video_url)
-            if parsed.scheme not in ("http", "https"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=error_detail(
-                        "INVALID_URL",
-                        "video_url must be an http(s) URL.",
-                    ),
-                )
-            if _is_shared_object_url(video_url):
-                raise HTTPException(
-                    status_code=400,
-                    detail=error_detail(
-                        "SHARED_OBJECT_UNSUPPORTED",
-                        "Shared object URLs are not supported for video download.",
-                    ),
-                )
-        else:
+    try:
+        video_url = payload.video_url
+        video_bucket = None
+        video_key = None
+        if payload.video_key:
             context = load_s3_context()
             s3_public = context["s3_public"]
             bucket = payload.video_bucket or context["bucket"]
@@ -633,48 +619,91 @@ def create_job(payload: JobCreate, request: Request, db: Session = Depends(get_d
                     ),
                 )
             expires_seconds = context["expires_seconds"]
-            video_url = presign_get_url(s3_public, bucket, video_url, expires_seconds)
+            video_url = presign_get_url(
+                s3_public, bucket, payload.video_key, expires_seconds
+            )
             video_bucket = bucket
-            video_key = payload.video_url
+            video_key = payload.video_key
+        elif video_url:
+            if video_url.lower().startswith(("http://", "https://")):
+                parsed = urlsplit(video_url)
+                if parsed.scheme not in ("http", "https"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=error_detail(
+                            "INVALID_URL",
+                            "video_url must be an http(s) URL.",
+                        ),
+                    )
+                if _is_shared_object_url(video_url):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=error_detail(
+                            "SHARED_OBJECT_UNSUPPORTED",
+                            "Shared object URLs are not supported for video download.",
+                        ),
+                    )
+            else:
+                context = load_s3_context()
+                s3_public = context["s3_public"]
+                bucket = payload.video_bucket or context["bucket"]
+                if not bucket:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=error_detail(
+                            "VIDEO_BUCKET_MISSING",
+                            "video_bucket is required when using video_key.",
+                        ),
+                    )
+                expires_seconds = context["expires_seconds"]
+                video_url = presign_get_url(s3_public, bucket, video_url, expires_seconds)
+                video_bucket = bucket
+                video_key = payload.video_url
 
-    target = {
-        "player": {
-            "team_name": payload.team_name,
-            "player_name": payload.player_name,
-            "shirt_number": payload.shirt_number,
-        },
-        "selections": [],
-        "tracking": {"status": "PENDING"},
-    }
+        target = {
+            "player": {
+                "team_name": payload.team_name,
+                "player_name": payload.player_name,
+                "shirt_number": payload.shirt_number,
+            },
+            "selections": [],
+            "tracking": {"status": "PENDING"},
+        }
 
-    job = AnalysisJob(
-        id=job_id,
-        status="CREATED",
-        category=payload.category,
-        role=payload.role,
-        video_url=video_url,
-        video_bucket=video_bucket,
-        video_key=video_key,
-        target=target,
-        video_meta={},
-        anchor={},
-        player_ref={},
-        progress={"step": "CREATED", "pct": 0, "message": "Job created"},
-        result={},
-        warnings=[],
-        error=None,
-        failure_reason=normalize_failure_reason(None),
-    )
+        job = AnalysisJob(
+            id=job_id,
+            status="CREATED",
+            category=payload.category,
+            role=payload.role,
+            video_url=video_url,
+            video_bucket=video_bucket,
+            video_key=video_key,
+            target=target,
+            video_meta={},
+            anchor={},
+            player_ref={},
+            progress={"step": "CREATED", "pct": 0, "message": "Job created"},
+            result={},
+            warnings=[],
+            error=None,
+            failure_reason=normalize_failure_reason(None),
+        )
 
-    db.add(job)
-    db.commit()
-    db.refresh(job)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
 
-    from app.workers.pipeline import kickoff_job
+        background_tasks.add_task(enqueue_job, job.id)
 
-    kickoff_job.delay(job.id)
-
-    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+        return ok_response(
+            {"job_id": job.id, "id": job.id, "status": job.status}, request
+        )
+    except HTTPException:
+        logger.exception("create_job failed job_id=%s", job_id)
+        raise
+    except Exception:
+        logger.exception("create_job failed job_id=%s", job_id)
+        raise
 
 
 @router.get("/jobs/{job_id}")

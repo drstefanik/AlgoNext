@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -149,6 +150,11 @@ def _get_public_s3_client():
     return _get_s3_client(endpoint_url)
 
 
+@lru_cache(maxsize=1)
+def _get_presign_s3_client():
+    return _get_public_s3_client()
+
+
 def _ensure_public_s3_client(s3_client):
     public_endpoint = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
     endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
@@ -198,8 +204,8 @@ def _presign_get_url(
     key: str,
     expires_seconds: int,
 ) -> str:
-    s3_public = _ensure_public_s3_client(s3_public)
-    return s3_public.generate_presigned_url(
+    presign_client = _get_presign_s3_client()
+    return presign_client.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,

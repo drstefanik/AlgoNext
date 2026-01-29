@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import logging
 import socket
+from functools import lru_cache
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -535,6 +536,11 @@ def get_public_s3_client():
     return get_s3_client(endpoint_url)
 
 
+@lru_cache(maxsize=1)
+def get_presign_s3_client():
+    return get_public_s3_client()
+
+
 def ensure_public_s3_client(s3_client):
     public_endpoint = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
     endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
@@ -584,8 +590,8 @@ def presign_get_url(
     key: str,
     expires_seconds: int,
 ) -> str:
-    s3_public = ensure_public_s3_client(s3_public)
-    return s3_public.generate_presigned_url(
+    presign_client = get_presign_s3_client()
+    return presign_client.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
