@@ -2274,7 +2274,7 @@ def save_selection(
 
 @router.post("/jobs/{job_id}/target")
 def save_target(
-    job_id: str, payload: dict = Body(...), request: Request, db: Session = Depends(get_db)
+    job_id: str, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)
 ):
     return _confirm_target_selection(job_id, payload, request, db)
 
