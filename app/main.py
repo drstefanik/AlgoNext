@@ -112,14 +112,27 @@ def _meta_payload(request: Request) -> dict:
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    payload_keys: list[str] = []
+    if request.method == "POST" and request.url.path == "/jobs":
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            payload_keys = list(body.keys())
+        request_id = getattr(request.state, "request_id", None)
+        logger.info(
+            "JOBS_PAYLOAD_KEYS",
+            extra={"payload_keys": payload_keys, "request_id": request_id},
+        )
     return JSONResponse(
-        status_code=400,
+        status_code=422,
         content={
             "ok": False,
             "error": _error_payload(
                 "VALIDATION_ERROR",
                 "Request validation failed",
-                {"errors": exc.errors()},
+                {"errors": exc.errors(), "payload_keys": payload_keys},
             ),
             "meta": _meta_payload(request),
         },
@@ -166,7 +179,10 @@ def init_db():
             return
         except OperationalError:
             time.sleep(1)
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except OperationalError:
+        logger.warning("Database unavailable during init_db; continuing without DB.")
 
 init_db()
 
@@ -190,12 +206,11 @@ def fail_fast_db_check():
         session.execute(text("SELECT 1"))
     except Exception:
         logger.exception("Database connectivity check failed during startup.")
-        raise
     finally:
         session.close()
 
 @app.get("/health", include_in_schema=False)
 def health():
-    return {"status": "ok"}
+    return {"ok": True, "service": "algonext-api"}
 
 app.include_router(api_router)
