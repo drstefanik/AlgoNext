@@ -601,6 +601,12 @@ def create_job(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    payload_dict = normalize_payload(payload)
+    request_id = getattr(request.state, "request_id", None)
+    logger.info(
+        "JOBS_PAYLOAD_KEYS",
+        extra={"payload_keys": list(payload_dict.keys()), "request_id": request_id},
+    )
     job_id = str(uuid4())
     try:
         video_url = payload.video_url
@@ -704,6 +710,11 @@ def create_job(
     except Exception:
         logger.exception("create_job failed job_id=%s", job_id)
         raise
+
+
+@router.get("/jobs")
+def jobs_root(request: Request):
+    return ok_response({"status": "ready"}, request)
 
 
 @router.get("/jobs/{job_id}")
