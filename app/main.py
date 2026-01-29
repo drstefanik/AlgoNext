@@ -211,6 +211,10 @@ def fail_fast_db_check():
 
 @app.get("/health", include_in_schema=False)
 def health():
-    return {"ok": True, "service": "algonext-api"}
+    return {
+        "ok": True,
+        "service": "algonext-api",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
 
 app.include_router(api_router)
