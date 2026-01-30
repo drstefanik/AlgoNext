@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import requests
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
@@ -598,7 +598,6 @@ def probe_image_dimensions(path: Path) -> Tuple[Optional[int], Optional[int]]:
 def create_job(
     payload: JobCreate,
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     payload_dict = normalize_payload(payload)
@@ -698,8 +697,10 @@ def create_job(
         db.add(job)
         db.commit()
         db.refresh(job)
+        from app.workers.pipeline import kickoff_job
 
-        background_tasks.add_task(enqueue_job, job.id)
+        kickoff_job.delay(str(job.id))
+        logger.info("Enqueued kickoff_job", extra={"job_id": str(job.id)})
 
         return ok_response(
             {"job_id": job.id, "id": job.id, "status": job.status}, request
