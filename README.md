@@ -35,6 +35,22 @@ SIGNED_URL_EXPIRES_SECONDS=3600
 Notes:
 - `S3_ENDPOINT_URL` and `S3_PUBLIC_ENDPOINT_URL` must be different.
 - Presigned URLs for external clients are generated directly with `S3_PUBLIC_ENDPOINT_URL` (no rewrite).
+- MinIO must allow browser access to images via CORS. In Docker this is configured by `createbuckets`; otherwise apply it with `mc` (or the MinIO console):
+
+```bash
+cat << 'EOF' > cors.json
+[
+  {
+    "AllowedOrigins": ["https://algonext-frontend.vercel.app", "https://algonext-frontend.vercel.app/"],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag", "Content-Length", "Content-Type"],
+    "MaxAgeSeconds": 3000
+  }
+]
+EOF
+mc cors set local/fnh cors.json
+```
 
 Verification after deploy/restart:
 
