@@ -38,6 +38,19 @@ class AnalysisError(RuntimeError):
     pass
 
 
+def _keep_workdir() -> bool:
+    return os.environ.get("KEEP_WORKDIR", "0") == "1"
+
+
+def _cleanup_workdir(base_dir: Optional[Path]) -> None:
+    if base_dir is None or not base_dir.exists():
+        return
+    if _keep_workdir():
+        logger.info("KEEP_WORKDIR=1 leaving workdir %s", base_dir)
+        return
+    shutil.rmtree(base_dir, ignore_errors=True)
+
+
 # ----------------------------
 # Helpers: time / db commit / progress
 # ----------------------------
@@ -113,6 +126,27 @@ def _run(cmd: List[str]) -> str:
 
 def _run_json(cmd: List[str]) -> Dict[str, Any]:
     return json.loads(_run(cmd))
+
+
+def ffmpeg_extract_segment(
+    input_path: Path, output_path: Path, start: float, duration: float
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{duration:.3f}",
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+    )
 
 
 def ensure_ffmpeg_available() -> None:
@@ -638,7 +672,7 @@ def extract_preview_frames(self, job_id: str) -> None:
 
         base_dir = Path("/tmp/fnh_jobs_previews") / job_id
         if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
+            _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
 
         input_path = base_dir / "input.mp4"
@@ -750,11 +784,7 @@ def extract_preview_frames(self, job_id: str) -> None:
         except Exception:
             db.rollback()
     finally:
-        if base_dir is not None and base_dir.exists():
-            try:
-                shutil.rmtree(base_dir)
-            except Exception:
-                pass
+        _cleanup_workdir(base_dir)
         db.close()
 
 
@@ -855,7 +885,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
 
         base_dir = Path("/tmp/fnh_jobs_candidates") / job_id
         if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
+            _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
 
         s3_internal = get_s3_client(s3_endpoint_url)
@@ -1254,11 +1284,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             "primaryCount": 0,
         }
     finally:
-        if base_dir is not None and base_dir.exists():
-            try:
-                shutil.rmtree(base_dir)
-            except Exception:
-                pass
+        _cleanup_workdir(base_dir)
         db.close()
 
 
@@ -1363,7 +1389,7 @@ def run_analysis(self, job_id: str):
         # Prepare workspace
         base_dir = Path("/tmp/fnh_jobs") / job_id
         if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
+            _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
 
         input_path = base_dir / "input.mp4"
@@ -1517,6 +1543,57 @@ def run_analysis(self, job_id: str):
                 ),
             )
 
+        tracking_input_path = input_path
+        tracking_time_offset = 0.0
+        tracking_window_before = float(
+            os.environ.get("TRACKING_WINDOW_BEFORE_SEC", "60") or 60
+        )
+        tracking_window_after = float(
+            os.environ.get("TRACKING_WINDOW_AFTER_SEC", "60") or 60
+        )
+        tracking_anchor = (target.get("selection") or {}) if isinstance(target, dict) else {}
+        t0_value = None
+        if isinstance(tracking_anchor, dict):
+            t0_value = tracking_anchor.get("time_sec")
+        if t0_value is None and isinstance(job.player_ref, dict):
+            t0_value = job.player_ref.get("best_time_sec")
+        try:
+            t0 = float(t0_value) if t0_value is not None else 0.0
+        except (TypeError, ValueError):
+            t0 = 0.0
+
+        window_start = max(0.0, t0 - tracking_window_before)
+        window_duration = tracking_window_before + tracking_window_after
+        if duration and duration > 0:
+            if window_start >= duration:
+                window_start = max(0.0, duration - window_duration)
+            max_duration = max(0.0, duration - window_start)
+            window_duration = min(window_duration, max_duration)
+
+        if window_duration > 0:
+            segment_path = base_dir / "segment.mp4"
+            try:
+                ffmpeg_extract_segment(
+                    input_path,
+                    segment_path,
+                    window_start,
+                    window_duration,
+                )
+                tracking_input_path = segment_path
+                tracking_time_offset = window_start
+                logger.info(
+                    "run_analysis tracking window job_id=%s start=%.2fs duration=%.2fs t0=%.2fs",
+                    job_id,
+                    window_start,
+                    window_duration,
+                    t0,
+                )
+            except Exception:
+                logger.exception(
+                    "run_analysis failed to extract tracking segment job_id=%s",
+                    job_id,
+                )
+
         job = reload_job(db, job_id)
         if not job:
             return
@@ -1531,7 +1608,7 @@ def run_analysis(self, job_id: str):
             )
             candidates_output = track_all_players(
                 job_id,
-                str(input_path),
+                str(tracking_input_path),
             )
             update_job(
                 db,
@@ -1574,11 +1651,31 @@ def run_analysis(self, job_id: str):
             job_id,
             lambda job: set_progress(job, "TRACKING", 35, "Tracking selected player"),
         )
+        tracking_player_ref = dict(player_ref)
+        tracking_selections = [dict(sel) for sel in selections]
+        if tracking_time_offset:
+            tracking_player_ref["t"] = max(
+                0.0, float(tracking_player_ref.get("t", 0.0)) - tracking_time_offset
+            )
+            adjusted_selections = []
+            for selection in tracking_selections:
+                if "frame_time_sec" in selection:
+                    selection_time = float(selection.get("frame_time_sec", 0.0))
+                    adjusted_time = max(0.0, selection_time - tracking_time_offset)
+                    selection["frame_time_sec"] = adjusted_time
+                    selection["time_sec"] = adjusted_time
+                else:
+                    selection_time = float(selection.get("time_sec", 0.0))
+                    selection["time_sec"] = max(
+                        0.0, selection_time - tracking_time_offset
+                    )
+                adjusted_selections.append(selection)
+            tracking_selections = adjusted_selections
         tracking_output = track_player(
             job_id,
-            str(input_path),
-            player_ref,
-            selections,
+            str(tracking_input_path),
+            tracking_player_ref,
+            tracking_selections,
         )
         tracking_asset = {
             "bucket": s3_bucket,
@@ -1874,9 +1971,5 @@ def run_analysis(self, job_id: str):
             db.rollback()
         return
     finally:
-        if base_dir is not None and base_dir.exists():
-            try:
-                shutil.rmtree(base_dir)
-            except Exception:
-                pass
+        _cleanup_workdir(base_dir)
         db.close()

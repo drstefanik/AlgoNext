@@ -86,6 +86,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       MINIO_BUCKET: fnh
+      TRACKING_TIMEOUT_SECONDS: "3600"
     depends_on:
       db:
         condition: service_healthy
@@ -134,6 +135,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       MINIO_BUCKET: fnh
+      TRACKING_TIMEOUT_SECONDS: "3600"
     depends_on:
       db:
         condition: service_healthy
