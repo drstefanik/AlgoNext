@@ -41,7 +41,7 @@ Notes:
 cat << 'EOF' > cors.json
 [
   {
-    "AllowedOrigins": ["https://algonext-frontend.vercel.app", "https://algonext-frontend.vercel.app/"],
+    "AllowedOrigins": ["https://algonext-frontend.vercel.app"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["*"],
     "ExposeHeaders": ["ETag", "Content-Length", "Content-Type"],
@@ -50,6 +50,27 @@ cat << 'EOF' > cors.json
 ]
 EOF
 mc cors set local/fnh cors.json
+
+cat << 'EOF' > policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowFramesReadOnly",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["*"]
+      },
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::fnh/jobs/*/frames/*",
+        "arn:aws:s3:::fnh/jobs/*/candidates/*"
+      ]
+    }
+  ]
+}
+EOF
+mc anonymous set-json policy.json local/fnh
 ```
 
 Verification after deploy/restart:

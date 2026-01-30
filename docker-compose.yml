@@ -60,7 +60,7 @@ services:
       cat << 'EOF' > /tmp/cors.json
       [
         {
-          \"AllowedOrigins\": [\"https://algonext-frontend.vercel.app\", \"https://algonext-frontend.vercel.app/\"],
+          \"AllowedOrigins\": [\"https://algonext-frontend.vercel.app\"],
           \"AllowedMethods\": [\"GET\", \"HEAD\"],
           \"AllowedHeaders\": [\"*\"],
           \"ExposeHeaders\": [\"ETag\", \"Content-Length\", \"Content-Type\"],
@@ -69,6 +69,26 @@ services:
       ]
       EOF
       mc cors set local/$MINIO_BUCKET /tmp/cors.json
+      cat << 'EOF' > /tmp/policy.json
+      {
+        \"Version\": \"2012-10-17\",
+        \"Statement\": [
+          {
+            \"Sid\": \"AllowFramesReadOnly\",
+            \"Effect\": \"Allow\",
+            \"Principal\": {
+              \"AWS\": [\"*\"]
+            },
+            \"Action\": [\"s3:GetObject\"],
+            \"Resource\": [
+              \"arn:aws:s3:::fnh/jobs/*/frames/*\",
+              \"arn:aws:s3:::fnh/jobs/*/candidates/*\"
+            ]
+          }
+        ]
+      }
+      EOF
+      mc anonymous set-json /tmp/policy.json local/$MINIO_BUCKET
       "
     restart: "no"
 
