@@ -2559,7 +2559,11 @@ def get_frames(
         {"preview_frames": preview_frames}, context
     ).get("preview_frames", preview_frames)
     preview_frames = [
-        {**frame, "key": frame.get("key") or frame.get("s3_key")}
+        {
+            **frame,
+            "key": frame.get("key") or frame.get("s3_key"),
+            "bucket": frame.get("bucket") or context.get("bucket"),
+        }
         if isinstance(frame, dict)
         else frame
         for frame in preview_frames
@@ -2567,17 +2571,35 @@ def get_frames(
     preview_frames = _normalize_preview_frames(preview_frames)
 
     items: List[Dict[str, Any]] = []
+    s3_public = context["s3_public"]
+    expires_seconds = context["expires_seconds"]
+    bucket_default = context["bucket"]
     for frame in preview_frames[:count]:
         if not isinstance(frame, dict):
+            continue
+        key = frame.get("key") or frame.get("s3_key")
+        bucket = frame.get("bucket") or bucket_default
+        signed_url = frame.get("signed_url")
+        if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
+            if bucket and key:
+                signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
+                frame["signed_url"] = signed_url
+        if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
             continue
         items.append(
             {
                 "time_sec": frame.get("time_sec"),
-                "signed_url": frame.get("signed_url"),
+                "signed_url": signed_url,
                 "width": frame.get("width"),
                 "height": frame.get("height"),
-                "key": frame.get("key") or frame.get("s3_key"),
+                "key": key,
             }
+        )
+
+    if not items:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("FRAMES_NOT_READY", "Preview frames not ready"),
         )
 
     return ok_response({"items": items}, request)
