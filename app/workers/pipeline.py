@@ -552,34 +552,38 @@ def build_motion_segments(
 # ----------------------------
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
-def _build_s3_config(addressing_style: str | None = "path") -> Config:
-    s3_config = {"addressing_style": addressing_style} if addressing_style else None
-    return Config(signature_version="s3v4", s3=s3_config)
+REGION = os.getenv("AWS_REGION") or os.getenv("S3_REGION", "us-east-1")
+S3_ENDPOINT_URL = (
+    os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
+)
+S3_PUBLIC_ENDPOINT_URL = (
+    os.getenv("S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com").strip()
+)
+
+
+def make_s3(endpoint_url: str):
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=REGION,
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY"),
+        aws_secret_access_key=os.getenv("S3_SECRET_KEY"),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
+    )
 
 
 def get_s3_client(endpoint_url: str):
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
-        config=_build_s3_config(),
-    )
+    return make_s3(endpoint_url)
 
 
 def get_public_s3_client():
-    endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    endpoint_url = (S3_PUBLIC_ENDPOINT_URL or "").strip()
     if not endpoint_url:
         raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL")
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
-        config=_build_s3_config(addressing_style="path"),
-    )
+    return make_s3(endpoint_url)
 
 
 @lru_cache(maxsize=1)
@@ -588,7 +592,7 @@ def get_presign_s3_client():
 
 
 def ensure_public_s3_client(s3_client):
-    public_endpoint = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    public_endpoint = S3_PUBLIC_ENDPOINT_URL
     endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
     if not public_endpoint or endpoint_url.rstrip("/") != public_endpoint.rstrip("/"):
         return get_public_s3_client()
@@ -630,14 +634,13 @@ def upload_file(
             raise
 
 
-def presign_get_url(
-    s3_public,
+def presign_get_object(
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
-    presign_client = get_presign_s3_client()
-    return presign_client.generate_presigned_url(
+    s3_public = get_presign_s3_client()
+    return s3_public.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
@@ -652,7 +655,7 @@ def extract_preview_frames(self, job_id: str) -> None:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
 
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
@@ -867,8 +870,8 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
 
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
-    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
+    s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
@@ -1309,7 +1312,7 @@ def run_analysis(self, job_id: str):
     skills_missing: List[str] = []
 
     # Env vars (required)
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()

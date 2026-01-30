@@ -54,8 +54,12 @@ POLLING_SAFE_STATUSES = {
     "FAILED",
 }
 
-S3_ENDPOINT_URL = (os.environ.get("S3_ENDPOINT_URL") or "").strip()
-S3_PUBLIC_ENDPOINT_URL = (os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "").strip()
+S3_ENDPOINT_URL = (
+    os.environ.get("S3_ENDPOINT_URL") or "http://127.0.0.1:9000"
+).strip()
+S3_PUBLIC_ENDPOINT_URL = (
+    os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "https://s3.nextgroupintl.com"
+).strip()
 S3_ACCESS_KEY = (os.environ.get("S3_ACCESS_KEY") or "").strip()
 S3_SECRET_KEY = (os.environ.get("S3_SECRET_KEY") or "").strip()
 S3_BUCKET = (os.environ.get("S3_BUCKET") or "").strip()
@@ -151,8 +155,7 @@ def _build_candidate_payload(
             if not key:
                 continue
             bucket = sample.get("bucket") or bucket_default
-            signed_url = presign_get_url(
-                s3_public,
+            signed_url = presign_get_object(
                 bucket,
                 key,
                 expires_seconds,
@@ -365,14 +368,13 @@ def _ensure_public_s3_client(s3_client):
     return s3_client
 
 
-def presign_get_url(
-    s3_public,
+def presign_get_object(
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
-    presign_client = _get_presign_s3_client()
-    return presign_client.generate_presigned_url(
+    s3_public = _get_presign_s3_client()
+    return s3_public.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
@@ -400,10 +402,10 @@ def build_public_video_url(
     s3_public = context["s3_public"]
     expires_seconds = context["expires_seconds"]
     if job.video_key and bucket:
-        return presign_get_url(s3_public, bucket, job.video_key, expires_seconds)
+        return presign_get_object(bucket, job.video_key, expires_seconds)
     if job.video_url and not job.video_url.lower().startswith(("http://", "https://")):
         if bucket:
-            return presign_get_url(s3_public, bucket, job.video_url, expires_seconds)
+            return presign_get_object(bucket, job.video_url, expires_seconds)
     return job.video_url
 
 
@@ -413,7 +415,7 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
     expires_seconds = context["expires_seconds"]
 
     def presign(bucket: str, key: str) -> str:
-        return presign_get_url(s3_public, bucket, key, expires_seconds)
+        return presign_get_object(bucket, key, expires_seconds)
 
     def normalize_asset(asset: Dict[str, Any], include_url: bool) -> Dict[str, Any]:
         bucket = asset.get("bucket") or bucket_default
@@ -509,7 +511,7 @@ def _hydrate_player_ref_sample_frames(
         key = frame.get("key") or frame.get("s3_key")
         bucket = frame.get("bucket") or bucket_default
         if key and bucket:
-            signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
+            signed_url = presign_get_object(bucket, key, expires_seconds)
             hydrated_frame = {
                 **frame,
                 "bucket": bucket,
@@ -657,9 +659,7 @@ def create_job(
                     ),
                 )
             expires_seconds = context["expires_seconds"]
-            video_url = presign_get_url(
-                s3_public, bucket, payload.video_key, expires_seconds
-            )
+            video_url = presign_get_object(bucket, payload.video_key, expires_seconds)
             video_bucket = bucket
             video_key = payload.video_key
         elif video_url:
@@ -694,7 +694,7 @@ def create_job(
                         ),
                     )
                 expires_seconds = context["expires_seconds"]
-                video_url = presign_get_url(s3_public, bucket, video_url, expires_seconds)
+                video_url = presign_get_object(bucket, video_url, expires_seconds)
                 video_bucket = bucket
                 video_key = payload.video_url
 
@@ -2595,7 +2595,7 @@ def get_frames(
         signed_url = frame.get("signed_url")
         if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
             if bucket and key:
-                signed_url = presign_get_url(s3_public, bucket, key, expires_seconds)
+                signed_url = presign_get_object(bucket, key, expires_seconds)
                 frame["signed_url"] = signed_url
         if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
             continue
