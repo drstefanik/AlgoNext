@@ -2535,8 +2535,6 @@ def confirm_selection(
 def get_frames(
     job_id: str, request: Request, count: int = 8, db: Session = Depends(get_db)
 ):
-    from app.workers.pipeline import ensure_bucket_exists, upload_file
-
     if count < 1:
         raise HTTPException(
             status_code=400,
@@ -2549,85 +2547,40 @@ def get_frames(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
-    context = load_s3_context()
-    s3_internal = context["s3_internal"]
-    s3_public = context["s3_public"]
-    minio_bucket = context["bucket"]
-    expires_seconds = context["expires_seconds"]
-
-    ensure_ffmpeg_available()
-
-    base_dir = Path("/tmp/fnh_jobs") / job_id
-    input_path = base_dir / "input.mp4"
-    frames_dir = base_dir / "frames"
-
-    if not input_path.exists():
-        video_source, source_bucket = resolve_job_video_source(job, minio_bucket)
-        download_video(video_source, input_path, s3_internal, source_bucket)
-
-    duration = probe_video_duration(input_path)
-    if duration and duration > 0:
-        step = duration / (count + 1)
-        timestamps = [round(step * (i + 1), 3) for i in range(count)]
-    else:
-        timestamps = [i * 10 for i in range(count)]
-
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    ensure_bucket_exists(s3_internal, minio_bucket)
-
-    frames: List[Dict[str, Any]] = []
-    for index, timestamp in enumerate(timestamps, start=1):
-        frame_name = f"frame_{index:03d}.jpg"
-        frame_path = frames_dir / frame_name
-        if not frame_path.exists():
-            try:
-                _run_command(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-ss",
-                        str(timestamp),
-                        "-i",
-                        str(input_path),
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "2",
-                        str(frame_path),
-                    ]
-                )
-            except RuntimeError:
-                break
-
-        width, height = probe_image_dimensions(frame_path)
-        frame_key = f"jobs/{job_id}/frames/{frame_name}"
-        upload_file(s3_internal, minio_bucket, frame_path, frame_key, "image/jpeg")
-        signed_url = presign_get_url(
-            s3_public,
-            minio_bucket,
-            frame_key,
-            expires_seconds,
+    preview_frames = job.preview_frames or []
+    if not preview_frames:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("FRAMES_NOT_READY", "Preview frames not ready"),
         )
-        frames.append(
+
+    context = load_s3_context()
+    preview_frames = attach_presigned_urls(
+        {"preview_frames": preview_frames}, context
+    ).get("preview_frames", preview_frames)
+    preview_frames = [
+        {**frame, "key": frame.get("key") or frame.get("s3_key")}
+        if isinstance(frame, dict)
+        else frame
+        for frame in preview_frames
+    ]
+    preview_frames = _normalize_preview_frames(preview_frames)
+
+    items: List[Dict[str, Any]] = []
+    for frame in preview_frames[:count]:
+        if not isinstance(frame, dict):
+            continue
+        items.append(
             {
-                "index": index,
-                "timestamp": timestamp,
-                "s3_key": frame_key,
-                "signed_url": signed_url,
-                "expires_in": expires_seconds,
-                "width": width,
-                "height": height,
+                "time_sec": frame.get("time_sec"),
+                "signed_url": frame.get("signed_url"),
+                "width": frame.get("width"),
+                "height": frame.get("height"),
+                "key": frame.get("key") or frame.get("s3_key"),
             }
         )
 
-    if not frames:
-        raise HTTPException(
-            status_code=500,
-            detail=error_detail("FRAMES_EXTRACTION_FAILED", "No frames extracted"),
-        )
-
-    return ok_response({"count": len(frames), "frames": frames}, request)
+    return ok_response({"items": items}, request)
 
 
 @router.get("/jobs/{job_id}/frames/{filename}")
@@ -2644,60 +2597,23 @@ def list_frames(
     count: int = 8,
     db: Session = Depends(get_db),
 ):
-    return get_frames(job_id=job_id, request=request, count=count, db=db)
+    raise HTTPException(
+        status_code=410,
+        detail=error_detail(
+            "DEPRECATED",
+            "Deprecated. Use /jobs/{id}/frames?count=8",
+        ),
+    )
 
 
 @router.get("/jobs/{job_id}/frames/overlay")
 def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db)):
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
-        )
-
-    preview_frames = job.preview_frames or []
-    progress_step = (job.progress or {}).get("step")
-    overlay_ready = bool(preview_frames) and progress_step == "CANDIDATES_READY"
-    context = None
-    if preview_frames:
-        context = load_s3_context()
-        preview_frames = attach_presigned_urls(
-            {"preview_frames": preview_frames}, context
-        ).get("preview_frames", preview_frames)
-        preview_frames = [
-            {**frame, "key": frame.get("key") or frame.get("s3_key")}
-            if isinstance(frame, dict)
-            else frame
-            for frame in preview_frames
-        ]
-        preview_frames = _normalize_preview_frames(preview_frames)
-
-    items: List[Dict[str, Any]] = []
-    for frame in preview_frames:
-        if not isinstance(frame, dict):
-            continue
-        frame_key = frame.get("key") or frame.get("s3_key")
-        if not frame_key:
-            continue
-        tracks = frame.get("tracks") if overlay_ready else []
-        items.append(
-            {
-                "frame_key": frame_key,
-                "signed_url": frame.get("signed_url"),
-                "time_sec": frame.get("time_sec"),
-                "width": frame.get("width"),
-                "height": frame.get("height"),
-                "tracks": tracks if isinstance(tracks, list) else [],
-            }
-        )
-
-    return ok_response(
-        {
-            "items": items,
-            "overlay_ready": overlay_ready,
-        },
-        request,
+    raise HTTPException(
+        status_code=410,
+        detail=error_detail(
+            "DEPRECATED",
+            "Deprecated. Use /jobs/{id}/frames?count=8",
+        ),
     )
 
 
