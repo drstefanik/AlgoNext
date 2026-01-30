@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import subprocess
 from functools import lru_cache
@@ -13,9 +14,10 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import requests
+from botocore.exceptions import ClientError
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -58,6 +60,7 @@ S3_ACCESS_KEY = (os.environ.get("S3_ACCESS_KEY") or "").strip()
 S3_SECRET_KEY = (os.environ.get("S3_SECRET_KEY") or "").strip()
 S3_BUCKET = (os.environ.get("S3_BUCKET") or "").strip()
 SIGNED_URL_EXPIRES_SECONDS = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+FILENAME_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
 
 def normalize_status(status: str) -> str:
@@ -304,6 +307,36 @@ def load_s3_context() -> Dict[str, Any]:
         "bucket": S3_BUCKET,
         "expires_seconds": SIGNED_URL_EXPIRES_SECONDS,
     }
+
+
+def _validate_filename(filename: str) -> None:
+    if not filename or not FILENAME_PATTERN.match(filename):
+        raise HTTPException(
+            status_code=400,
+            detail=error_detail("INVALID_FILENAME", "Invalid filename"),
+        )
+
+
+def _stream_s3_image(key: str) -> StreamingResponse:
+    context = load_s3_context()
+    s3_internal = context["s3_internal"]
+    bucket = context["bucket"]
+    try:
+        response = s3_internal.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        error_code = (exc.response.get("Error") or {}).get("Code")
+        if error_code in {"NoSuchKey", "404", "NotFound"}:
+            raise HTTPException(
+                status_code=404,
+                detail=error_detail("FILE_NOT_FOUND", "File not found"),
+            ) from exc
+        raise
+
+    headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Content-Type": "image/jpeg",
+    }
+    return StreamingResponse(response["Body"], media_type="image/jpeg", headers=headers)
 
 
 def _get_public_s3_client():
@@ -1023,6 +1056,13 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
         },
         request,
     )
+
+
+@router.get("/jobs/{job_id}/candidates/{filename}")
+def get_candidate_preview(job_id: str, filename: str) -> StreamingResponse:
+    _validate_filename(filename)
+    key = f"jobs/{job_id}/candidates/{filename}"
+    return _stream_s3_image(key)
 
 
 def _parse_track_selection_payload(payload: Any) -> TrackSelectionPayload:
@@ -2588,6 +2628,13 @@ def get_frames(
         )
 
     return ok_response({"count": len(frames), "frames": frames}, request)
+
+
+@router.get("/jobs/{job_id}/frames/{filename}")
+def get_frame_file(job_id: str, filename: str) -> StreamingResponse:
+    _validate_filename(filename)
+    key = f"jobs/{job_id}/frames/{filename}"
+    return _stream_s3_image(key)
 
 
 @router.get("/jobs/{job_id}/frames/list")
