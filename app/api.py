@@ -381,6 +381,14 @@ def presign_get_object(
     )
 
 
+def presign_get(
+    bucket: str,
+    key: str,
+    expires_seconds: int,
+) -> str:
+    return presign_get_object(bucket, key, expires_seconds)
+
+
 def enqueue_job(job_id: str) -> None:
     from app.workers.pipeline import kickoff_job
 
@@ -2555,9 +2563,6 @@ def get_frames(
         )
 
     context = load_s3_context()
-    preview_frames = attach_presigned_urls(
-        {"preview_frames": preview_frames}, context
-    ).get("preview_frames", preview_frames)
     preview_frames = [
         {
             **frame,
@@ -2584,7 +2589,6 @@ def get_frames(
         )
 
     items: List[Dict[str, Any]] = []
-    s3_public = context["s3_public"]
     expires_seconds = context["expires_seconds"]
     bucket_default = context["bucket"]
     for frame in available_frames[:count]:
@@ -2592,13 +2596,9 @@ def get_frames(
             continue
         key = frame.get("key") or frame.get("s3_key")
         bucket = frame.get("bucket") or bucket_default
-        signed_url = frame.get("signed_url")
-        if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
-            if bucket and key:
-                signed_url = presign_get_object(bucket, key, expires_seconds)
-                frame["signed_url"] = signed_url
-        if not (isinstance(signed_url, str) and signed_url.lower().startswith(("http://", "https://"))):
+        if not bucket or not key:
             continue
+        signed_url = presign_get(bucket, key, expires_seconds)
         items.append(
             {
                 "time_sec": frame.get("time_sec"),
