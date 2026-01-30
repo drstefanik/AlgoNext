@@ -552,7 +552,7 @@ def build_motion_segments(
 # ----------------------------
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
-def _build_s3_config(addressing_style: str | None = None) -> Config:
+def _build_s3_config(addressing_style: str | None = "path") -> Config:
     s3_config = {"addressing_style": addressing_style} if addressing_style else None
     return Config(signature_version="s3v4", s3=s3_config)
 
@@ -563,7 +563,7 @@ def get_s3_client(endpoint_url: str):
         endpoint_url=endpoint_url,
         aws_access_key_id=os.environ["S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("S3_REGION", "us-east-1"),
+        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
         config=_build_s3_config(),
     )
 
@@ -577,7 +577,7 @@ def get_public_s3_client():
         endpoint_url=endpoint_url,
         aws_access_key_id=os.environ["S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("S3_REGION", "us-east-1"),
+        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
         config=_build_s3_config(addressing_style="path"),
     )
 
