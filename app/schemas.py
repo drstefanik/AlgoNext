@@ -221,7 +221,7 @@ class TargetSelectionPayload(BaseModel):
     frame_key: Optional[str] = Field(default=None, alias="frameKey")
     time_sec: Optional[float] = Field(default=None, alias="timeSec")
     bbox: Dict[str, float]
-    track_id: Optional[int | str] = Field(default=None, alias="trackId")
+    track_id: Optional[int | str] = Field(default=0, alias="trackId")
     force: bool = False
 
     @model_validator(mode="before")
@@ -237,7 +237,12 @@ class TargetSelectionPayload(BaseModel):
             or data.get("frameTimeSec")
         )
         force = bool(data.get("force")) if "force" in data else False
-        track_id = data.get("track_id") or data.get("trackId")
+        if "track_id" in data:
+            track_id = data.get("track_id")
+        else:
+            track_id = data.get("trackId")
+        if track_id is None:
+            track_id = 0
         bbox = data.get("bbox")
         if not isinstance(bbox, dict):
             bbox = {

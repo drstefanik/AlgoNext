@@ -1767,7 +1767,12 @@ def _normalize_target_payload(payload: Any) -> Dict[str, Any]:
         or payload.get("frame_time_sec")
         or payload.get("frameTimeSec")
     )
-    track_id = payload.get("track_id") or payload.get("trackId")
+    if "track_id" in payload:
+        track_id = payload.get("track_id")
+    else:
+        track_id = payload.get("trackId")
+    if track_id is None:
+        track_id = 0
     force = bool(payload.get("force")) if "force" in payload else False
 
     bbox = payload.get("bbox")
@@ -1782,8 +1787,6 @@ def _normalize_target_payload(payload: Any) -> Dict[str, Any]:
     missing: List[str] = []
     if frame_key is None and time_sec is None:
         missing.extend(["frame_key", "time_sec"])
-    if track_id is None:
-        missing.append("track_id")
     if not isinstance(bbox, dict):
         missing.append("bbox")
     else:
