@@ -280,7 +280,7 @@ def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[st
 
 
 def load_s3_context() -> Dict[str, Any]:
-    from app.workers.pipeline import get_s3_client
+    from app.workers.pipeline import get_public_s3_client, get_s3_client
 
     if (
         not S3_ENDPOINT_URL
@@ -299,7 +299,7 @@ def load_s3_context() -> Dict[str, Any]:
         )
 
     s3_internal = get_s3_client(S3_ENDPOINT_URL)
-    s3_public = get_s3_client(S3_PUBLIC_ENDPOINT_URL)
+    s3_public = get_public_s3_client()
 
     return {
         "s3_internal": s3_internal,
@@ -340,7 +340,7 @@ def _stream_s3_image(key: str) -> StreamingResponse:
 
 
 def _get_public_s3_client():
-    from app.workers.pipeline import get_s3_client
+    from app.workers.pipeline import get_public_s3_client
 
     if not S3_PUBLIC_ENDPOINT_URL:
         raise HTTPException(
@@ -350,7 +350,7 @@ def _get_public_s3_client():
                 "Missing S3 env vars: S3_PUBLIC_ENDPOINT_URL",
             ),
         )
-    return get_s3_client(S3_PUBLIC_ENDPOINT_URL)
+    return get_public_s3_client()
 
 
 @lru_cache(maxsize=1)
@@ -2570,11 +2570,24 @@ def get_frames(
     ]
     preview_frames = _normalize_preview_frames(preview_frames)
 
+    available_frames = [
+        frame
+        for frame in preview_frames
+        if isinstance(frame, dict)
+        and (frame.get("key") or frame.get("s3_key"))
+        and (frame.get("bucket") or context.get("bucket"))
+    ]
+    if not available_frames:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("FRAMES_NOT_READY", "Preview frames not ready"),
+        )
+
     items: List[Dict[str, Any]] = []
     s3_public = context["s3_public"]
     expires_seconds = context["expires_seconds"]
     bucket_default = context["bucket"]
-    for frame in preview_frames[:count]:
+    for frame in available_frames[:count]:
         if not isinstance(frame, dict):
             continue
         key = frame.get("key") or frame.get("s3_key")
@@ -2594,12 +2607,6 @@ def get_frames(
                 "height": frame.get("height"),
                 "key": key,
             }
-        )
-
-    if not items:
-        raise HTTPException(
-            status_code=409,
-            detail=error_detail("FRAMES_NOT_READY", "Preview frames not ready"),
         )
 
     return ok_response({"items": items}, request)

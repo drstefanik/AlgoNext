@@ -552,6 +552,11 @@ def build_motion_segments(
 # ----------------------------
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
+def _build_s3_config(addressing_style: str | None = None) -> Config:
+    s3_config = {"addressing_style": addressing_style} if addressing_style else None
+    return Config(signature_version="s3v4", s3=s3_config)
+
+
 def get_s3_client(endpoint_url: str):
     return boto3.client(
         "s3",
@@ -559,7 +564,7 @@ def get_s3_client(endpoint_url: str):
         aws_access_key_id=os.environ["S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
         region_name=os.environ.get("S3_REGION", "us-east-1"),
-        config=Config(signature_version="s3v4"),
+        config=_build_s3_config(),
     )
 
 
@@ -567,7 +572,14 @@ def get_public_s3_client():
     endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
     if not endpoint_url:
         raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL")
-    return get_s3_client(endpoint_url)
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+        region_name=os.environ.get("S3_REGION", "us-east-1"),
+        config=_build_s3_config(addressing_style="path"),
+    )
 
 
 @lru_cache(maxsize=1)

@@ -138,6 +138,11 @@ def _mark_tracking_timeout(job_id: str, timeout_seconds: int, elapsed: float) ->
         db.close()
 
 
+def _build_s3_config(addressing_style: str | None = None) -> Config:
+    s3_config = {"addressing_style": addressing_style} if addressing_style else None
+    return Config(signature_version="s3v4", s3=s3_config)
+
+
 def _get_s3_client(endpoint_url: str):
     return boto3.client(
         "s3",
@@ -145,7 +150,7 @@ def _get_s3_client(endpoint_url: str):
         aws_access_key_id=os.environ["S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["S3_SECRET_KEY"],
         region_name=os.environ.get("S3_REGION", "us-east-1"),
-        config=Config(signature_version="s3v4"),
+        config=_build_s3_config(),
     )
 
 
@@ -153,7 +158,14 @@ def _get_public_s3_client():
     endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
     if not endpoint_url:
         raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL")
-    return _get_s3_client(endpoint_url)
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+        region_name=os.environ.get("S3_REGION", "us-east-1"),
+        config=_build_s3_config(addressing_style="path"),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -617,7 +629,7 @@ def track_player(
         json.dump(tracking_output, handle, ensure_ascii=False, indent=2)
 
     s3_internal = _get_s3_client(s3_endpoint_url)
-    s3_public = _get_s3_client(s3_public_endpoint_url)
+    s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
     tracking_key = f"jobs/{job_id}/tracking/tracking.json"
     _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
@@ -975,7 +987,7 @@ def track_all_players(
         }
 
     s3_internal = _get_s3_client(s3_endpoint_url)
-    s3_public = _get_s3_client(s3_public_endpoint_url)
+    s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
 
     candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
@@ -1221,7 +1233,7 @@ def track_all_players_from_frames(
         }
 
     s3_internal = _get_s3_client(s3_endpoint_url)
-    s3_public = _get_s3_client(s3_public_endpoint_url)
+    s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
 
     candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
