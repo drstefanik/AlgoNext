@@ -107,12 +107,18 @@ def _update_candidates_frames_processed(job_id: str, frames_processed: int) -> N
         db.close()
 
 
-def _mark_tracking_timeout(job_id: str, timeout_seconds: int) -> None:
+def _mark_tracking_timeout(job_id: str, timeout_seconds: int, elapsed: float) -> None:
     db = SessionLocal()
     try:
         job = db.get(AnalysisJob, job_id)
         if not job:
             return
+        logger.warning(
+            "TRACKING_TIMEOUT job_id=%s elapsed=%.1fs timeout=%ss",
+            job_id,
+            elapsed,
+            timeout_seconds,
+        )
         warnings = list(job.warnings or [])
         if "TRACKING_TIMEOUT" not in warnings:
             warnings.append("TRACKING_TIMEOUT")
@@ -363,7 +369,6 @@ def track_player(
     model = YOLO(detector_model)
     samples: List[Dict[str, Any]] = []
 
-    last_progress_time = time.monotonic()
     processed_samples = 0
     start_pct = 10
     end_pct = 40
@@ -426,14 +431,24 @@ def track_player(
             processed_samples += 1
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
-                _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+                _mark_tracking_timeout(
+                    job_id,
+                    tracking_timeout_seconds,
+                    now - tracking_started_at,
+                )
                 raise TrackingTimeoutError("Tracking timeout exceeded")
-            if now - last_progress_time >= 10:
+            if processed_samples % 200 == 0:
+                logger.info(
+                    "tracking progress job_id=%s frame=%s/%s",
+                    job_id,
+                    processed_samples,
+                    total_samples,
+                )
+            if processed_samples % 10 == 0 or processed_samples == total_samples:
                 pct = start_pct + int(
                     (processed_samples / float(total_samples)) * (end_pct - start_pct)
                 )
                 _update_tracking_progress(job_id, pct, "Tracking player")
-                last_progress_time = now
 
             frame_index += 1
     finally:
@@ -829,7 +844,6 @@ def track_all_players(
     samples: List[Dict[str, Any]] = []
     track_map: Dict[int, List[Dict[str, Any]]] = {}
 
-    last_progress_time = time.monotonic()
     processed_samples = 0
     start_pct = 10
     end_pct = 40
@@ -899,14 +913,24 @@ def track_all_players(
                 _update_candidates_frames_processed(job_id, processed_samples)
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
-                _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+                _mark_tracking_timeout(
+                    job_id,
+                    tracking_timeout_seconds,
+                    now - tracking_started_at,
+                )
                 raise TrackingTimeoutError("Tracking timeout exceeded")
-            if now - last_progress_time >= 10:
+            if processed_samples % 200 == 0:
+                logger.info(
+                    "tracking progress job_id=%s frame=%s/%s",
+                    job_id,
+                    processed_samples,
+                    total_samples,
+                )
+            if processed_samples % 10 == 0 or processed_samples == total_samples:
                 pct = start_pct + int(
                     (processed_samples / float(total_samples)) * (end_pct - start_pct)
                 )
                 _update_tracking_progress(job_id, pct, "Tracking all players")
-                last_progress_time = now
 
             frame_index += 1
     finally:
@@ -1057,7 +1081,6 @@ def track_all_players_from_frames(
     total_samples = len(frames)
     frame_tracks: List[Dict[str, Any]] = []
 
-    last_progress_time = time.monotonic()
     processed_samples = 0
     start_pct = 10
     end_pct = 40
@@ -1142,14 +1165,24 @@ def track_all_players_from_frames(
             _update_candidates_frames_processed(job_id, processed_samples)
         now = time.monotonic()
         if now - tracking_started_at > tracking_timeout_seconds:
-            _mark_tracking_timeout(job_id, tracking_timeout_seconds)
+            _mark_tracking_timeout(
+                job_id,
+                tracking_timeout_seconds,
+                now - tracking_started_at,
+            )
             raise TrackingTimeoutError("Tracking timeout exceeded")
-        if now - last_progress_time >= 10:
+        if processed_samples % 200 == 0:
+            logger.info(
+                "tracking progress job_id=%s frame=%s/%s",
+                job_id,
+                processed_samples,
+                total_samples,
+            )
+        if processed_samples % 10 == 0 or processed_samples == total_samples:
             pct = start_pct + int(
                 (processed_samples / float(total_samples)) * (end_pct - start_pct)
             )
             _update_tracking_progress(job_id, pct, "Tracking all players")
-            last_progress_time = now
 
     _update_tracking_progress(job_id, end_pct, "Tracking all players")
 
