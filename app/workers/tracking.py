@@ -138,34 +138,38 @@ def _mark_tracking_timeout(job_id: str, timeout_seconds: int, elapsed: float) ->
         db.close()
 
 
-def _build_s3_config(addressing_style: str | None = "path") -> Config:
-    s3_config = {"addressing_style": addressing_style} if addressing_style else None
-    return Config(signature_version="s3v4", s3=s3_config)
+REGION = os.getenv("AWS_REGION") or os.getenv("S3_REGION", "us-east-1")
+S3_ENDPOINT_URL = (
+    os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
+)
+S3_PUBLIC_ENDPOINT_URL = (
+    os.getenv("S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com").strip()
+)
+
+
+def _make_s3(endpoint_url: str):
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=REGION,
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY"),
+        aws_secret_access_key=os.getenv("S3_SECRET_KEY"),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
+    )
 
 
 def _get_s3_client(endpoint_url: str):
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
-        config=_build_s3_config(),
-    )
+    return _make_s3(endpoint_url)
 
 
 def _get_public_s3_client():
-    endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    endpoint_url = (S3_PUBLIC_ENDPOINT_URL or "").strip()
     if not endpoint_url:
         raise RuntimeError("Missing S3_PUBLIC_ENDPOINT_URL")
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name=os.environ.get("AWS_REGION") or os.environ.get("S3_REGION", "us-east-1"),
-        config=_build_s3_config(addressing_style="path"),
-    )
+    return _make_s3(endpoint_url)
 
 
 @lru_cache(maxsize=1)
@@ -174,7 +178,7 @@ def _get_presign_s3_client():
 
 
 def _ensure_public_s3_client(s3_client):
-    public_endpoint = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    public_endpoint = S3_PUBLIC_ENDPOINT_URL
     endpoint_url = getattr(getattr(s3_client, "meta", None), "endpoint_url", "") or ""
     if not public_endpoint or endpoint_url.rstrip("/") != public_endpoint.rstrip("/"):
         return _get_public_s3_client()
@@ -216,14 +220,13 @@ def _upload_file(
             raise
 
 
-def _presign_get_url(
-    s3_public,
+def _presign_get_object(
     bucket: str,
     key: str,
     expires_seconds: int,
 ) -> str:
-    presign_client = _get_presign_s3_client()
-    return presign_client.generate_presigned_url(
+    s3_public = _get_presign_s3_client()
+    return s3_public.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_seconds,
@@ -348,12 +351,12 @@ def track_player(
     if player_ref_norm is None:
         raise RuntimeError("Missing player_ref for tracking")
 
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
 
     if (
         not s3_endpoint_url
@@ -629,11 +632,10 @@ def track_player(
         json.dump(tracking_output, handle, ensure_ascii=False, indent=2)
 
     s3_internal = _get_s3_client(s3_endpoint_url)
-    s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
     tracking_key = f"jobs/{job_id}/tracking/tracking.json"
     _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
-    tracking_url = _presign_get_url(s3_public, s3_bucket, tracking_key, expires_seconds)
+    tracking_url = _presign_get_object(s3_bucket, tracking_key, expires_seconds)
 
     tracking_output["tracking_key"] = tracking_key
     tracking_output["tracking_url"] = tracking_url
@@ -822,12 +824,12 @@ def track_all_players(
     detector_model: str = "yolo11s.pt",
     tracker: str = "bytetrack.yaml",
 ) -> Dict[str, Any]:
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
 
     if (
         not s3_endpoint_url
@@ -1066,12 +1068,12 @@ def track_all_players_from_frames(
     detector_model: str = "yolo11s.pt",
     tracker: str = "bytetrack.yaml",
 ) -> Dict[str, Any]:
-    s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
     s3_bucket = os.environ.get("S3_BUCKET", "").strip()
     expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-    s3_public_endpoint_url = os.environ.get("S3_PUBLIC_ENDPOINT_URL", "").strip()
+    s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
 
     if (
         not s3_endpoint_url
