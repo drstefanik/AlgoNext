@@ -592,6 +592,16 @@ def _build_report_v1(
             fps = tracking_output.get("fps")
         if frames_processed is None:
             frames_processed = len(tracking_output.get("bboxes") or [])
+    tracked_span_seconds = 0.0
+    if isinstance(tracking_output, dict):
+        times = []
+        for b in (tracking_output.get("bboxes") or []):
+            try:
+                times.append(float(b.get("t", 0.0)))
+            except Exception:
+                pass
+        if times:
+            tracked_span_seconds = max(times) - min(times)
     analyzed_seconds = _compute_analyzed_seconds(video_features, tracking_output)
     tracking_quality = None
     coverage_pct = None
@@ -637,15 +647,21 @@ def _build_report_v1(
     incomplete_radar = bool(skills_missing_payload)
 
     confidence_level = "low"
-    if analyzed_seconds >= 20 and skills_ok_count == skills_total:
-        confidence_level = "high"
-    elif analyzed_seconds >= 12 and skills_ok_count >= 4:
-        confidence_level = "medium"
-    try:
-        if coverage_pct is not None and float(coverage_pct) < 30.0:
-            confidence_level = "low"
-    except (TypeError, ValueError):
-        pass
+    coverage_low = False
+    if coverage_pct is not None:
+        try:
+            coverage_low = float(coverage_pct) < 30.0
+        except (TypeError, ValueError):
+            coverage_low = False
+    if coverage_low:
+        confidence_level = "low"
+    elif tracked_span_seconds < 12:
+        confidence_level = "low"
+    else:
+        if analyzed_seconds >= 20 and skills_ok_count == skills_total:
+            confidence_level = "high"
+        elif analyzed_seconds >= 12 and skills_ok_count >= 4:
+            confidence_level = "medium"
 
     role_name = role if role in ROLE_WEIGHTS else "unknown"
     target_payload = (job.target or {}).get("selection") or {}
@@ -679,6 +695,8 @@ def _build_report_v1(
         },
         "analysis_window": {
             "analyzed_seconds": analyzed_seconds,
+            "video_duration_seconds": analyzed_seconds,
+            "tracked_span_seconds": tracked_span_seconds,
             "fps": fps,
             "frames_total": frame_count,
             "frames_processed": frames_processed,
@@ -712,6 +730,7 @@ def _build_report_v1(
                 "analyzed_seconds": analyzed_seconds,
                 "skills_ok_count": skills_ok_count,
                 "scene_change_rate": scene_change_rate,
+                "tracked_span_seconds": tracked_span_seconds,
                 "tracking_coverage_pct": coverage_pct,
             },
         },
