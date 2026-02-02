@@ -760,7 +760,7 @@ def jobs_root(request: Request):
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str, request: Request):
+def get_job(job_id: str, request: Request, view: str = "lite"):
     db: Session = SessionLocal()
     try:
         job = db.get(AnalysisJob, job_id)
@@ -805,7 +805,10 @@ def get_job(job_id: str, request: Request):
             context = load_s3_context()
         public_video_url = build_public_video_url(job, context)
 
-        result, assets = _build_result_assets(result_payload or {})
+        result_payload = result_payload or {}
+        result, assets = _build_result_assets(result_payload)
+        if view == "full":
+            result = result_payload
         if not assets.get("inputVideoUrl") and public_video_url:
             assets = {**assets, "inputVideoUrl": public_video_url}
         if preview_frames:
