@@ -2544,9 +2544,9 @@ def confirm_selection(
 
 def _default_preview_frame_count() -> int:
     try:
-        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "16"))
     except ValueError:
-        preview_count = 8
+        preview_count = 16
     return max(1, preview_count)
 
 
@@ -2559,7 +2559,7 @@ def get_frames(
 ):
     if count is None:
         count = _default_preview_frame_count()
-    count = min(max(int(count), 1), 32)
+    count = max(int(count), 1)
 
     job = db.get(AnalysisJob, job_id)
     if not job:
@@ -2653,7 +2653,7 @@ def list_frames(
         status_code=410,
         detail=error_detail(
             "DEPRECATED",
-            "Deprecated. Use /jobs/{id}/frames?count=8",
+            "Deprecated. Use /jobs/{id}/frames?count=N",
         ),
     )
 
@@ -2664,7 +2664,7 @@ def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db))
         status_code=410,
         detail=error_detail(
             "DEPRECATED",
-            "Deprecated. Use /jobs/{id}/frames?count=8",
+            "Deprecated. Use /jobs/{id}/frames?count=N",
         ),
     )
 

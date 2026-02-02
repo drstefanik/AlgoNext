@@ -19,6 +19,7 @@ cp .env.example .env
 | `S3_BUCKET` | Bucket name for assets. |
 | `S3_REGION` | Region name for S3. |
 | `SIGNED_URL_EXPIRES_SECONDS` | Expiration for presigned URLs. |
+| `PREVIEW_FRAME_COUNT` | Number of preview frames to extract per job (default: 16). |
 
 **VPS example values**
 
@@ -83,6 +84,14 @@ curl -s -o /dev/null -w "%{http_code}\n" "$SIGNED_URL"
 ```
 
 Expected result: `200`.
+
+Frames debug (preview frames count):
+
+```bash
+curl -s "https://api.nextgroupintl.com/jobs/<id>/frames?count=16" | jq '.data.items | length'
+```
+
+Expected result: `16` (when at least 16 preview frames are available).
 
 ## GitHub Actions Deploy
 
