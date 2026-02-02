@@ -1,0 +1,145 @@
+{
+  "version": "1.0",
+  "source": {
+    "extract_video_features": "app/workers/pipeline.py::extract_video_features",
+    "compute_skill_scores": "app/workers/pipeline.py::compute_skill_scores",
+    "compute_evaluation": "app/core/scoring.py::compute_evaluation",
+    "compute_scores": "app/core/scoring.py::compute_scores"
+  },
+  "radar_skills": {
+    "Finishing": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_count >= 2",
+      "base": 34.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    },
+    "Shot Power": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_count >= 2",
+      "base": 32.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    },
+    "Heading": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_count >= 3",
+      "base": 30.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    },
+    "Positioning": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_rate >= 0.03",
+      "base": 38.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    },
+    "Off-the-ball Movement": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_rate >= 0.04",
+      "base": 36.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    },
+    "Composure": {
+      "features": ["scene_change_count", "scene_change_rate"],
+      "condition": "scene_change_rate >= 0.015",
+      "base": 40.0,
+      "transformations": {
+        "activity_score": "min(1.0, scene_change_rate / 0.25)",
+        "scene_bonus": "min(scene_change_count, 10.0) * 2.0",
+        "score": "round(clamp(base + activity_score * 45.0 + scene_bonus, 0, 100))"
+      },
+      "aggregation": "global video-level (no rolling windows)",
+      "normalization": "clamp 0-100 after formula",
+      "weights": "role-weighted later in compute_scores",
+      "missing_handling": "None if condition fails; omitted from radar"
+    }
+  },
+  "role_weights": {
+    "Striker": {
+      "Finishing": 0.24,
+      "Positioning": 0.2,
+      "Off-the-ball Movement": 0.2,
+      "Composure": 0.16,
+      "Shot Power": 0.12,
+      "Heading": 0.08
+    },
+    "Winger": {
+      "Off-the-ball Movement": 0.22,
+      "Positioning": 0.18,
+      "Composure": 0.16,
+      "Shot Power": 0.16,
+      "Finishing": 0.18,
+      "Heading": 0.1
+    },
+    "Midfielder": {
+      "Composure": 0.22,
+      "Positioning": 0.22,
+      "Off-the-ball Movement": 0.2,
+      "Shot Power": 0.14,
+      "Finishing": 0.14,
+      "Heading": 0.08
+    },
+    "Defender": {
+      "Heading": 0.22,
+      "Positioning": 0.22,
+      "Composure": 0.18,
+      "Off-the-ball Movement": 0.18,
+      "Shot Power": 0.1,
+      "Finishing": 0.1
+    },
+    "Goalkeeper": {
+      "Composure": 0.4,
+      "Positioning": 0.3,
+      "Off-the-ball Movement": 0.1,
+      "Heading": 0.05,
+      "Shot Power": 0.1,
+      "Finishing": 0.05
+    },
+    "DEFAULT_WEIGHTS": {
+      "Finishing": 1.0,
+      "Heading": 1.0,
+      "Positioning": 1.0,
+      "Composure": 1.0,
+      "Off-the-ball Movement": 1.0,
+      "Shot Power": 1.0
+    }
+  }
+}
