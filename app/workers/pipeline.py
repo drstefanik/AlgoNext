@@ -593,6 +593,21 @@ def _build_report_v1(
         if frames_processed is None:
             frames_processed = len(tracking_output.get("bboxes") or [])
     analyzed_seconds = _compute_analyzed_seconds(video_features, tracking_output)
+    tracking_quality = None
+    coverage_pct = None
+    tracking_source = tracking_output
+    if not isinstance(tracking_source, dict):
+        tracking_source = (job.result or {}).get("tracking")
+    if isinstance(tracking_source, dict):
+        coverage_pct = tracking_source.get("coverage_pct")
+        tracking_quality = {
+            "method": tracking_source.get("method"),
+            "fps": tracking_source.get("fps"),
+            "track_id": tracking_source.get("track_id"),
+            "coverage_pct": coverage_pct,
+            "lost_segments": tracking_source.get("lost_segments") or [],
+            "notes": tracking_source.get("notes"),
+        }
 
     skills_ok: List[str] = []
     skills_missing_payload: List[Dict[str, Any]] = []
@@ -626,6 +641,11 @@ def _build_report_v1(
         confidence_level = "high"
     elif analyzed_seconds >= 12 and skills_ok_count >= 4:
         confidence_level = "medium"
+    try:
+        if coverage_pct is not None and float(coverage_pct) < 30.0:
+            confidence_level = "low"
+    except (TypeError, ValueError):
+        pass
 
     role_name = role if role in ROLE_WEIGHTS else "unknown"
     target_payload = (job.target or {}).get("selection") or {}
@@ -684,6 +704,7 @@ def _build_report_v1(
             "overall_score": overall_score,
         },
         "partial": partial_payload,
+        "tracking_quality": tracking_quality,
         "confidence": {
             "level": confidence_level,
             "ruleset": "confidence-v1",
@@ -691,6 +712,7 @@ def _build_report_v1(
                 "analyzed_seconds": analyzed_seconds,
                 "skills_ok_count": skills_ok_count,
                 "scene_change_rate": scene_change_rate,
+                "tracking_coverage_pct": coverage_pct,
             },
         },
     }
