@@ -605,18 +605,22 @@ def _build_report_v1(
     analyzed_seconds = _compute_analyzed_seconds(video_features, tracking_output)
     tracking_quality = None
     coverage_pct = None
-    tracking_source = tracking_output
-    if not isinstance(tracking_source, dict):
-        tracking_source = (job.result or {}).get("tracking")
-    if isinstance(tracking_source, dict):
-        coverage_pct = tracking_source.get("coverage_pct")
+
+    source = None
+    if isinstance(tracking_output, dict):
+        source = tracking_output
+    elif isinstance(job.result, dict) and isinstance(job.result.get("tracking"), dict):
+        source = job.result.get("tracking")
+
+    if isinstance(source, dict):
+        coverage_pct = source.get("coverage_pct")
         tracking_quality = {
-            "method": tracking_source.get("method"),
-            "fps": tracking_source.get("fps"),
-            "track_id": tracking_source.get("track_id"),
+            "method": source.get("method"),
+            "fps": source.get("fps"),
+            "track_id": source.get("track_id"),
             "coverage_pct": coverage_pct,
-            "lost_segments": tracking_source.get("lost_segments") or [],
-            "notes": tracking_source.get("notes"),
+            "lost_segments": source.get("lost_segments") or [],
+            "notes": source.get("notes"),
         }
 
     skills_ok: List[str] = []
@@ -662,6 +666,12 @@ def _build_report_v1(
             confidence_level = "high"
         elif analyzed_seconds >= 12 and skills_ok_count >= 4:
             confidence_level = "medium"
+    if coverage_pct is not None:
+        try:
+            if float(coverage_pct) < 30.0:
+                confidence_level = "low"
+        except (TypeError, ValueError):
+            pass
 
     role_name = role if role in ROLE_WEIGHTS else "unknown"
     target_payload = (job.target or {}).get("selection") or {}
