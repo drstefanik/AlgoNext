@@ -2542,15 +2542,24 @@ def confirm_selection(
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
 
 
+def _default_preview_frame_count() -> int:
+    try:
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+    except ValueError:
+        preview_count = 8
+    return max(1, preview_count)
+
+
 @router.get("/jobs/{job_id}/frames")
 def get_frames(
-    job_id: str, request: Request, count: int = 8, db: Session = Depends(get_db)
+    job_id: str,
+    request: Request,
+    count: Optional[int] = None,
+    db: Session = Depends(get_db),
 ):
-    if count < 1:
-        raise HTTPException(
-            status_code=400,
-            detail=error_detail("INVALID_COUNT", "Count must be >= 1"),
-        )
+    if count is None:
+        count = _default_preview_frame_count()
+    count = min(max(int(count), 1), 32)
 
     job = db.get(AnalysisJob, job_id)
     if not job:
