@@ -53,9 +53,9 @@ def _cleanup_workdir(base_dir: Optional[Path]) -> None:
 
 def _preview_frame_count() -> int:
     try:
-        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "16"))
     except ValueError:
-        preview_count = 8
+        preview_count = 16
     return max(1, preview_count)
 
 
