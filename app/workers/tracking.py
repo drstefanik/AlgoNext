@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 CANDIDATE_MIN_HITS = int(os.environ.get("CANDIDATE_MIN_HITS", "2"))
 CANDIDATE_MIN_SECONDS = float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0)
 CANDIDATE_TOP_N = int(os.environ.get("CANDIDATE_TOP_N", "5"))
+CANDIDATE_SAMPLE_FRAMES = max(
+    1, int(os.environ.get("CANDIDATE_SAMPLE_FRAMES", "10"))
+)
 PRIMARY_COVERAGE_THRESHOLD = 0.05
 
 class TrackingTimeoutError(RuntimeError):
@@ -645,28 +648,40 @@ def track_player(
 
 def _select_candidate_samples(
     detections_sorted: List[Dict[str, Any]],
+    sample_frames_count: int,
 ) -> List[Dict[str, Any]]:
     if not detections_sorted:
         return []
     count = len(detections_sorted)
-    third_points = [
-        int(round((count - 1) * (1 / 3))),
-        int(round((count - 1) * (2 / 3))),
-        count - 1,
-    ]
+    target_count = max(1, sample_frames_count)
+    if count <= target_count:
+        return detections_sorted
+
     areas = [det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted]
     best_index = int(np.argmax(areas)) if areas else 0
-    indices = []
-    for idx in [third_points[0], third_points[1], third_points[2], best_index]:
+    if target_count == 1:
+        return [detections_sorted[best_index]]
+
+    base_indices = [
+        int(round(i * (count - 1) / float(target_count - 1)))
+        for i in range(target_count)
+    ]
+    closest_idx = min(
+        range(len(base_indices)), key=lambda i: abs(base_indices[i] - best_index)
+    )
+    base_indices[closest_idx] = best_index
+
+    indices: List[int] = []
+    for idx in base_indices:
         if idx not in indices and 0 <= idx < count:
             indices.append(idx)
-    if len(indices) < 4:
+    if len(indices) < target_count:
         for idx in range(count):
             if idx not in indices:
                 indices.append(idx)
-            if len(indices) >= 4:
+            if len(indices) >= target_count:
                 break
-    return [detections_sorted[idx] for idx in indices[:4]]
+    return [detections_sorted[idx] for idx in indices[:target_count]]
 
 
 def _build_candidate_tracks(
@@ -703,7 +718,9 @@ def _build_candidate_tracks(
         id_switches = max(0, segments - 1)
         normalized_switches = id_switches / float(max(1, hit_count - 1))
         stability_score = max(0.0, 1.0 - normalized_switches)
-        selected_samples = _select_candidate_samples(detections_sorted)
+        selected_samples = _select_candidate_samples(
+            detections_sorted, CANDIDATE_SAMPLE_FRAMES
+        )
         sample_frames = [
             {
                 "time_sec": float(sample["t"]),

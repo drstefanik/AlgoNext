@@ -51,6 +51,45 @@ def _cleanup_workdir(base_dir: Optional[Path]) -> None:
     shutil.rmtree(base_dir, ignore_errors=True)
 
 
+def _preview_frame_count() -> int:
+    try:
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
+    except ValueError:
+        preview_count = 8
+    return max(1, preview_count)
+
+
+def _build_preview_timestamps(
+    duration: float | None,
+    preview_count: int,
+    anchor_time: float | None = None,
+) -> List[float]:
+    if preview_count <= 0:
+        return []
+    if not duration or duration <= 0:
+        return [i * 10 for i in range(preview_count)]
+
+    if anchor_time is None:
+        step = duration / (preview_count + 1)
+        return [round(step * (i + 1), 3) for i in range(preview_count)]
+
+    anchor = max(0.0, min(duration, float(anchor_time)))
+    window = min(120.0, duration / 2)
+    start = max(0.0, anchor - window)
+    end = min(duration, anchor + window)
+
+    if preview_count == 1:
+        return [round(anchor, 3)]
+
+    step = (end - start) / float(max(1, preview_count - 1))
+    timestamps = [round(start + step * i, 3) for i in range(preview_count)]
+    closest_index = min(
+        range(len(timestamps)), key=lambda i: abs(timestamps[i] - anchor)
+    )
+    timestamps[closest_index] = round(anchor, 3)
+    return sorted(timestamps)
+
+
 # ----------------------------
 # Helpers: time / db commit / progress
 # ----------------------------
@@ -712,14 +751,10 @@ def extract_preview_frames(self, job_id: str) -> None:
         video_meta = probe_video_meta(input_path) or {}
         duration = get_duration_seconds(video_meta)
 
-        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
-        preview_count = max(1, min(12, preview_count))
-
-        if duration and duration > 0:
-            step = duration / (preview_count + 1)
-            timestamps = [round(step * (i + 1), 3) for i in range(preview_count)]
-        else:
-            timestamps = [i * 10 for i in range(preview_count)]
+        preview_count = _preview_frame_count()
+        player_ref = _normalize_player_ref(job.player_ref or {})
+        anchor_time = player_ref.get("t") if player_ref else None
+        timestamps = _build_preview_timestamps(duration, preview_count, anchor_time)
 
         preview_frames: List[Dict[str, Any]] = []
         for index, timestamp in enumerate(timestamps, start=1):
@@ -1498,15 +1533,11 @@ def run_analysis(self, job_id: str):
                 job, "EXTRACTING_FRAMES", 25, "Extracting preview frames"
             ),
         )
-        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "8"))
-        preview_count = max(1, min(12, preview_count))
-
+        preview_count = _preview_frame_count()
         duration = get_duration_seconds(video_meta)
-        if duration and duration > 0:
-            step = duration / (preview_count + 1)
-            timestamps = [round(step * (i + 1), 3) for i in range(preview_count)]
-        else:
-            timestamps = [i * 10 for i in range(preview_count)]
+        player_ref = _normalize_player_ref(job.player_ref or {})
+        anchor_time = player_ref.get("t") if player_ref else None
+        timestamps = _build_preview_timestamps(duration, preview_count, anchor_time)
 
         frames_dir = base_dir / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
