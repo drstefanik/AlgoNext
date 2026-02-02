@@ -2575,16 +2575,27 @@ def get_frames(
         )
 
     context = load_s3_context()
-    preview_frames = [
-        {
-            **frame,
-            "key": frame.get("key") or frame.get("s3_key"),
-            "bucket": frame.get("bucket") or context.get("bucket"),
-        }
-        if isinstance(frame, dict)
-        else frame
-        for frame in preview_frames
-    ]
+    normalized_preview_frames: List[Dict[str, Any] | str] = []
+    for frame in preview_frames:
+        if isinstance(frame, dict):
+            normalized_preview_frames.append(
+                {
+                    **frame,
+                    "key": frame.get("key") or frame.get("s3_key"),
+                    "bucket": frame.get("bucket") or context.get("bucket"),
+                }
+            )
+            continue
+        if isinstance(frame, str):
+            normalized_preview_frames.append(
+                {
+                    "key": frame,
+                    "bucket": context.get("bucket"),
+                }
+            )
+            continue
+        normalized_preview_frames.append(frame)
+    preview_frames = normalized_preview_frames
     preview_frames = _normalize_preview_frames(preview_frames)
 
     available_frames = [
