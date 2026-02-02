@@ -23,7 +23,7 @@ from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.core.scoring import compute_evaluation, keys_required_for_role
+from app.core.scoring import ROLE_WEIGHTS, compute_evaluation, keys_required_for_role
 from app.workers.tracking import (
     TrackingTimeoutError,
     track_all_players,
@@ -480,6 +480,220 @@ def compute_skill_scores(
         raise AnalysisError("Insufficient video signal to compute score")
 
     return skills, missing
+
+
+SKILLS_ORDER = [
+    "Finishing",
+    "Shot Power",
+    "Heading",
+    "Positioning",
+    "Off-the-ball Movement",
+    "Composure",
+]
+
+SKILL_REASON_RULES = {
+    "Finishing": ("SCENE_CHANGE_COUNT_LT_2", "scene_change_count"),
+    "Shot Power": ("SCENE_CHANGE_COUNT_LT_2", "scene_change_count"),
+    "Heading": ("SCENE_CHANGE_COUNT_LT_3", "scene_change_count"),
+    "Positioning": ("SCENE_CHANGE_RATE_LT_0_03", "scene_change_rate"),
+    "Off-the-ball Movement": ("SCENE_CHANGE_RATE_LT_0_04", "scene_change_rate"),
+    "Composure": ("SCENE_CHANGE_RATE_LT_0_015", "scene_change_rate"),
+}
+
+
+def _compute_analyzed_seconds(
+    video_features: Dict[str, Any] | None,
+    tracking_output: Dict[str, Any] | None,
+) -> float:
+    if isinstance(video_features, dict):
+        duration = video_features.get("duration_seconds")
+        if duration is not None:
+            try:
+                return max(0.0, float(duration))
+            except (TypeError, ValueError):
+                pass
+    if isinstance(tracking_output, dict):
+        bboxes = tracking_output.get("bboxes") or []
+        times = []
+        for bbox in bboxes:
+            try:
+                times.append(float(bbox.get("t", 0.0)))
+            except (TypeError, ValueError):
+                continue
+        if times:
+            return max(0.0, max(times) - min(times))
+    return 0.0
+
+
+def _normalize_selection_payload(selection: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(selection, dict):
+        return {"frame_time_sec": 0.0, "bbox_xywh": [0.0, 0.0, 0.0, 0.0]}
+    if "frame_time_sec" in selection or "frame_key" in selection:
+        frame_time_sec = float(selection.get("frame_time_sec", 0.0))
+        return {
+            "frame_time_sec": frame_time_sec,
+            "bbox_xywh": [
+                float(selection.get("x", 0.0)),
+                float(selection.get("y", 0.0)),
+                float(selection.get("w", 0.0)),
+                float(selection.get("h", 0.0)),
+            ],
+        }
+    bbox = selection.get("bbox") or {}
+    frame_time_sec = float(selection.get("time_sec", 0.0))
+    return {
+        "frame_time_sec": frame_time_sec,
+        "bbox_xywh": [
+            float(bbox.get("x", 0.0)),
+            float(bbox.get("y", 0.0)),
+            float(bbox.get("w", 0.0)),
+            float(bbox.get("h", 0.0)),
+        ],
+    }
+
+
+def _normalize_player_ref_selection(player_ref: Dict[str, Any] | None) -> Dict[str, Any]:
+    player_ref_norm = _normalize_player_ref(player_ref or {})
+    if not player_ref_norm:
+        return {"frame_time_sec": 0.0, "bbox_xywh": [0.0, 0.0, 0.0, 0.0]}
+    return {
+        "frame_time_sec": float(player_ref_norm.get("t", 0.0)),
+        "bbox_xywh": [
+            float(player_ref_norm.get("x", 0.0)),
+            float(player_ref_norm.get("y", 0.0)),
+            float(player_ref_norm.get("w", 0.0)),
+            float(player_ref_norm.get("h", 0.0)),
+        ],
+    }
+
+
+def _build_report_v1(
+    job: AnalysisJob,
+    skills_computed: Dict[str, Optional[int]],
+    role: str,
+    role_score: float,
+    overall_score: float,
+    warnings: List[str],
+    video_features: Dict[str, Any] | None,
+    tracking_output: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    scene_change_count = 0
+    scene_change_rate = 0.0
+    fps = None
+    frame_count = None
+    frames_processed = None
+    if isinstance(video_features, dict):
+        scene_change_count = int(video_features.get("scene_change_count") or 0)
+        scene_change_rate = float(video_features.get("scene_change_rate") or 0.0)
+        fps = video_features.get("fps")
+        frame_count = video_features.get("frame_count")
+    if isinstance(tracking_output, dict):
+        if fps is None:
+            fps = tracking_output.get("fps")
+        if frames_processed is None:
+            frames_processed = len(tracking_output.get("bboxes") or [])
+    analyzed_seconds = _compute_analyzed_seconds(video_features, tracking_output)
+
+    skills_ok: List[str] = []
+    skills_missing_payload: List[Dict[str, Any]] = []
+    for skill in SKILLS_ORDER:
+        value = skills_computed.get(skill)
+        if value is None:
+            reason_code, reason_field = SKILL_REASON_RULES.get(
+                skill, ("SCENE_CHANGE_COUNT_LT_2", "scene_change_count")
+            )
+            details_value = (
+                scene_change_count
+                if reason_field == "scene_change_count"
+                else scene_change_rate
+            )
+            skills_missing_payload.append(
+                {
+                    "skill": skill,
+                    "reason_code": reason_code,
+                    "details": {reason_field: details_value},
+                }
+            )
+        else:
+            skills_ok.append(skill)
+
+    skills_ok_count = len(skills_ok)
+    skills_total = len(SKILLS_ORDER)
+    incomplete_radar = bool(skills_missing_payload)
+
+    confidence_level = "low"
+    if analyzed_seconds >= 20 and skills_ok_count == skills_total:
+        confidence_level = "high"
+    elif analyzed_seconds >= 12 and skills_ok_count >= 4:
+        confidence_level = "medium"
+
+    role_name = role if role in ROLE_WEIGHTS else "unknown"
+    target_payload = (job.target or {}).get("selection") or {}
+    if not target_payload:
+        selections = (job.target or {}).get("selections") or []
+        target_payload = selections[0] if selections else {}
+
+    is_partial = incomplete_radar or ("INCOMPLETE_RADAR" in warnings)
+    if is_partial:
+        report_status = "COMPLETED_PARTIAL"
+    else:
+        report_status = "COMPLETED"
+    partial_payload = {
+        "is_partial": is_partial,
+        "reason_codes": ["INCOMPLETE_RADAR"] if is_partial else [],
+        "explain": (
+            f"Radar incomplete because {skills_ok_count}/{skills_total} skills could not be computed."
+            if is_partial
+            else ""
+        ),
+    }
+
+    return {
+        "version": "report-v1",
+        "job": {
+            "job_id": job.id,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "completed_at": utc_now_iso(),
+            "status": report_status,
+            "warnings": warnings,
+        },
+        "analysis_window": {
+            "analyzed_seconds": analyzed_seconds,
+            "fps": fps,
+            "frames_total": frame_count,
+            "frames_processed": frames_processed,
+        },
+        "selections": {
+            "player_ref": _normalize_player_ref_selection(job.player_ref),
+            "target": _normalize_selection_payload(target_payload),
+        },
+        "video_scene_activity": {
+            "scene_change_count": scene_change_count,
+            "scene_change_rate": scene_change_rate,
+            "notes": ["driver_of_radar_v1"],
+        },
+        "radar_coverage": {
+            "skills_ok": skills_ok,
+            "skills_missing": skills_missing_payload,
+            "skills_ok_count": skills_ok_count,
+            "skills_total": skills_total,
+            "incomplete_radar": incomplete_radar,
+        },
+        "scores": {
+            "role": {"name": role_name, "role_score": role_score},
+            "overall_score": overall_score,
+        },
+        "partial": partial_payload,
+        "confidence": {
+            "level": confidence_level,
+            "ruleset": "confidence-v1",
+            "signals": {
+                "analyzed_seconds": analyzed_seconds,
+                "skills_ok_count": skills_ok_count,
+                "scene_change_rate": scene_change_rate,
+            },
+        },
+    }
 
 
 def extract_clips(input_path: Path, out_dir: Path) -> Tuple[List[Dict], Optional[str]]:
@@ -1903,6 +2117,16 @@ def run_analysis(self, job_id: str):
                 add_warning("MISSING_INPUT_VIDEO")
 
             run_status = "COMPLETED" if not warnings else "PARTIAL"
+            report = _build_report_v1(
+                job=job,
+                skills_computed=skills_computed,
+                role=role,
+                role_score=role_score,
+                overall_score=overall,
+                warnings=warnings,
+                video_features=video_features,
+                tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
+            )
             player_runs = (
                 existing_result.get("player_runs")
                 if isinstance(existing_result, dict)
@@ -1944,6 +2168,7 @@ def run_analysis(self, job_id: str):
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,
                 "skills_missing": skills_missing,
+                "report": report,
                 "assets": {
                     **sanitized_assets,
                     "input_video": input_video,
