@@ -29,6 +29,7 @@ from app.workers.tracking import (
     track_all_players,
     track_all_players_from_frames,
     track_player,
+    track_player_windowed,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,15 @@ def get_duration_seconds(meta: Dict) -> Optional[float]:
         return None
 
 
+def _is_full_match_mode(job: AnalysisJob) -> bool:
+    env_flag = os.environ.get("FULL_MATCH_MODE", "").strip().lower()
+    env_enabled = env_flag in {"1", "true", "yes", "on"}
+    target_flag = False
+    if isinstance(job.target, dict):
+        target_flag = bool(job.target.get("full_match_mode"))
+    return env_enabled or target_flag
+
+
 def probe_frame_count(path: Path) -> int:
     data = _run_json(
         [
@@ -582,6 +592,7 @@ def _build_report_v1(
     fps = None
     frame_count = None
     frames_processed = None
+    match_payload = None
     if isinstance(video_features, dict):
         scene_change_count = int(video_features.get("scene_change_count") or 0)
         scene_change_rate = float(video_features.get("scene_change_rate") or 0.0)
@@ -605,6 +616,8 @@ def _build_report_v1(
     analyzed_seconds = _compute_analyzed_seconds(video_features, tracking_output)
     tracking_quality = None
     coverage_pct = None
+    segments_total = None
+    segments_with_player = None
 
     source = None
     if isinstance(tracking_output, dict):
@@ -614,14 +627,39 @@ def _build_report_v1(
 
     if isinstance(source, dict):
         coverage_pct = source.get("coverage_pct")
-        tracking_quality = {
-            "method": source.get("method"),
-            "fps": source.get("fps"),
-            "track_id": source.get("track_id"),
-            "coverage_pct": coverage_pct,
-            "lost_segments": source.get("lost_segments") or [],
-            "notes": source.get("notes"),
-        }
+        if source.get("mode") == "full_match_windowed":
+            segments_total = source.get("segments_total")
+            segments_with_player = source.get("segments_with_player")
+            tracking_quality = {
+                "mode": source.get("mode"),
+                "method": source.get("method"),
+                "fps": source.get("fps"),
+                "window_sec": source.get("window_sec"),
+                "overlap_sec": source.get("overlap_sec"),
+                "segments_total": segments_total,
+                "segments_with_player": segments_with_player,
+                "coverage_pct_total": source.get("coverage_pct_total"),
+                "largest_gap_sec": source.get("largest_gap_sec"),
+                "notes": source.get("notes"),
+            }
+            match_payload = {
+                "mode": source.get("mode"),
+                "window_sec": source.get("window_sec"),
+                "overlap_sec": source.get("overlap_sec"),
+                "segments_total": segments_total or 0,
+                "segments_with_player": segments_with_player or 0,
+                "coverage_pct_total": source.get("coverage_pct_total") or 0.0,
+                "largest_gap_sec": source.get("largest_gap_sec") or 0.0,
+            }
+        else:
+            tracking_quality = {
+                "method": source.get("method"),
+                "fps": source.get("fps"),
+                "track_id": source.get("track_id"),
+                "coverage_pct": coverage_pct,
+                "lost_segments": source.get("lost_segments") or [],
+                "notes": source.get("notes"),
+            }
 
     skills_ok: List[str] = []
     skills_missing_payload: List[Dict[str, Any]] = []
@@ -672,6 +710,17 @@ def _build_report_v1(
                 confidence_level = "low"
         except (TypeError, ValueError):
             pass
+    if isinstance(source, dict) and source.get("mode") == "full_match_windowed":
+        coverage_total = float(source.get("coverage_pct_total") or 0.0)
+        window_total = float(source.get("segments_total") or 0.0)
+        window_with_player = float(source.get("segments_with_player") or 0.0)
+        window_ratio = (window_with_player / window_total) * 100.0 if window_total else 0.0
+        if coverage_total >= 70.0 and window_ratio >= 70.0:
+            confidence_level = "high"
+        elif coverage_total >= 45.0:
+            confidence_level = "medium"
+        else:
+            confidence_level = "low"
 
     role_name = role if role in ROLE_WEIGHTS else "unknown"
     target_payload = (job.target or {}).get("selection") or {}
@@ -694,7 +743,7 @@ def _build_report_v1(
         ),
     }
 
-    return {
+    report_payload = {
         "version": "report-v1",
         "job": {
             "job_id": job.id,
@@ -745,6 +794,9 @@ def _build_report_v1(
             },
         },
     }
+    if match_payload is not None:
+        report_payload["match"] = match_payload
+    return report_payload
 
 
 def extract_clips(input_path: Path, out_dir: Path) -> Tuple[List[Dict], Optional[str]]:
@@ -1854,6 +1906,7 @@ def run_analysis(self, job_id: str):
                 ),
             )
 
+        full_match_mode = _is_full_match_mode(job)
         tracking_input_path = input_path
         tracking_time_offset = 0.0
         tracking_window_before = float(
@@ -1873,37 +1926,38 @@ def run_analysis(self, job_id: str):
         except (TypeError, ValueError):
             t0 = 0.0
 
-        window_start = max(0.0, t0 - tracking_window_before)
-        window_duration = tracking_window_before + tracking_window_after
-        if duration and duration > 0:
-            if window_start >= duration:
-                window_start = max(0.0, duration - window_duration)
-            max_duration = max(0.0, duration - window_start)
-            window_duration = min(window_duration, max_duration)
+        if not full_match_mode:
+            window_start = max(0.0, t0 - tracking_window_before)
+            window_duration = tracking_window_before + tracking_window_after
+            if duration and duration > 0:
+                if window_start >= duration:
+                    window_start = max(0.0, duration - window_duration)
+                max_duration = max(0.0, duration - window_start)
+                window_duration = min(window_duration, max_duration)
 
-        if window_duration > 0:
-            segment_path = base_dir / "segment.mp4"
-            try:
-                ffmpeg_extract_segment(
-                    input_path,
-                    segment_path,
-                    window_start,
-                    window_duration,
-                )
-                tracking_input_path = segment_path
-                tracking_time_offset = window_start
-                logger.info(
-                    "run_analysis tracking window job_id=%s start=%.2fs duration=%.2fs t0=%.2fs",
-                    job_id,
-                    window_start,
-                    window_duration,
-                    t0,
-                )
-            except Exception:
-                logger.exception(
-                    "run_analysis failed to extract tracking segment job_id=%s",
-                    job_id,
-                )
+            if window_duration > 0:
+                segment_path = base_dir / "segment.mp4"
+                try:
+                    ffmpeg_extract_segment(
+                        input_path,
+                        segment_path,
+                        window_start,
+                        window_duration,
+                    )
+                    tracking_input_path = segment_path
+                    tracking_time_offset = window_start
+                    logger.info(
+                        "run_analysis tracking window job_id=%s start=%.2fs duration=%.2fs t0=%.2fs",
+                        job_id,
+                        window_start,
+                        window_duration,
+                        t0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "run_analysis failed to extract tracking segment job_id=%s",
+                        job_id,
+                    )
 
         job = reload_job(db, job_id)
         if not job:
@@ -1982,18 +2036,66 @@ def run_analysis(self, job_id: str):
                     )
                 adjusted_selections.append(selection)
             tracking_selections = adjusted_selections
-        tracking_output = track_player(
-            job_id,
-            str(tracking_input_path),
-            tracking_player_ref,
-            tracking_selections,
-        )
+        if full_match_mode:
+            max_windows = int(os.environ.get("FULL_MATCH_MAX_WINDOWS", "200"))
+            tracking_output = track_player_windowed(
+                job_id,
+                str(tracking_input_path),
+                tracking_player_ref,
+                tracking_selections,
+                video_duration_sec=duration or 0.0,
+                window_sec=45.0,
+                overlap_sec=10.0,
+                fps=5,
+                max_windows=max_windows,
+            )
+        else:
+            tracking_output = track_player(
+                job_id,
+                str(tracking_input_path),
+                tracking_player_ref,
+                tracking_selections,
+            )
         tracking_asset = {
             "bucket": s3_bucket,
             "key": tracking_output.get("tracking_key"),
             "url": tracking_output.get("tracking_url"),
         }
         motion_segments = build_motion_segments(tracking_output.get("bboxes") or [])
+        tracking_payload: Dict[str, Any]
+        if tracking_output.get("mode") == "full_match_windowed":
+            segments = tracking_output.get("segments") or []
+            total_bboxes = sum(len(seg.get("bboxes") or []) for seg in segments)
+            tracking_payload = {
+                "mode": tracking_output.get("mode"),
+                "method": tracking_output.get("method"),
+                "fps": tracking_output.get("fps"),
+                "window_sec": tracking_output.get("window_sec"),
+                "overlap_sec": tracking_output.get("overlap_sec"),
+                "segments": segments,
+                "segments_total": tracking_output.get("segments_total"),
+                "segments_with_player": tracking_output.get("segments_with_player"),
+                "coverage_pct_total": tracking_output.get("coverage_pct_total"),
+                "largest_gap_sec": tracking_output.get("largest_gap_sec"),
+                "coverage_pct": tracking_output.get("coverage_pct"),
+                "bboxes_count": total_bboxes,
+                "lost_segments": [],
+                "motion_segments": [],
+                "notes": tracking_output.get("notes"),
+                "asset": tracking_asset,
+            }
+        else:
+            tracking_payload = {
+                "method": tracking_output.get("method"),
+                "fps": tracking_output.get("fps"),
+                "coverage_pct": tracking_output.get("coverage_pct"),
+                "bboxes_count": len(tracking_output.get("bboxes") or []),
+                "track_id": tracking_output.get("track_id"),
+                "lost_segments": tracking_output.get("lost_segments"),
+                "motion_segments": motion_segments,
+                "notes": tracking_output.get("notes"),
+                "asset": tracking_asset,
+            }
         update_job(
             db,
             job_id,
@@ -2002,17 +2104,7 @@ def run_analysis(self, job_id: str):
                 "result",
                 {
                     **(job.result or {}),
-                    "tracking": {
-                        "method": tracking_output.get("method"),
-                        "fps": tracking_output.get("fps"),
-                        "coverage_pct": tracking_output.get("coverage_pct"),
-                        "bboxes_count": len(tracking_output.get("bboxes") or []),
-                        "track_id": tracking_output.get("track_id"),
-                        "lost_segments": tracking_output.get("lost_segments"),
-                        "motion_segments": motion_segments,
-                        "notes": tracking_output.get("notes"),
-                        "asset": tracking_asset,
-                    },
+                    "tracking": tracking_payload,
                 },
             ),
         )
