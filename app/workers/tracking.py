@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import subprocess
 import time
 from functools import lru_cache
 from datetime import datetime, timezone
@@ -327,6 +328,240 @@ def _smooth_bbox(
     }
 
 
+def _size_aspect_penalty(a: Dict[str, float], b: Dict[str, float]) -> float:
+    area_ratio = _area_similarity(a, b)
+    aspect_a = a["w"] / max(1e-6, a["h"])
+    aspect_b = b["w"] / max(1e-6, b["h"])
+    aspect_ratio = aspect_a / aspect_b if aspect_b > 0 else 1.0
+    if aspect_ratio < 1.0:
+        aspect_ratio = 1.0 / aspect_ratio
+    return max(0.0, area_ratio - 1.0) + max(0.0, aspect_ratio - 1.0)
+
+
+def iter_windows(
+    video_duration_sec: float,
+    *,
+    window: float = 45.0,
+    overlap: float = 10.0,
+    max_windows: int = 200,
+) -> List[Tuple[float, float]]:
+    if video_duration_sec <= 0:
+        return []
+    step = max(1e-3, window - overlap)
+    windows: List[Tuple[float, float]] = []
+    start = 0.0
+    while start < video_duration_sec and len(windows) < max_windows:
+        end = min(video_duration_sec, start + window)
+        windows.append((round(start, 3), round(end, 3)))
+        start += step
+    return windows
+
+
+def _extract_segment(
+    input_path: str,
+    output_path: Path,
+    start: float,
+    duration: float,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            input_path,
+            "-t",
+            f"{duration:.3f}",
+            "-c",
+            "copy",
+            str(output_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg segment extraction failed: {result.stderr.strip()}"
+        )
+
+
+def _collect_window_samples(
+    input_video_path: str,
+    *,
+    fps: int,
+    model: YOLO,
+    tracker: str,
+    job_id: str,
+    tracking_started_at: float,
+    tracking_timeout_seconds: int,
+) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, Any]]]]:
+    cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open video for tracking")
+
+    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if orig_fps <= 0:
+        orig_fps = 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_interval = max(1, int(round(orig_fps / float(fps))))
+    total_samples = max(1, int(np.ceil(total_frames / frame_interval)))
+
+    samples: List[Dict[str, Any]] = []
+    track_map: Dict[int, List[Dict[str, Any]]] = {}
+
+    frame_index = 0
+    processed_samples = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_index % frame_interval != 0:
+                frame_index += 1
+                continue
+
+            height, width = frame.shape[:2]
+            timestamp = frame_index / float(orig_fps)
+            results = model.track(
+                source=frame,
+                persist=True,
+                tracker=tracker,
+                conf=0.25,
+                iou=0.5,
+                classes=[0],
+                verbose=False,
+            )
+            detections: List[Dict[str, Any]] = []
+            if results:
+                boxes = results[0].boxes
+                if boxes is not None and boxes.xyxy is not None:
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
+                    ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+                    for idx in range(len(xyxy)):
+                        if idx >= len(ids):
+                            continue
+                        track_id = ids[idx]
+                        if track_id is None:
+                            continue
+                        bbox_norm = _bbox_xyxy_to_xywh_norm(
+                            tuple(xyxy[idx]), width, height
+                        )
+                        detection = {
+                            "track_id": int(track_id),
+                            "bbox": {
+                                "x": bbox_norm[0],
+                                "y": bbox_norm[1],
+                                "w": bbox_norm[2],
+                                "h": bbox_norm[3],
+                            },
+                            "conf": float(confs[idx]) if idx < len(confs) else 0.0,
+                        }
+                        detections.append(detection)
+                        track_map.setdefault(int(track_id), []).append(
+                            {
+                                "t": float(timestamp),
+                                "bbox": detection["bbox"],
+                                "conf": detection["conf"],
+                                "sample_index": processed_samples,
+                            }
+                        )
+
+            samples.append({"t": float(timestamp), "detections": detections})
+            processed_samples += 1
+            now = time.monotonic()
+            if now - tracking_started_at > tracking_timeout_seconds:
+                _mark_tracking_timeout(
+                    job_id,
+                    tracking_timeout_seconds,
+                    now - tracking_started_at,
+                )
+                raise TrackingTimeoutError("Tracking timeout exceeded")
+
+            frame_index += 1
+    finally:
+        cap.release()
+
+    if not samples:
+        raise RuntimeError("No frames sampled for tracking")
+
+    return samples, track_map
+
+
+def _build_window_bboxes(
+    samples: List[Dict[str, Any]],
+    selected_track_id: Optional[int],
+    *,
+    fps: int,
+    time_offset: float,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]], Optional[Dict[str, float]]]:
+    bboxes: List[Dict[str, float]] = []
+    lost_segments: List[Dict[str, float]] = []
+    missing_count = 0
+    missing_threshold = max(1, int(round(2 * fps)))
+    first_missing_time = None
+    last_missing_time = None
+    smoothed: Optional[Dict[str, float]] = None
+    last_good_bbox: Optional[Dict[str, float]] = None
+
+    for sample in samples:
+        timestamp = float(sample["t"]) + time_offset
+        detections = sample["detections"]
+        selected_detection = None
+        if selected_track_id is not None:
+            for det in detections:
+                if det["track_id"] == selected_track_id:
+                    selected_detection = det
+                    break
+
+        if selected_detection is None:
+            missing_count += 1
+            if missing_count == 1:
+                first_missing_time = timestamp
+            last_missing_time = timestamp
+            if missing_count == missing_threshold:
+                pass
+        else:
+            if missing_count >= missing_threshold and first_missing_time is not None:
+                lost_segments.append(
+                    {
+                        "start": float(first_missing_time),
+                        "end": float(last_missing_time or timestamp),
+                    }
+                )
+            missing_count = 0
+            first_missing_time = None
+            last_missing_time = None
+
+            bbox = dict(selected_detection["bbox"])
+            bbox = _smooth_bbox(smoothed, bbox)
+            smoothed = bbox
+            bboxes.append(
+                {
+                    "t": float(timestamp),
+                    "x": bbox["x"],
+                    "y": bbox["y"],
+                    "w": bbox["w"],
+                    "h": bbox["h"],
+                    "conf": float(selected_detection.get("conf", 0.0)),
+                }
+            )
+            last_good_bbox = bbox
+
+    if missing_count >= missing_threshold and first_missing_time is not None:
+        lost_segments.append(
+            {
+                "start": float(first_missing_time),
+                "end": float(last_missing_time or (samples[-1]["t"] + time_offset)),
+            }
+        )
+
+    return bboxes, lost_segments, last_good_bbox
+
+
 def track_player(
     job_id: str,
     input_video_path: str,
@@ -392,6 +627,7 @@ def track_player(
     end_pct = 40
     tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
     tracking_started_at = time.monotonic()
+    model = YOLO(detector_model)
 
     frame_index = 0
     try:
@@ -626,6 +862,209 @@ def track_player(
         "lost_segments": lost_segments,
         "anchors_used": {"player_ref": player_ref_norm, "selections": selections},
         "notes": "; ".join(notes) if notes else "",
+    }
+
+    tracking_dir = Path("/tmp/fnh_jobs") / job_id / "tracking"
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    tracking_path = tracking_dir / "tracking.json"
+    with tracking_path.open("w", encoding="utf-8") as handle:
+        json.dump(tracking_output, handle, ensure_ascii=False, indent=2)
+
+    s3_internal = _get_s3_client(s3_endpoint_url)
+    _ensure_bucket_exists(s3_internal, s3_bucket)
+    tracking_key = f"jobs/{job_id}/tracking/tracking.json"
+    _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
+    tracking_url = _presign_get_object(s3_bucket, tracking_key, expires_seconds)
+
+    tracking_output["tracking_key"] = tracking_key
+    tracking_output["tracking_url"] = tracking_url
+
+    return tracking_output
+
+
+def track_player_windowed(
+    job_id: str,
+    input_video_path: str,
+    player_ref: dict,
+    selections: List[Dict[str, Any]],
+    *,
+    video_duration_sec: float,
+    window_sec: float = 45.0,
+    overlap_sec: float = 10.0,
+    fps: int = 5,
+    detector_model: str = "yolo11s.pt",
+    tracker: str = "bytetrack.yaml",
+    max_windows: int = 200,
+) -> Dict[str, Any]:
+    player_ref_norm = _normalize_player_ref(player_ref)
+    if player_ref_norm is None:
+        raise RuntimeError("Missing player_ref for tracking")
+
+    s3_endpoint_url = S3_ENDPOINT_URL
+    s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
+    s3_secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
+    s3_bucket = os.environ.get("S3_BUCKET", "").strip()
+    expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
+    s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
+
+    if (
+        not s3_endpoint_url
+        or not s3_public_endpoint_url
+        or not s3_access_key
+        or not s3_secret_key
+        or not s3_bucket
+    ):
+        raise RuntimeError(
+            "Missing S3 env vars: S3_ENDPOINT_URL, S3_PUBLIC_ENDPOINT_URL, "
+            "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
+        )
+
+    if video_duration_sec <= 0:
+        cap = cv2.VideoCapture(str(input_video_path))
+        if cap.isOpened():
+            fps_probe = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+            cap.release()
+            if fps_probe > 0:
+                video_duration_sec = float(frame_count) / float(fps_probe)
+
+    windows = iter_windows(
+        float(video_duration_sec),
+        window=window_sec,
+        overlap=overlap_sec,
+        max_windows=max_windows,
+    )
+    if not windows:
+        raise RuntimeError("No windows available for tracking")
+
+    tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
+    tracking_started_at = time.monotonic()
+
+    segments: List[Dict[str, Any]] = []
+    prev_bbox_abs: Optional[Dict[str, float]] = {
+        "x": float(player_ref_norm.get("x", 0.0)),
+        "y": float(player_ref_norm.get("y", 0.0)),
+        "w": float(player_ref_norm.get("w", 0.0)),
+        "h": float(player_ref_norm.get("h", 0.0)),
+    }
+    tracked_seconds_total = 0.0
+    segments_with_player = 0
+
+    windows_dir = Path("/tmp/fnh_jobs") / job_id / "tracking" / "windows"
+    windows_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, (window_start, window_end) in enumerate(windows, start=1):
+        window_duration = max(0.0, window_end - window_start)
+        segment_path = windows_dir / f"window_{idx:04d}.mp4"
+        try:
+            _extract_segment(
+                input_video_path,
+                segment_path,
+                window_start,
+                window_duration,
+            )
+            samples, track_map = _collect_window_samples(
+                str(segment_path),
+                fps=fps,
+                model=model,
+                tracker=tracker,
+                job_id=job_id,
+                tracking_started_at=tracking_started_at,
+                tracking_timeout_seconds=tracking_timeout_seconds,
+            )
+            if hasattr(model, "reset"):
+                model.reset()
+        except Exception:
+            samples = []
+            track_map = {}
+
+        selected_track_id: Optional[int] = None
+        best_score = 0.0
+        if prev_bbox_abs is not None and track_map:
+            for track_id, detections in track_map.items():
+                if not detections:
+                    continue
+                closest = min(detections, key=lambda d: abs(d.get("t", 0.0)))
+                candidate_bbox = closest["bbox"]
+                iou = _bbox_iou(prev_bbox_abs, candidate_bbox)
+                size_penalty = _size_aspect_penalty(prev_bbox_abs, candidate_bbox)
+                score = iou - 0.2 * size_penalty
+                if score > best_score:
+                    best_score = score
+                    selected_track_id = int(track_id)
+        if best_score < 0.15:
+            selected_track_id = None
+
+        if samples and selected_track_id is not None:
+            bboxes, lost_segments, last_good_bbox = _build_window_bboxes(
+                samples,
+                selected_track_id,
+                fps=fps,
+                time_offset=window_start,
+            )
+        else:
+            bboxes = []
+            lost_segments = []
+            last_good_bbox = None
+
+        coverage_pct = (
+            (len(bboxes) / float(len(samples))) * 100.0 if samples else 0.0
+        )
+        if bboxes:
+            tracked_seconds_total += len(bboxes) / float(max(1, fps))
+            segments_with_player += 1
+            prev_bbox_abs = last_good_bbox or prev_bbox_abs
+
+        segments.append(
+            {
+                "window_start": float(window_start),
+                "window_end": float(window_end),
+                "selected_track_id": selected_track_id,
+                "reacquire_score": round(float(best_score), 4),
+                "coverage_pct": round(float(coverage_pct), 2),
+                "lost_segments": lost_segments,
+                "bboxes": bboxes,
+            }
+        )
+
+        if idx % 5 == 0 or idx == len(windows):
+            pct = 10 + int((idx / float(len(windows))) * 30)
+            _update_tracking_progress(job_id, pct, "Tracking player (windowed)")
+
+    total_duration = float(video_duration_sec) if video_duration_sec else windows[-1][1]
+    coverage_pct_total = (
+        (tracked_seconds_total / total_duration) * 100.0 if total_duration > 0 else 0.0
+    )
+    coverage_pct_total = max(0.0, min(100.0, coverage_pct_total))
+
+    valid_intervals = [
+        (seg["window_start"], seg["window_end"])
+        for seg in segments
+        if seg.get("bboxes")
+    ]
+    valid_intervals.sort(key=lambda item: item[0])
+    largest_gap_sec = 0.0
+    cursor = 0.0
+    for start, end in valid_intervals:
+        if start > cursor:
+            largest_gap_sec = max(largest_gap_sec, start - cursor)
+        cursor = max(cursor, end)
+    if total_duration > cursor:
+        largest_gap_sec = max(largest_gap_sec, total_duration - cursor)
+
+    tracking_output: Dict[str, Any] = {
+        "mode": "full_match_windowed",
+        "method": "yolo+bytetrack",
+        "fps": fps,
+        "window_sec": window_sec,
+        "overlap_sec": overlap_sec,
+        "segments": segments,
+        "segments_total": len(segments),
+        "segments_with_player": segments_with_player,
+        "coverage_pct_total": round(coverage_pct_total, 2),
+        "largest_gap_sec": round(float(largest_gap_sec), 2),
+        "coverage_pct": round(coverage_pct_total, 2),
+        "anchors_used": {"player_ref": player_ref_norm, "selections": selections},
     }
 
     tracking_dir = Path("/tmp/fnh_jobs") / job_id / "tracking"

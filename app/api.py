@@ -715,6 +715,8 @@ def create_job(
             "selections": [],
             "tracking": {"status": "PENDING"},
         }
+        if payload.full_match_mode is not None:
+            target["full_match_mode"] = bool(payload.full_match_mode)
 
         job = AnalysisJob(
             id=job_id,

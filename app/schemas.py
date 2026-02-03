@@ -12,6 +12,7 @@ class JobCreate(BaseModel):
     team_name: str = Field(min_length=1)
     player_name: Optional[str] = None
     shirt_number: Optional[int] = Field(default=None, ge=0, le=99)
+    full_match_mode: Optional[bool] = None
 
     @model_validator(mode="after")
     def require_video_source(self) -> "JobCreate":
