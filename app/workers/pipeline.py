@@ -54,10 +54,290 @@ def _cleanup_workdir(base_dir: Optional[Path]) -> None:
 
 def _preview_frame_count() -> int:
     try:
-        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "16"))
+        preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "32"))
     except ValueError:
-        preview_count = 16
-    return max(1, preview_count)
+        preview_count = 32
+    preview_count = max(1, preview_count)
+    preview_count = max(32, preview_count)
+    return min(48, preview_count)
+
+
+def _preview_confidence_threshold() -> float:
+    try:
+        threshold = float(os.environ.get("PREVIEW_CONFIDENCE_THRESHOLD", "0.3"))
+    except ValueError:
+        threshold = 0.3
+    return max(0.0, min(1.0, threshold))
+
+
+def _preview_time_epsilon_from_fps(fps: float | None) -> float:
+    if not fps or fps <= 0:
+        return 0.5
+    return max(0.25, 1.5 / float(fps))
+
+
+def _collect_tracking_bboxes(tracking_output: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not isinstance(tracking_output, dict):
+        return []
+    if tracking_output.get("segments"):
+        bboxes: List[Dict[str, Any]] = []
+        for segment in tracking_output.get("segments") or []:
+            if not isinstance(segment, dict):
+                continue
+            for bbox in segment.get("bboxes") or []:
+                if isinstance(bbox, dict):
+                    bboxes.append(bbox)
+        return bboxes
+    bboxes = tracking_output.get("bboxes") or []
+    return [bbox for bbox in bboxes if isinstance(bbox, dict)]
+
+
+def _collect_lost_segments(tracking_output: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not isinstance(tracking_output, dict):
+        return []
+    if tracking_output.get("segments"):
+        segments: List[Dict[str, Any]] = []
+        for segment in tracking_output.get("segments") or []:
+            if not isinstance(segment, dict):
+                continue
+            segments.extend(segment.get("lost_segments") or [])
+        return [seg for seg in segments if isinstance(seg, dict)]
+    lost_segments = tracking_output.get("lost_segments") or []
+    return [seg for seg in lost_segments if isinstance(seg, dict)]
+
+
+def _normalize_time(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_target_times(target: Dict[str, Any] | None) -> List[float]:
+    if not isinstance(target, dict):
+        return []
+    times: List[float] = []
+    selection = target.get("selection")
+    if isinstance(selection, dict):
+        for key in ("time_sec", "frame_time_sec"):
+            time_val = _normalize_time(selection.get(key))
+            if time_val is not None:
+                times.append(time_val)
+                break
+    for sel in target.get("selections") or []:
+        if not isinstance(sel, dict):
+            continue
+        time_val = _normalize_time(sel.get("time_sec") or sel.get("frame_time_sec"))
+        if time_val is not None:
+            times.append(time_val)
+    return times
+
+
+def _collect_player_ref_times(player_ref: Dict[str, Any] | None) -> List[float]:
+    if not isinstance(player_ref, dict):
+        return []
+    times: List[float] = []
+    for key in ("t", "best_time_sec", "time_sec"):
+        time_val = _normalize_time(player_ref.get(key))
+        if time_val is not None:
+            times.append(time_val)
+            break
+    for frame in player_ref.get("sample_frames") or []:
+        if not isinstance(frame, dict):
+            continue
+        time_val = _normalize_time(frame.get("time_sec"))
+        if time_val is not None:
+            times.append(time_val)
+    return times
+
+
+def _select_tracking_preview_candidates(
+    *,
+    tracking_output: Dict[str, Any] | None,
+    player_ref: Dict[str, Any] | None,
+    target: Dict[str, Any] | None,
+    max_frames: int,
+) -> List[Dict[str, Any]]:
+    bboxes = _collect_tracking_bboxes(tracking_output)
+    fps = None
+    if isinstance(tracking_output, dict):
+        fps = tracking_output.get("fps")
+    epsilon = _preview_time_epsilon_from_fps(
+        float(fps) if isinstance(fps, (int, float)) else None
+    )
+    conf_threshold = _preview_confidence_threshold()
+    filtered_bboxes = [
+        bbox
+        for bbox in bboxes
+        if _normalize_time(bbox.get("t")) is not None
+        and float(bbox.get("conf", 0.0)) >= conf_threshold
+    ]
+    filtered_bboxes.sort(key=lambda item: float(item.get("t", 0.0)))
+
+    def _closest_bbox(time_sec: float) -> Optional[Dict[str, Any]]:
+        if not filtered_bboxes:
+            return None
+        closest = min(
+            filtered_bboxes,
+            key=lambda item: abs(float(item.get("t", 0.0)) - time_sec),
+        )
+        if abs(float(closest.get("t", 0.0)) - time_sec) <= epsilon:
+            return closest
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+
+    def _merge_candidate(
+        time_sec: float,
+        *,
+        bbox: Optional[Dict[str, Any]],
+        is_target: bool = False,
+        is_reacquire: bool = False,
+    ) -> None:
+        has_player = bbox is not None
+        if not (has_player or is_target):
+            return
+        for existing in candidates:
+            if abs(existing["time_sec"] - time_sec) <= epsilon:
+                existing["is_target"] = existing["is_target"] or is_target
+                existing["is_reacquire"] = existing["is_reacquire"] or is_reacquire
+                if bbox is not None and existing.get("bbox") is None:
+                    existing["bbox"] = bbox
+                    existing["confidence"] = float(bbox.get("conf", 0.0))
+                    existing["has_player"] = True
+                if bbox is not None and float(bbox.get("conf", 0.0)) > existing.get(
+                    "confidence", 0.0
+                ):
+                    existing["bbox"] = bbox
+                    existing["confidence"] = float(bbox.get("conf", 0.0))
+                    existing["has_player"] = True
+                return
+        candidates.append(
+            {
+                "time_sec": float(time_sec),
+                "bbox": bbox,
+                "confidence": float(bbox.get("conf", 0.0)) if bbox else 0.0,
+                "has_player": has_player,
+                "is_target": is_target,
+                "is_reacquire": is_reacquire,
+            }
+        )
+
+    for time_sec in _collect_target_times(target):
+        bbox = _closest_bbox(time_sec)
+        _merge_candidate(time_sec, bbox=bbox, is_target=True)
+
+    for time_sec in _collect_player_ref_times(player_ref):
+        bbox = _closest_bbox(time_sec)
+        if bbox is None:
+            continue
+        _merge_candidate(time_sec, bbox=bbox)
+
+    lost_segments = _collect_lost_segments(tracking_output)
+    if lost_segments and filtered_bboxes:
+        for segment in lost_segments:
+            end_time = _normalize_time(segment.get("end"))
+            if end_time is None:
+                continue
+            reacquire_bbox = next(
+                (
+                    bbox
+                    for bbox in filtered_bboxes
+                    if float(bbox.get("t", 0.0)) >= end_time
+                ),
+                None,
+            )
+            if reacquire_bbox is None:
+                continue
+            _merge_candidate(
+                float(reacquire_bbox.get("t", 0.0)),
+                bbox=reacquire_bbox,
+                is_reacquire=True,
+            )
+
+    for bbox in sorted(
+        filtered_bboxes, key=lambda item: float(item.get("conf", 0.0)), reverse=True
+    ):
+        if len(candidates) >= max_frames:
+            break
+        time_sec = float(bbox.get("t", 0.0))
+        _merge_candidate(time_sec, bbox=bbox)
+
+    def _rank(candidate: Dict[str, Any]) -> Tuple[int, float, float]:
+        if candidate.get("is_target"):
+            tier = 0
+        elif candidate.get("is_reacquire"):
+            tier = 1
+        else:
+            tier = 2
+        return (
+            tier,
+            -float(candidate.get("confidence", 0.0)),
+            float(candidate.get("time_sec", 0.0)),
+        )
+
+    candidates.sort(key=_rank)
+    return candidates[:max_frames]
+
+
+def _generate_tracking_preview_frames(
+    *,
+    job_id: str,
+    input_path: Path,
+    frames_dir: Path,
+    s3_internal: Any,
+    s3_bucket: str,
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    preview_frames: List[Dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        time_sec = candidate.get("time_sec")
+        if time_sec is None:
+            continue
+        frame_name = f"frame_{index:04d}.jpg"
+        frame_path = frames_dir / frame_name
+        try:
+            _run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(time_sec),
+                    "-i",
+                    str(input_path),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(frame_path),
+                ]
+            )
+        except Exception:
+            logger.exception(
+                "Failed to extract preview frame job_id=%s time_sec=%s",
+                job_id,
+                time_sec,
+            )
+            continue
+
+        width, height = probe_image_dimensions(frame_path)
+        frame_key = f"jobs/{job_id}/frames/{frame_name}"
+        upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
+        preview_frames.append(
+            {
+                "time_sec": float(time_sec),
+                "bucket": s3_bucket,
+                "key": frame_key,
+                "width": width,
+                "height": height,
+                "has_player": bool(candidate.get("has_player")),
+                "is_target": bool(candidate.get("is_target")),
+                "tracks": [],
+            }
+        )
+    return preview_frames
 
 
 def _build_preview_timestamps(
@@ -2108,6 +2388,38 @@ def run_analysis(self, job_id: str):
                 },
             ),
         )
+
+        try:
+            preview_candidates = _select_tracking_preview_candidates(
+                tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
+                player_ref=player_ref if isinstance(player_ref, dict) else None,
+                target=target if isinstance(target, dict) else None,
+                max_frames=_preview_frame_count(),
+            )
+            if preview_candidates:
+                frames_dir = base_dir / "preview_frames"
+                if frames_dir.exists():
+                    shutil.rmtree(frames_dir, ignore_errors=True)
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                preview_frames = _generate_tracking_preview_frames(
+                    job_id=job_id,
+                    input_path=input_path,
+                    frames_dir=frames_dir,
+                    s3_internal=s3_internal,
+                    s3_bucket=s3_bucket,
+                    candidates=preview_candidates,
+                )
+                if preview_frames:
+                    update_job(
+                        db,
+                        job_id,
+                        lambda job: setattr(job, "preview_frames", preview_frames),
+                    )
+        except Exception:
+            logger.exception(
+                "Failed to update tracking-based preview frames job_id=%s",
+                job_id,
+            )
 
         # Extract visual features for scoring
         update_job(
