@@ -20,6 +20,7 @@ cp .env.example .env
 | `S3_REGION` | Region name for S3. |
 | `SIGNED_URL_EXPIRES_SECONDS` | Expiration for presigned URLs. |
 | `PREVIEW_FRAME_COUNT` | Number of preview frames to extract per job (default: 16). |
+| `FULL_MATCH_MODE` | Enable full-match windowed tracking (set to `1` to use 45s windows with 10s overlap). |
 
 **VPS example values**
 

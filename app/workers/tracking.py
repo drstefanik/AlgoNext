@@ -939,6 +939,7 @@ def track_player_windowed(
 
     tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
     tracking_started_at = time.monotonic()
+    model = YOLO(detector_model)
 
     segments: List[Dict[str, Any]] = []
     prev_bbox_abs: Optional[Dict[str, float]] = {
