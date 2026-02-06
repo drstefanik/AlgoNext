@@ -976,6 +976,11 @@ def job_diagnostic(job_id: str, request: Request, db: Session = Depends(get_db))
             "progress": normalize_payload(job.progress),
             "assets": assets_snapshot,
             "result_keys": result_keys,
+            "player_ref_set": _has_player_ref(job.player_ref),
+            "target_set": bool((job.target or {}).get("confirmed")),
+            "selections_count": len((job.target or {}).get("selections") or []),
+            "can_enqueue": _has_player_ref(job.player_ref)
+            and bool((job.target or {}).get("confirmed")),
         },
         request,
     )

@@ -46,6 +46,48 @@ class SelectionBox(BaseModel):
     w: float = Field(gt=0)
     h: float = Field(gt=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Missing selection payload")
+        frame_time_sec = data.get("frame_time_sec") or data.get("frameTimeSec")
+        if frame_time_sec is None:
+            raise ValueError("Missing selection frame_time_sec")
+
+        bbox = data.get("bbox_xywh")
+        if not isinstance(bbox, dict):
+            bbox = data.get("bbox")
+        if not isinstance(bbox, dict):
+            bbox = {
+                "x": data.get("x"),
+                "y": data.get("y"),
+                "w": data.get("w"),
+                "h": data.get("h"),
+            }
+        if not isinstance(bbox, dict) or not {"x", "y", "w", "h"}.issubset(bbox):
+            raise ValueError("Missing selection bbox")
+
+        bbox = PlayerRefPayload._validate_bbox_xywh(
+            {
+                "x": float(bbox["x"]),
+                "y": float(bbox["y"]),
+                "w": float(bbox["w"]),
+                "h": float(bbox["h"]),
+            }
+        )
+
+        frame_key = data.get("frame_key") or data.get("frameKey")
+
+        return {
+            "frame_time_sec": float(frame_time_sec),
+            "frame_key": frame_key,
+            "x": bbox["x"],
+            "y": bbox["y"],
+            "w": bbox["w"],
+            "h": bbox["h"],
+        }
+
 
 class SelectionPayload(BaseModel):
     selections: conlist(SelectionBox, min_length=1, max_length=5)
