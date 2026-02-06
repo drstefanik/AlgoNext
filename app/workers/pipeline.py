@@ -1,4 +1,5 @@
 import os
+import math
 import traceback
 import time
 import json
@@ -23,7 +24,12 @@ from app.workers.celery_app import celery
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.core.scoring import ROLE_WEIGHTS, compute_evaluation, keys_required_for_role
+from app.core.scoring import (
+    DEFAULT_WEIGHTS,
+    ROLE_WEIGHTS,
+    compute_evaluation,
+    keys_required_for_role,
+)
 from app.workers.tracking import (
     TrackingTimeoutError,
     track_all_players,
@@ -33,6 +39,10 @@ from app.workers.tracking import (
 )
 
 logger = logging.getLogger(__name__)
+
+PITCH_LENGTH_M = 105.0
+PITCH_WIDTH_M = 68.0
+SPRINT_THRESHOLD_KMH = float(os.environ.get("SPRINT_THRESHOLD_KMH", "25"))
 
 
 class AnalysisError(RuntimeError):
@@ -104,6 +114,109 @@ def _collect_lost_segments(tracking_output: Dict[str, Any] | None) -> List[Dict[
         return [seg for seg in segments if isinstance(seg, dict)]
     lost_segments = tracking_output.get("lost_segments") or []
     return [seg for seg in lost_segments if isinstance(seg, dict)]
+
+
+def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[str, Any]:
+    bboxes = _collect_tracking_bboxes(tracking_output)
+    if not bboxes:
+        return {
+            "distance_covered_m": 0.0,
+            "avg_speed_kmh": 0.0,
+            "top_speed_kmh": 0.0,
+            "sprints_count": 0,
+        }
+
+    fps = None
+    if isinstance(tracking_output, dict):
+        try:
+            fps = float(tracking_output.get("fps")) if tracking_output.get("fps") else None
+        except (TypeError, ValueError):
+            fps = None
+
+    points: List[Tuple[float, float, float]] = []
+    for idx, bbox in enumerate(bboxes):
+        if not isinstance(bbox, dict):
+            continue
+        t = _normalize_time(bbox.get("t"))
+        if t is None and fps:
+            t = idx / float(fps)
+        if t is None:
+            continue
+        try:
+            cx = float(bbox.get("x", 0.0)) + float(bbox.get("w", 0.0)) / 2.0
+            cy = float(bbox.get("y", 0.0)) + float(bbox.get("h", 0.0)) / 2.0
+        except (TypeError, ValueError):
+            continue
+        cx = max(0.0, min(1.0, cx))
+        cy = max(0.0, min(1.0, cy))
+        points.append((float(t), cx * PITCH_LENGTH_M, cy * PITCH_WIDTH_M))
+
+    if len(points) < 2:
+        return {
+            "distance_covered_m": 0.0,
+            "avg_speed_kmh": 0.0,
+            "top_speed_kmh": 0.0,
+            "sprints_count": 0,
+        }
+
+    points.sort(key=lambda item: item[0])
+    total_distance = 0.0
+    top_speed_kmh = 0.0
+    sprints_count = 0
+    prev_above = False
+
+    for idx in range(1, len(points)):
+        t0, x0, y0 = points[idx - 1]
+        t1, x1, y1 = points[idx]
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        dist = math.hypot(x1 - x0, y1 - y0)
+        total_distance += dist
+        speed_kmh = (dist / dt) * 3.6
+        top_speed_kmh = max(top_speed_kmh, speed_kmh)
+        above = speed_kmh >= SPRINT_THRESHOLD_KMH
+        if above and not prev_above:
+            sprints_count += 1
+        prev_above = above
+
+    total_time = points[-1][0] - points[0][0]
+    avg_speed_kmh = (total_distance / total_time) * 3.6 if total_time > 0 else 0.0
+
+    return {
+        "distance_covered_m": round(total_distance, 2),
+        "avg_speed_kmh": round(avg_speed_kmh, 2),
+        "top_speed_kmh": round(top_speed_kmh, 2),
+        "sprints_count": sprints_count,
+    }
+
+
+def _build_explain_text(
+    role: str,
+    radar: Dict[str, Any],
+    evidence_metrics: Dict[str, Any],
+    tracking_output: Dict[str, Any] | None,
+) -> str:
+    weights = ROLE_WEIGHTS.get(role, DEFAULT_WEIGHTS)
+    weights_text = ", ".join(
+        f"{key}={float(value):.2f}" for key, value in weights.items()
+    )
+    tracking_note = (
+        "Tracking signals derived from bbox centers (coverage, lost segments, kinematics)."
+        if tracking_output
+        else "Tracking signals unavailable; defaults used where needed."
+    )
+    evidence_note = (
+        f"Evidence metrics from bbox-center deltas mapped to {PITCH_LENGTH_M:.0f}x{PITCH_WIDTH_M:.0f}m "
+        f"pitch proxy; sprint threshold {SPRINT_THRESHOLD_KMH:.1f} km/h."
+    )
+    radar_keys = ", ".join(sorted(radar.keys())) if radar else "none"
+    return (
+        "Signals used: visual scene/motion features + tracking kinematics; no ball/event data. "
+        f"Radar dimensions: {radar_keys}. Scores normalized to 0-100. "
+        f"Overall score is weighted average by role ({weights_text}). "
+        f"{tracking_note} {evidence_note}"
+    )
 
 
 def _normalize_time(value: Any) -> Optional[float]:
@@ -2516,6 +2629,15 @@ def run_analysis(self, job_id: str):
             role_score = float(overall)
         if not radar:
             radar = {"tracking_quality": 0.0, "activity_proxy": 0.0, "visibility": 0.0, "consistency": 0.0}
+        evidence_metrics = _compute_evidence_metrics(
+            tracking_output if isinstance(tracking_output, dict) else None
+        )
+        explain_text = _build_explain_text(
+            role,
+            radar,
+            evidence_metrics,
+            tracking_output if isinstance(tracking_output, dict) else None,
+        )
 
         # Final result
         update_job(
@@ -2582,6 +2704,8 @@ def run_analysis(self, job_id: str):
                 video_features=video_features,
                 tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
             )
+            report["explain"] = explain_text
+            report["evidence_metrics"] = evidence_metrics
             player_runs = (
                 existing_result.get("player_runs")
                 if isinstance(existing_result, dict)
@@ -2620,6 +2744,9 @@ def run_analysis(self, job_id: str):
                 "role_score": role_score,
                 "roleScore": role_score,
                 "radar": radar,
+                "breakdown": radar,
+                "explain": explain_text,
+                "evidence_metrics": evidence_metrics,
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,
                 "skills_missing": skills_missing,

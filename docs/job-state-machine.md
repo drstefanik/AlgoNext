@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | Create job | `POST /jobs` | Creates job in `WAITING_FOR_SELECTION` and enqueues preview extraction. |
 | Get job | `GET /jobs/{job_id}` | Returns status, progress, target, player_ref, results, etc. |
+| Preview frames | `GET /jobs/{job_id}/frames` or `GET /jobs/{job_id}/frames/list` | Returns preview frames with signed URLs (`data.items[]`). |
 | Candidates | `GET /jobs/{job_id}/candidates` | Returns autodetection status + candidate tracks. |
 | Select track | `POST /jobs/{job_id}/select-track` | Saves `player_ref` and moves to `WAITING_FOR_TARGET` (does not auto-create target). |
 | Select target | `POST /jobs/{job_id}/select-target` | Saves confirmed target (including `frame_key`) and moves to `READY_TO_ENQUEUE`. |
@@ -73,10 +74,31 @@ If any prerequisite is missing, the endpoint returns `400`:
 When a target is saved (select-target or save target), the backend persists:
 
 - `target.confirmed: true`
-- `target.selections[]` with `frame_time_sec` and `bbox`
+- `target.selections[]` with `frame_time_sec`, `x`, `y`, `w`, `h` (no `bbox_xywh` wrapper)
 - `frame_key` is stored when available to avoid float-only matching
 
 This ensures the job can be enqueued as soon as all prerequisites are met.
+
+## Preview frames payload
+
+`GET /jobs/{job_id}/frames` or `GET /jobs/{job_id}/frames/list` returns:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "items": [
+      {
+        "time_sec": 12.4,
+        "signed_url": "https://...",
+        "width": 1280,
+        "height": 720,
+        "key": "jobs/<job_id>/frames/frame_0001.jpg"
+      }
+    ]
+  }
+}
+```
 
 ## Payload examples
 
@@ -133,6 +155,13 @@ Response includes `player_ref` (snake_case) and `playerRef` (alias), plus `playe
     "radar": {
       "coverage": 78.4,
       "stability": 90.0
+    },
+    "explain": "Signals used: ...",
+    "evidence_metrics": {
+      "distance_covered_m": 1280.4,
+      "avg_speed_kmh": 7.8,
+      "top_speed_kmh": 24.6,
+      "sprints_count": 3
     }
   }
 }
