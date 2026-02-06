@@ -116,9 +116,89 @@ def compute_scores(role: str, radar: Dict[str, Any]) -> Dict[str, Optional[float
     return {"overall_score": rounded, "role_score": rounded}
 
 
-def _fallback_radar_from_tracking(tracking: Dict[str, Any] | None) -> Dict[str, float]:
+def _fallback_radar_from_tracking(
+    tracking: Dict[str, Any] | None, evidence_metrics: Dict[str, Any] | None
+) -> Dict[str, float]:
     def clamp(value: float) -> float:
         return max(0.0, min(100.0, value))
+
+    def normalize(value: float | None, max_value: float) -> float | None:
+        if value is None:
+            return None
+        if max_value <= 0:
+            return None
+        return clamp((float(value) / max_value) * 100.0)
+
+    def has_metric(values: List[float | None]) -> bool:
+        return any(value is not None and value > 0 for value in values)
+
+    distance_m = None
+    avg_speed_kmh = None
+    top_speed_kmh = None
+    if isinstance(evidence_metrics, dict):
+        distance_m = evidence_metrics.get("distance_covered_m")
+        avg_speed_kmh = evidence_metrics.get("avg_speed_kmh")
+        top_speed_kmh = evidence_metrics.get("top_speed_kmh")
+
+    coverage_pct = None
+    stability_score = None
+    lost_segments = []
+    if isinstance(tracking, dict):
+        coverage_pct = tracking.get("coverage_pct")
+        stability_score = tracking.get("stability_score")
+        lost_segments = tracking.get("lost_segments") or []
+
+    visibility_score = None
+    if coverage_pct is not None:
+        try:
+            visibility_score = clamp(float(coverage_pct))
+        except (TypeError, ValueError):
+            visibility_score = None
+
+    stability_value = None
+    if stability_score is not None:
+        try:
+            stability_value = clamp(float(stability_score) * 100.0)
+        except (TypeError, ValueError):
+            stability_value = None
+    if stability_value is None and isinstance(lost_segments, list):
+        stability_penalty = min(100.0, float(len(lost_segments)) * 10.0)
+        stability_value = max(0.0, 100.0 - stability_penalty)
+
+    distance_score = None
+    avg_speed_score = None
+    top_speed_score = None
+    try:
+        if distance_m is not None:
+            distance_score = normalize(float(distance_m), 1500.0)
+    except (TypeError, ValueError):
+        distance_score = None
+    try:
+        if avg_speed_kmh is not None:
+            avg_speed_score = normalize(float(avg_speed_kmh), 18.0)
+    except (TypeError, ValueError):
+        avg_speed_score = None
+    try:
+        if top_speed_kmh is not None:
+            top_speed_score = normalize(float(top_speed_kmh), 28.0)
+    except (TypeError, ValueError):
+        top_speed_score = None
+
+    if has_metric(
+        [distance_score, avg_speed_score, top_speed_score, visibility_score, stability_value]
+    ):
+        radar: Dict[str, float] = {}
+        if distance_score is not None:
+            radar["distance_covered"] = distance_score
+        if avg_speed_score is not None:
+            radar["avg_speed"] = avg_speed_score
+        if top_speed_score is not None:
+            radar["top_speed"] = top_speed_score
+        if visibility_score is not None:
+            radar["visibility"] = visibility_score
+        if stability_value is not None:
+            radar["stability"] = clamp(stability_value)
+        return radar
 
     if not isinstance(tracking, dict):
         return {
@@ -189,7 +269,10 @@ def _average_radar_score(radar: Dict[str, float]) -> float:
 
 
 def compute_evaluation(
-    role: str, radar: Dict[str, Any], tracking: Dict[str, Any] | None
+    role: str,
+    radar: Dict[str, Any],
+    tracking: Dict[str, Any] | None,
+    evidence_metrics: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     sanitized_radar = {}
     for key, value in (radar or {}).items():
@@ -200,7 +283,7 @@ def compute_evaluation(
         except (TypeError, ValueError):
             continue
     if not sanitized_radar:
-        sanitized_radar = _fallback_radar_from_tracking(tracking)
+        sanitized_radar = _fallback_radar_from_tracking(tracking, evidence_metrics)
     score_payload = compute_scores(role, sanitized_radar)
     overall = score_payload.get("overall_score")
     role_score = score_payload.get("role_score")

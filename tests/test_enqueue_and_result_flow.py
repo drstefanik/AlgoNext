@@ -115,9 +115,19 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
         self.assertTrue(response["ok"])
 
     def test_compute_evaluation_returns_scores(self):
-        tracking = {"coverage_pct": 72.5, "lost_segments": [{"start": 1, "end": 2}]}
+        tracking = {
+            "coverage_pct": 72.5,
+            "lost_segments": [{"start": 1, "end": 2}],
+        }
+        evidence_metrics = {
+            "distance_covered_m": 320.0,
+            "avg_speed_kmh": 11.5,
+            "top_speed_kmh": 22.3,
+        }
 
-        evaluation = scoring.compute_evaluation("player", {}, tracking)
+        evaluation = scoring.compute_evaluation(
+            "player", {}, tracking, evidence_metrics
+        )
 
         self.assertIsNotNone(evaluation["overall_score"])
         self.assertIsNotNone(evaluation["role_score"])

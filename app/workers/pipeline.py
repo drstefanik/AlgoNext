@@ -191,6 +191,124 @@ def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[st
     }
 
 
+def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _select_best_candidate(
+    candidates: List[Dict[str, Any]] | None,
+) -> Dict[str, Any] | None:
+    if not candidates:
+        return None
+
+    def _tier_rank(tier: str | None) -> int:
+        if tier == "PRIMARY":
+            return 2
+        if tier == "SECONDARY":
+            return 1
+        return 0
+
+    best_candidate = None
+    best_rank: Tuple[float, ...] | None = None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        tier = candidate.get("tier")
+        stability = float(candidate.get("stability_score") or 0.0)
+        coverage = float(candidate.get("coverage_pct") or 0.0)
+        avg_box_area = float(candidate.get("avg_box_area") or 0.0)
+        sample_frames_count = len(candidate.get("sample_frames") or [])
+        rank = (
+            _tier_rank(tier),
+            stability,
+            coverage,
+            avg_box_area,
+            sample_frames_count,
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_candidate = candidate
+    return best_candidate
+
+
+def _compute_candidate_metrics(
+    candidates: List[Dict[str, Any]] | None,
+) -> Tuple[Dict[str, Any] | None, Dict[str, float] | None, float | None]:
+    best = _select_best_candidate(candidates)
+    if not best:
+        return None, None, None
+
+    coverage_pct = float(best.get("coverage_pct") or 0.0)
+    stability_score = float(best.get("stability_score") or 0.0)
+    avg_box_area = float(best.get("avg_box_area") or 0.0)
+    sample_frames_count = len(best.get("sample_frames") or [])
+    tier = best.get("tier") or "UNKNOWN"
+
+    tier_score = 1.0 if tier == "PRIMARY" else 0.7 if tier == "SECONDARY" else 0.5
+    tier_multiplier = 1.0 if tier == "PRIMARY" else 0.85
+
+    base_score = 20.0
+    score = base_score
+    score += _clamp_score(coverage_pct * 800.0, 0.0, 35.0)
+    score += _clamp_score(stability_score * 120.0, 0.0, 25.0)
+    score += _clamp_score(sample_frames_count * 2.0, 0.0, 10.0)
+    score *= tier_multiplier
+    overall_score = _clamp_score(score, 0.0, 100.0)
+
+    radar = {
+        "consistency": _clamp_score(stability_score * 100.0, 0.0, 100.0),
+        "visibility": _clamp_score(coverage_pct * 800.0, 0.0, 100.0),
+        "presence": _clamp_score(sample_frames_count * 10.0, 0.0, 100.0),
+        "box_quality": _clamp_score(avg_box_area * 5000.0, 0.0, 100.0),
+    }
+
+    metrics = {
+        "coveragePct": round(coverage_pct, 4),
+        "stabilityScore": round(stability_score, 3),
+        "avgBoxArea": round(avg_box_area, 6),
+        "sampleFramesCount": sample_frames_count,
+        "tier": tier_score,
+        "tierLabel": tier,
+    }
+    return metrics, radar, round(overall_score, 1)
+
+
+def _update_candidate_score_fields(
+    job: AnalysisJob,
+    candidate_overall: float | None,
+    candidate_radar: Dict[str, float] | None,
+    evidence_metrics: Dict[str, Any],
+    explain_text: str,
+) -> None:
+    existing_result = job.result or {}
+    updated_result = dict(existing_result) if isinstance(existing_result, dict) else {}
+    if evidence_metrics:
+        merged_evidence = {}
+        if isinstance(updated_result.get("evidence_metrics"), dict):
+            merged_evidence.update(updated_result.get("evidence_metrics") or {})
+        merged_evidence.update(evidence_metrics)
+        updated_result["evidence_metrics"] = merged_evidence
+    if candidate_overall is not None:
+        updated_result["overall_score"] = candidate_overall
+        updated_result["overallScore"] = candidate_overall
+        updated_result["role_score"] = candidate_overall
+        updated_result["roleScore"] = candidate_overall
+        updated_result["radar"] = candidate_radar or {}
+        updated_result["breakdown"] = candidate_radar or {}
+        updated_result["explain"] = explain_text
+    else:
+        if "overall_score" not in updated_result and "overallScore" not in updated_result:
+            updated_result["overall_score"] = 42
+            updated_result["overallScore"] = 42
+            updated_result["role_score"] = 42
+            updated_result["roleScore"] = 42
+        updated_result.setdefault("radar", candidate_radar or {})
+        updated_result.setdefault("breakdown", updated_result.get("radar") or {})
+        if not updated_result.get("explain"):
+            updated_result["explain"] = explain_text
+    job.result = updated_result
+
+
 def _build_explain_text(
     role: str,
     radar: Dict[str, Any],
@@ -1957,6 +2075,22 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             "autodetection_status": autodetection_status,
             "error_detail": error_detail,
         }
+        candidate_metrics = None
+        candidate_radar = None
+        candidate_overall = None
+        if autodetection_status == "READY":
+            (
+                candidate_metrics,
+                candidate_radar,
+                candidate_overall,
+            ) = _compute_candidate_metrics(candidates_list)
+        evidence_metrics = (
+            {"candidate_metrics": candidate_metrics} if candidate_metrics else {}
+        )
+        explain_text = (
+            "Score computed from candidate tracking stability + coverage + presence. "
+            "No ball/event data yet."
+        )
         update_job(
             db,
             job_id,
@@ -1974,6 +2108,13 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                         "primaryCount": primary_count,
                         "secondaryCount": secondary_count,
                     },
+                ),
+                _update_candidate_score_fields(
+                    job,
+                    candidate_overall,
+                    candidate_radar,
+                    evidence_metrics,
+                    explain_text,
                 ),
                 set_progress(
                     job, "CANDIDATES_READY", 22, "Candidate tracks ready"
@@ -2619,7 +2760,10 @@ def run_analysis(self, job_id: str):
 
         skills_computed, skills_missing = compute_skill_scores(video_features)
         radar = {k: v for k, v in skills_computed.items() if v is not None}
-        evaluation = compute_evaluation(role, radar, tracking_output)
+        evidence_metrics = _compute_evidence_metrics(
+            tracking_output if isinstance(tracking_output, dict) else None
+        )
+        evaluation = compute_evaluation(role, radar, tracking_output, evidence_metrics)
         overall = evaluation.get("overall_score")
         role_score = evaluation.get("role_score")
         radar = evaluation.get("radar") or {}
@@ -2629,9 +2773,6 @@ def run_analysis(self, job_id: str):
             role_score = float(overall)
         if not radar:
             radar = {"tracking_quality": 0.0, "activity_proxy": 0.0, "visibility": 0.0, "consistency": 0.0}
-        evidence_metrics = _compute_evidence_metrics(
-            tracking_output if isinstance(tracking_output, dict) else None
-        )
         explain_text = _build_explain_text(
             role,
             radar,
@@ -2648,6 +2789,12 @@ def run_analysis(self, job_id: str):
 
         def finalize_job(job: AnalysisJob) -> None:
             existing_result = job.result or {}
+            merged_evidence_metrics = dict(evidence_metrics or {})
+            if isinstance(existing_result, dict) and isinstance(
+                existing_result.get("evidence_metrics"), dict
+            ):
+                for key, value in (existing_result.get("evidence_metrics") or {}).items():
+                    merged_evidence_metrics.setdefault(key, value)
 
             existing_assets = (
                 (existing_result.get("assets") or {})
@@ -2705,7 +2852,7 @@ def run_analysis(self, job_id: str):
                 tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
             )
             report["explain"] = explain_text
-            report["evidence_metrics"] = evidence_metrics
+            report["evidence_metrics"] = merged_evidence_metrics
             player_runs = (
                 existing_result.get("player_runs")
                 if isinstance(existing_result, dict)
@@ -2746,7 +2893,7 @@ def run_analysis(self, job_id: str):
                 "radar": radar,
                 "breakdown": radar,
                 "explain": explain_text,
-                "evidence_metrics": evidence_metrics,
+                "evidence_metrics": merged_evidence_metrics,
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,
                 "skills_missing": skills_missing,
