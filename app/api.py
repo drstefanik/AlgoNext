@@ -111,10 +111,23 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
         or result_payload.get("roleScore")
         or (result_payload.get("summary") or {}).get("role_score")
     )
+    explain = result_payload.get("explain") or (result_payload.get("report") or {}).get(
+        "explain"
+    )
+    evidence_metrics = (
+        result_payload.get("evidence_metrics")
+        or result_payload.get("evidenceMetrics")
+        or {}
+    )
     result = {
         "overallScore": overall,
+        "overall_score": overall,
         "roleScore": role_score,
+        "role_score": role_score,
         "radar": radar,
+        "breakdown": radar,
+        "explain": explain,
+        "evidence_metrics": evidence_metrics,
     }
 
     assets_payload = result_payload.get("assets") or {}
@@ -905,6 +918,64 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
             "result": result,
             "assets": assets,
             "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        },
+        request,
+    )
+
+
+@router.get("/jobs/{job_id}/diagnostic")
+def job_diagnostic(job_id: str, request: Request, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    result_payload = normalize_payload(job.result)
+    result_keys = list(result_payload.keys()) if isinstance(result_payload, dict) else []
+    assets_snapshot: Dict[str, Any] = {"bucket": None, "prefix": None, "count": 0, "keys": []}
+    try:
+        context = load_s3_context()
+        bucket = context["bucket"]
+        prefix = f"jobs/{job_id}/"
+        s3_internal = context["s3_internal"]
+        response = s3_internal.list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix,
+            MaxKeys=50,
+        )
+        contents = response.get("Contents") or []
+        assets_snapshot = {
+            "bucket": bucket,
+            "prefix": prefix,
+            "count": len(contents),
+            "keys": [item.get("Key") for item in contents if item.get("Key")],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "diagnostic snapshot failed job_id=%s error=%s",
+            job_id,
+            exc,
+        )
+        assets_snapshot = {
+            "bucket": assets_snapshot.get("bucket"),
+            "prefix": assets_snapshot.get("prefix"),
+            "count": assets_snapshot.get("count", 0),
+            "keys": assets_snapshot.get("keys", []),
+            "error": str(exc),
+        }
+
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": normalize_status(job.status),
+            "progress": normalize_payload(job.progress),
+            "assets": assets_snapshot,
+            "result_keys": result_keys,
         },
         request,
     )
@@ -2505,46 +2576,7 @@ def confirm_selection(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
-        )
-
-    selections = (job.target or {}).get("selections") or []
-    if not selections:
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail("MISSING_SELECTION", "Target selection is missing"),
-        )
-
-    player_ref = job.player_ref or job.anchor or {}
-    if _normalize_player_ref(player_ref) is None:
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail("MISSING_PLAYER_REF", "Player reference is missing"),
-        )
-
-    job.status = "CREATED"
-
-    progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
-    try:
-        current_pct = int(current_pct)
-    except (TypeError, ValueError):
-        current_pct = 0
-
-    job.progress = {
-        **progress,
-        "step": "SELECTION_CONFIRMED",
-        "pct": max(current_pct, 15),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    db.commit()
-    db.refresh(job)
-    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+    return enqueue_job(job_id, request, None, db)
 
 
 def _default_preview_frame_count() -> int:
@@ -2654,13 +2686,7 @@ def list_frames(
     count: int = 8,
     db: Session = Depends(get_db),
 ):
-    raise HTTPException(
-        status_code=410,
-        detail=error_detail(
-            "DEPRECATED",
-            "Deprecated. Use /jobs/{id}/frames?count=N",
-        ),
-    )
+    return get_frames(job_id, request, count=count, db=db)
 
 
 @router.get("/jobs/{job_id}/frames/overlay")
@@ -2736,8 +2762,3 @@ def enqueue_job(
     run_analysis.delay(job.id)
 
     return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
-
-
-@router.post("/jobs/{job_id}/confirm-selection")
-def confirm_selection(job_id: str, request: Request, db: Session = Depends(get_db)):
-    return enqueue_job(job_id, request, db)
