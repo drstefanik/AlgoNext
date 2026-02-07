@@ -1,5 +1,32 @@
 from typing import Any, Dict, List, Optional, Tuple
 
+MATCH_BASELINE_BY_GROUP: Dict[str, float] = {
+    "DEF": 6.6,
+    "MID": 6.6,
+    "ATT": 6.5,
+}
+
+MATCH_ROLE_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "MID": {
+        "presence": 0.30,
+        "workrate": 0.30,
+        "intensity": 0.20,
+        "stability": 0.20,
+    },
+    "ATT": {
+        "intensity": 0.35,
+        "presence": 0.25,
+        "workrate": 0.20,
+        "stability": 0.20,
+    },
+    "DEF": {
+        "stability": 0.35,
+        "presence": 0.30,
+        "workrate": 0.20,
+        "intensity": 0.15,
+    },
+}
+
 ROLE_WEIGHTS: Dict[str, Dict[str, float]] = {
     "Striker": {
         "Finishing": 0.24,
@@ -299,4 +326,130 @@ def compute_evaluation(
         "overall_score": overall,
         "role_score": role_score,
         "weight_sum": weight_sum,
+    }
+
+
+def compute_match_rating(job: Any) -> Dict[str, Any]:
+    def clamp(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    def safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def normalize_ratio(value: float) -> float:
+        if value > 1.5:
+            value = value / 100.0
+        return clamp(value, 0.0, 1.0)
+
+    def map_linear(value: float, low: float, high: float) -> float:
+        if high <= low:
+            return 0.0
+        mid = (low + high) / 2.0
+        half_span = (high - low) / 2.0
+        return clamp((value - mid) / half_span, -1.0, 1.0)
+
+    def role_group_for(role_name: str) -> str:
+        role_name = (role_name or "").strip().upper()
+        if not role_name:
+            return "MID"
+        if any(token in role_name for token in ("GK", "KEEP")):
+            return "DEF"
+        if any(token in role_name for token in ("DEF", "CB", "FB", "WB")):
+            return "DEF"
+        if any(token in role_name for token in ("MID", "DM", "CM", "AM")):
+            return "MID"
+        if any(token in role_name for token in ("STR", "ST", "ATT", "FW", "WING")):
+            return "ATT"
+        return "MID"
+
+    def describe_score(value: float) -> str:
+        if value >= 0.4:
+            return "strong"
+        if value >= 0.15:
+            return "solid"
+        if value > -0.15:
+            return "steady"
+        if value > -0.4:
+            return "below-average"
+        return "weak"
+
+    role_name = getattr(job, "role", "") or ""
+    role_group = role_group_for(role_name)
+    baseline = MATCH_BASELINE_BY_GROUP.get(role_group, 6.6)
+
+    result = getattr(job, "result", {}) or {}
+    evidence_metrics = {}
+    if isinstance(result, dict):
+        evidence_metrics = result.get("evidence_metrics") or result.get("evidenceMetrics") or {}
+    if not isinstance(evidence_metrics, dict):
+        evidence_metrics = {}
+
+    candidate_metrics = evidence_metrics.get("candidate_metrics")
+    if not isinstance(candidate_metrics, dict):
+        candidate_metrics = {}
+
+    tracking_payload = {}
+    if isinstance(result, dict):
+        tracking_payload = result.get("tracking") or {}
+    if not isinstance(tracking_payload, dict):
+        tracking_payload = {}
+
+    coverage_raw = candidate_metrics.get("coveragePct")
+    if coverage_raw is None:
+        coverage_raw = candidate_metrics.get("coverage_pct")
+    if coverage_raw is None:
+        coverage_raw = tracking_payload.get("coverage_pct")
+    coverage_ratio = normalize_ratio(safe_float(coverage_raw, 0.0))
+
+    stability_raw = candidate_metrics.get("stabilityScore")
+    if stability_raw is None:
+        stability_raw = candidate_metrics.get("stability_score")
+    stability_ratio = normalize_ratio(safe_float(stability_raw, 0.0))
+
+    distance_m = safe_float(evidence_metrics.get("distance_covered_m"), 0.0)
+    top_speed_kmh = safe_float(
+        evidence_metrics.get("top_speed_kmh_clamped")
+        or evidence_metrics.get("top_speed_kmh"),
+        0.0,
+    )
+
+    presence_score = map_linear(coverage_ratio, 0.35, 0.90)
+    workrate_score = map_linear(distance_m, 300.0, 1200.0)
+    intensity_score = map_linear(top_speed_kmh, 16.0, 30.0)
+    stability_score = map_linear(stability_ratio, 0.55, 0.95)
+
+    weights = MATCH_ROLE_WEIGHTS.get(role_group, MATCH_ROLE_WEIGHTS["MID"])
+    impact = (
+        presence_score * weights["presence"]
+        + workrate_score * weights["workrate"]
+        + intensity_score * weights["intensity"]
+        + stability_score * weights["stability"]
+    )
+    impact_adj = clamp(impact, -1.0, 1.0)
+    match_rating_10 = clamp(baseline + 2.1 * impact_adj, 5.5, 8.5)
+    impact_100 = round(clamp((match_rating_10 - 5.5) / 3.0 * 100.0, 0.0, 100.0))
+
+    explain = (
+        f"Baseline {baseline:.1f} adjusted to {match_rating_10:.1f} because presence was "
+        f"{describe_score(presence_score)}, workrate {describe_score(workrate_score)}, "
+        f"intensity {describe_score(intensity_score)}, and stability {describe_score(stability_score)}."
+    )
+
+    return {
+        "match_rating_10": round(match_rating_10, 2),
+        "impact_100": impact_100,
+        "impact_adj": round(impact_adj, 3),
+        "impact_components": {
+            "presence": round(presence_score, 3),
+            "workrate": round(workrate_score, 3),
+            "intensity": round(intensity_score, 3),
+            "stability": round(stability_score, 3),
+        },
+        "highlight_adj": 0.0,
+        "baseline": baseline,
+        "role_group": role_group,
+        "explain": explain,
     }
