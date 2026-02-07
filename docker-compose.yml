@@ -32,8 +32,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"   # S3 API (USATO PER VIDEO/CLIP/FRAME)
-      - "9001:9001"   # Console (SOLO UI)
+      - "9000:9000" # S3 API (USATO PER VIDEO/CLIP/FRAME)
+      - "9001:9001" # Console (SOLO UI)
     volumes:
       - minio_data:/data
     healthcheck:
@@ -107,6 +107,12 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       MINIO_BUCKET: fnh
       TRACKING_TIMEOUT_SECONDS: "3600"
+
+      # OpenAI (valore preso da .env sul server)
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+
     depends_on:
       db:
         condition: service_healthy
@@ -156,6 +162,12 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       MINIO_BUCKET: fnh
       TRACKING_TIMEOUT_SECONDS: "3600"
+
+      # OpenAI (valore preso da .env sul server)
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+
     depends_on:
       db:
         condition: service_healthy
