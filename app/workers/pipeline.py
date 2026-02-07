@@ -215,12 +215,12 @@ def _compute_performance_score(
     sprints_count = float(evidence_metrics.get("sprints_count") or 0.0)
 
     score = 20.0
-    score += _clamp_score(coverage * 800.0, 0.0, 30.0)
-    score += _clamp_score(stability * 60.0, 0.0, 20.0)
-    score += _clamp_score(distance_m / 3.0, 0.0, 15.0)
+    score += _clamp_score(coverage * 600.0, 0.0, 25.0)
+    score += _clamp_score(stability * 80.0, 0.0, 25.0)
+    score += _clamp_score(distance_m / 4.0, 0.0, 15.0)
     score += _clamp_score(avg_speed_kmh * 3.0, 0.0, 10.0)
-    score += _clamp_score(top_speed_kmh, 0.0, 10.0) / 3.8
-    score += _clamp_score(sprints_count * 3.0, 0.0, 5.0)
+    score += _clamp_score((top_speed_kmh - 15.0) * 0.6, 0.0, 10.0)
+    score += _clamp_score(sprints_count * 2.0, 0.0, 5.0)
     overall_score = _clamp_score(score, 0.0, 100.0)
 
     radar = {
