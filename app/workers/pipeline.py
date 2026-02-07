@@ -123,6 +123,7 @@ def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[st
             "distance_covered_m": 0.0,
             "avg_speed_kmh": 0.0,
             "top_speed_kmh": 0.0,
+            "top_speed_kmh_clamped": 0.0,
             "sprints_count": 0,
         }
 
@@ -156,6 +157,7 @@ def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[st
             "distance_covered_m": 0.0,
             "avg_speed_kmh": 0.0,
             "top_speed_kmh": 0.0,
+            "top_speed_kmh_clamped": 0.0,
             "sprints_count": 0,
         }
 
@@ -183,12 +185,51 @@ def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[st
     total_time = points[-1][0] - points[0][0]
     avg_speed_kmh = (total_distance / total_time) * 3.6 if total_time > 0 else 0.0
 
+    top_speed_kmh = min(top_speed_kmh, 38.0)
     return {
         "distance_covered_m": round(total_distance, 2),
         "avg_speed_kmh": round(avg_speed_kmh, 2),
         "top_speed_kmh": round(top_speed_kmh, 2),
+        "top_speed_kmh_clamped": round(top_speed_kmh, 2),
         "sprints_count": sprints_count,
     }
+
+
+def _compute_performance_score(
+    evidence_metrics: Dict[str, Any],
+) -> Tuple[float, Dict[str, float]]:
+    candidate_metrics = evidence_metrics.get("candidate_metrics")
+    if not isinstance(candidate_metrics, dict):
+        candidate_metrics = {}
+
+    coverage = float(candidate_metrics.get("coveragePct") or 0.0)
+    stability = float(candidate_metrics.get("stabilityScore") or 0.0)
+    distance_m = float(evidence_metrics.get("distance_covered_m") or 0.0)
+    avg_speed_kmh = float(evidence_metrics.get("avg_speed_kmh") or 0.0)
+    top_speed_kmh = float(
+        evidence_metrics.get("top_speed_kmh_clamped")
+        or evidence_metrics.get("top_speed_kmh")
+        or 0.0
+    )
+    top_speed_kmh = max(0.0, min(38.0, top_speed_kmh))
+    sprints_count = float(evidence_metrics.get("sprints_count") or 0.0)
+
+    score = 20.0
+    score += _clamp_score(coverage * 800.0, 0.0, 30.0)
+    score += _clamp_score(stability * 60.0, 0.0, 20.0)
+    score += _clamp_score(distance_m / 3.0, 0.0, 15.0)
+    score += _clamp_score(avg_speed_kmh * 3.0, 0.0, 10.0)
+    score += _clamp_score(top_speed_kmh, 0.0, 10.0) / 3.8
+    score += _clamp_score(sprints_count * 3.0, 0.0, 5.0)
+    overall_score = _clamp_score(score, 0.0, 100.0)
+
+    radar = {
+        "coverage": _clamp_score(coverage * 800.0, 0.0, 100.0),
+        "stability": _clamp_score(stability * 100.0, 0.0, 100.0),
+        "workrate": _clamp_score(distance_m / 1.5, 0.0, 100.0),
+        "intensity": _clamp_score(top_speed_kmh * 2.5, 0.0, 100.0),
+    }
+    return round(overall_score, 1), radar
 
 
 def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
@@ -2801,6 +2842,8 @@ def run_analysis(self, job_id: str):
                 )
             final_overall = overall
             final_role_score = role_score
+            final_radar = dict(radar or {})
+            explain_text_final = explain_text
             if not radar or weight_sum <= 0:
                 if candidate_overall is not None:
                     final_overall = candidate_overall
@@ -2847,8 +2890,18 @@ def run_analysis(self, job_id: str):
                     warnings.append(code)
 
             expected_radar_keys = keys_required_for_role(role)
-            if not set(expected_radar_keys).issubset(radar.keys()):
+            radar_incomplete = not set(expected_radar_keys).issubset(radar.keys())
+            if radar_incomplete:
                 add_warning("INCOMPLETE_RADAR")
+            if "INCOMPLETE_RADAR" in warnings:
+                final_overall, final_radar = _compute_performance_score(
+                    merged_evidence_metrics
+                )
+                final_role_score = final_overall
+                explain_text_final = (
+                    "INCOMPLETE_RADAR: using performance-based scoring from tracking/"
+                    "candidate metrics. No ball/event data."
+                )
             if overall is None:
                 add_warning("MISSING_OVERALL_SCORE")
             if role_score is None:
@@ -2871,7 +2924,7 @@ def run_analysis(self, job_id: str):
                 video_features=video_features,
                 tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
             )
-            report["explain"] = explain_text
+            report["explain"] = explain_text_final
             report["evidence_metrics"] = merged_evidence_metrics
             player_runs = (
                 existing_result.get("player_runs")
@@ -2892,7 +2945,7 @@ def run_analysis(self, job_id: str):
                         "overall_score": final_overall,
                         "roleScore": final_role_score,
                         "role_score": final_role_score,
-                        "radar": radar,
+                        "radar": final_radar,
                     },
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -2910,9 +2963,9 @@ def run_analysis(self, job_id: str):
                 "overallScore": final_overall,
                 "role_score": final_role_score,
                 "roleScore": final_role_score,
-                "radar": radar,
-                "breakdown": radar,
-                "explain": explain_text,
+                "radar": final_radar,
+                "breakdown": final_radar,
+                "explain": explain_text_final,
                 "evidence_metrics": merged_evidence_metrics,
                 "raw_video_features": video_features,
                 "skills_computed": skills_computed,
