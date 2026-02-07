@@ -103,6 +103,16 @@ def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
 
 def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     radar = result_payload.get("radar") or {}
+    match_rating_10 = (
+        result_payload.get("match_rating_10")
+        or result_payload.get("matchRating10")
+        or (result_payload.get("summary") or {}).get("match_rating_10")
+    )
+    impact_100 = (
+        result_payload.get("impact_100")
+        or result_payload.get("impact100")
+        or (result_payload.get("summary") or {}).get("impact_100")
+    )
     overall = (
         result_payload.get("overall_score")
         or result_payload.get("overallScore")
@@ -122,6 +132,8 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
         or {}
     )
     result = {
+        "match_rating_10": match_rating_10,
+        "impact_100": impact_100,
         "overallScore": overall,
         "overall_score": overall,
         "roleScore": role_score,
@@ -169,6 +181,8 @@ def _build_ai_report_payload(job: AnalysisJob) -> Dict[str, Any]:
     return {
         "role": job.role,
         "category": job.category,
+        "match_rating_10": result.get("match_rating_10"),
+        "impact_100": result.get("impact_100"),
         "overall_score": result.get("overall_score"),
         "radar": result.get("radar") or {},
         "evidence_metrics": result.get("evidence_metrics") or {},

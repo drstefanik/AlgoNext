@@ -27,6 +27,7 @@ from app.core.normalizers import normalize_failure_reason
 from app.core.scoring import (
     DEFAULT_WEIGHTS,
     ROLE_WEIGHTS,
+    compute_match_rating,
     compute_evaluation,
     keys_required_for_role,
 )
@@ -2859,6 +2860,14 @@ def run_analysis(self, job_id: str):
                 for key, value in (existing_result.get("evidence_metrics") or {}).items():
                     merged_evidence_metrics.setdefault(key, value)
 
+            rating_context = dict(existing_result) if isinstance(existing_result, dict) else {}
+            rating_context["evidence_metrics"] = merged_evidence_metrics
+            job.result = rating_context
+            match_rating_payload = compute_match_rating(job)
+            match_rating_10 = match_rating_payload.get("match_rating_10")
+            impact_100 = match_rating_payload.get("impact_100")
+            explain_text_final = match_rating_payload.get("explain") or explain_text_final
+
             existing_assets = (
                 (existing_result.get("assets") or {})
                 if isinstance(existing_result, dict)
@@ -2902,6 +2911,8 @@ def run_analysis(self, job_id: str):
                     "INCOMPLETE_RADAR: using performance-based scoring from tracking/"
                     "candidate metrics. No ball/event data."
                 )
+            if match_rating_payload.get("explain"):
+                explain_text_final = match_rating_payload["explain"]
             if overall is None:
                 add_warning("MISSING_OVERALL_SCORE")
             if role_score is None:
@@ -2924,6 +2935,10 @@ def run_analysis(self, job_id: str):
                 video_features=video_features,
                 tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
             )
+            if match_rating_10 is not None:
+                report.setdefault("scores", {})
+                report["scores"]["match_rating_10"] = match_rating_10
+                report["scores"]["impact_100"] = impact_100
             report["explain"] = explain_text_final
             report["evidence_metrics"] = merged_evidence_metrics
             player_runs = (
@@ -2941,6 +2956,8 @@ def run_analysis(self, job_id: str):
                     "track_id": player_track_id,
                     "status": run_status,
                     "result": {
+                        "match_rating_10": match_rating_10,
+                        "impact_100": impact_100,
                         "overallScore": final_overall,
                         "overall_score": final_overall,
                         "roleScore": final_role_score,
@@ -2956,9 +2973,18 @@ def run_analysis(self, job_id: str):
                 "schema_version": "1.3",
                 "summary": {
                     "player_role": role,
+                    "match_rating_10": match_rating_10,
+                    "impact_100": impact_100,
                     "overall_score": final_overall,
                     "role_score": final_role_score,
                 },
+                "match_rating_10": match_rating_10,
+                "impact_100": impact_100,
+                "impact_adj": match_rating_payload.get("impact_adj"),
+                "impact_components": match_rating_payload.get("impact_components"),
+                "highlight_adj": match_rating_payload.get("highlight_adj"),
+                "baseline_rating": match_rating_payload.get("baseline"),
+                "role_group": match_rating_payload.get("role_group"),
                 "overall_score": final_overall,
                 "overallScore": final_overall,
                 "role_score": final_role_score,
