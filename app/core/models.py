@@ -45,6 +45,7 @@ class AnalysisJob(Base):
         nullable=False,
         server_default=text("'[]'::jsonb"),
     )
+    ai_report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
