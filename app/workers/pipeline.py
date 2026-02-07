@@ -297,11 +297,6 @@ def _update_candidate_score_fields(
         updated_result["breakdown"] = candidate_radar or {}
         updated_result["explain"] = explain_text
     else:
-        if "overall_score" not in updated_result and "overallScore" not in updated_result:
-            updated_result["overall_score"] = 42
-            updated_result["overallScore"] = 42
-            updated_result["role_score"] = 42
-            updated_result["roleScore"] = 42
         updated_result.setdefault("radar", candidate_radar or {})
         updated_result.setdefault("breakdown", updated_result.get("radar") or {})
         if not updated_result.get("explain"):
@@ -329,11 +324,22 @@ def _build_explain_text(
         f"pitch proxy; sprint threshold {SPRINT_THRESHOLD_KMH:.1f} km/h."
     )
     radar_keys = ", ".join(sorted(radar.keys())) if radar else "none"
+    partial_note = ""
+    if radar:
+        expected_keys = keys_required_for_role(role)
+        if expected_keys and not set(expected_keys).issubset(radar.keys()):
+            dims_used = sorted([key for key in radar.keys() if key in weights])
+            if dims_used:
+                dims_text = ", ".join(dims_used)
+                partial_note = (
+                    " Overall computed on available radar dims "
+                    f"({dims_text}) with renormalized weights."
+                )
     return (
         "Signals used: visual scene/motion features + tracking kinematics; no ball/event data. "
         f"Radar dimensions: {radar_keys}. Scores normalized to 0-100. "
         f"Overall score is weighted average by role ({weights_text}). "
-        f"{tracking_note} {evidence_note}"
+        f"{tracking_note} {evidence_note}{partial_note}"
     )
 
 
@@ -2766,11 +2772,8 @@ def run_analysis(self, job_id: str):
         evaluation = compute_evaluation(role, radar, tracking_output, evidence_metrics)
         overall = evaluation.get("overall_score")
         role_score = evaluation.get("role_score")
+        weight_sum = float(evaluation.get("weight_sum") or 0.0)
         radar = evaluation.get("radar") or {}
-        if overall is None:
-            overall = 0.0
-        if role_score is None:
-            role_score = float(overall)
         if not radar:
             radar = {"tracking_quality": 0.0, "activity_proxy": 0.0, "visibility": 0.0, "consistency": 0.0}
         explain_text = _build_explain_text(
@@ -2789,6 +2792,23 @@ def run_analysis(self, job_id: str):
 
         def finalize_job(job: AnalysisJob) -> None:
             existing_result = job.result or {}
+            candidate_overall = None
+            if isinstance(existing_result, dict):
+                candidate_overall = (
+                    existing_result.get("overall_score")
+                    or existing_result.get("overallScore")
+                    or (existing_result.get("summary") or {}).get("overall_score")
+                )
+            final_overall = overall
+            final_role_score = role_score
+            if not radar or weight_sum <= 0:
+                if candidate_overall is not None:
+                    final_overall = candidate_overall
+                    final_role_score = candidate_overall
+            if final_overall is None:
+                final_overall = 0.0
+            if final_role_score is None:
+                final_role_score = float(final_overall)
             merged_evidence_metrics = dict(evidence_metrics or {})
             if isinstance(existing_result, dict) and isinstance(
                 existing_result.get("evidence_metrics"), dict
@@ -2845,8 +2865,8 @@ def run_analysis(self, job_id: str):
                 job=job,
                 skills_computed=skills_computed,
                 role=role,
-                role_score=role_score,
-                overall_score=overall,
+                role_score=final_role_score,
+                overall_score=final_overall,
                 warnings=warnings,
                 video_features=video_features,
                 tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
@@ -2868,10 +2888,10 @@ def run_analysis(self, job_id: str):
                     "track_id": player_track_id,
                     "status": run_status,
                     "result": {
-                        "overallScore": overall,
-                        "overall_score": overall,
-                        "roleScore": role_score,
-                        "role_score": role_score,
+                        "overallScore": final_overall,
+                        "overall_score": final_overall,
+                        "roleScore": final_role_score,
+                        "role_score": final_role_score,
                         "radar": radar,
                     },
                     "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -2883,13 +2903,13 @@ def run_analysis(self, job_id: str):
                 "schema_version": "1.3",
                 "summary": {
                     "player_role": role,
-                    "overall_score": overall,
-                    "role_score": role_score,
+                    "overall_score": final_overall,
+                    "role_score": final_role_score,
                 },
-                "overall_score": overall,
-                "overallScore": overall,
-                "role_score": role_score,
-                "roleScore": role_score,
+                "overall_score": final_overall,
+                "overallScore": final_overall,
+                "role_score": final_role_score,
+                "roleScore": final_role_score,
                 "radar": radar,
                 "breakdown": radar,
                 "explain": explain_text,

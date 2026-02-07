@@ -6,7 +6,7 @@
 2. **Celery task entrypoint**: `app.workers.pipeline.run_analysis` loads the job and orchestrates scoring.【F:app/workers/pipeline.py†L1341-L1426】
 3. **Video feature extraction**: `extract_video_features` computes `duration_seconds`, `frame_count`, `fps`, `scene_change_count`, and `scene_change_rate`.【F:app/workers/pipeline.py†L427-L442】
 4. **Radar skill calculation**: `compute_skill_scores` maps scene-change features to each radar skill (or `None`).【F:app/workers/pipeline.py†L447-L478】
-5. **Evaluation aggregation**: `compute_evaluation` sanitizes the radar, applies role-weighted scoring, and falls back to averaging if required keys are missing.【F:app/core/scoring.py†L192-L215】
+5. **Evaluation aggregation**: `compute_evaluation` sanitizes the radar, applies role-weighted scoring on available radar dims (renormalized weights), and only falls back to averaging if no weighted dims are available.【F:app/core/scoring.py†L192-L215】
 6. **Persistence & status**: results (overall, role, radar) are saved; missing radar keys trigger `INCOMPLETE_RADAR` and job status `PARTIAL`.【F:app/workers/pipeline.py†L1889-L1947】
 
 ## Radar skills (feature → score)
@@ -47,7 +47,7 @@ Each skill is only computed if its **minimum condition** is met; otherwise it is
 ## Role score
 
 ### Definition
-- **Role score** is computed by `compute_scores` as a **weighted average** of the radar skills required for the role (same formula used for overall score; see below).【F:app/core/scoring.py†L87-L116】
+- **Role score** is computed by `compute_scores` as a **weighted average** of the radar skills available for the role (weights renormalized over available keys; same formula used for overall score; see below).【F:app/core/scoring.py†L87-L121】
 - The result is clamped to `[0, 100]` and rounded to **1 decimal place**.【F:app/core/scoring.py†L102-L116】
 
 ### Role profiles (weights)
@@ -56,25 +56,25 @@ Role-based weights are defined in `ROLE_WEIGHTS`:
 - If the role is **unknown or not mapped**, `DEFAULT_WEIGHTS` (all 1.0) are used instead.【F:app/core/scoring.py†L45-L76】
 
 ### Missing/unknown role handling
-- `keys_required_for_role` uses the role (or default) to define required keys; missing any of these keys causes `compute_scores` to return `None` for both overall and role score.【F:app/core/scoring.py†L78-L103】
-- In that case, `compute_evaluation` falls back to averaging the available radar values.【F:app/core/scoring.py†L203-L210】
+- `keys_required_for_role` uses the role (or default) to define the weighted keys; missing keys do **not** block scoring as long as some weighted dims are present in the radar.【F:app/core/scoring.py†L78-L121】
+- If no weighted dims are available (weight sum 0), `compute_scores` returns `None` and `compute_evaluation` falls back to averaging the available radar values.【F:app/core/scoring.py†L87-L121】【F:app/core/scoring.py†L203-L212】
 
 ## Overall score
 
 ### Definition
-- **Overall score** is computed by the same weighted average as role score in `compute_scores`.【F:app/core/scoring.py†L87-L116】
-- **Formula** (for required skills only):
+- **Overall score** is computed by the same weighted average as role score in `compute_scores`.【F:app/core/scoring.py†L87-L121】
+- **Formula** (for available weighted skills only):
   - `value = clamp( sum(score_i * weight_i) / sum(weight_i), 0, 100 )`
   - `overall_score = round(value, 1)`【F:app/core/scoring.py†L111-L116】
-- The output range is explicitly clamped to `[0, 100]` in `compute_scores`.【F:app/core/scoring.py†L102-L116】
+- The output range is explicitly clamped to `[0, 100]` in `compute_scores`.【F:app/core/scoring.py†L101-L118】
 
 ### Caps / bonuses / penalties
 - **Caps**: skill-level values are clamped to `[0, 100]` before weighting; the weighted result is also clamped to `[0, 100]`.【F:app/core/scoring.py†L102-L116】
 - **Bonuses**: the only “bonus”-like term appears inside each radar skill score via `scene_bonus`, which is capped at `10 * 2.0 = 20`.【F:app/workers/pipeline.py†L460-L461】
-- **Penalties**: missing required radar keys results in `None` from `compute_scores`, which causes a fallback to unweighted average of available radar values (no explicit numeric penalty beyond loss of weights).【F:app/core/scoring.py†L92-L110】【F:app/core/scoring.py†L203-L210】
+- **Penalties**: missing radar keys removes their weight from the renormalized weighted average; if no weighted dims remain, `compute_scores` returns `None` and `compute_evaluation` falls back to the unweighted average of available radar values.【F:app/core/scoring.py†L87-L121】【F:app/core/scoring.py†L203-L212】
 
 ### Handling incomplete radar
-- If required radar keys are missing, `compute_scores` returns `None` for both scores, and `compute_evaluation` falls back to the **simple average** of available radar values (no weighting).【F:app/core/scoring.py†L92-L110】【F:app/core/scoring.py†L203-L210】
+- If required radar keys are missing, `compute_scores` still produces a **renormalized weighted average** over available keys; only if no weighted dims remain will `compute_evaluation` fall back to the **simple average** of available radar values.【F:app/core/scoring.py†L87-L121】【F:app/core/scoring.py†L203-L212】
 - The pipeline additionally emits a warning `INCOMPLETE_RADAR` and marks the run `PARTIAL` if the radar does not contain all required keys for the role.【F:app/workers/pipeline.py†L1889-L1907】
 
 ## RADAR INCOMPLETE (formal definition)

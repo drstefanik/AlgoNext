@@ -87,18 +87,17 @@ def keys_required_for_role(role: Optional[str]) -> List[str]:
 def compute_scores(role: str, radar: Dict[str, Any]) -> Dict[str, Optional[float]]:
     expected_keys = keys_required_for_role(role)
     if not expected_keys:
-        return {"overall_score": None, "role_score": None}
-
-    if not set(expected_keys).issubset(radar.keys()):
-        return {"overall_score": None, "role_score": None}
+        return {"overall_score": None, "role_score": None, "weight_sum": 0.0}
 
     weights = ROLE_WEIGHTS.get(role, DEFAULT_WEIGHTS)
     pairs: List[Tuple[float, float]] = []
-    for key in expected_keys:
+    for key, value in radar.items():
+        if key not in weights:
+            continue
         try:
-            score = float(radar[key])
+            score = float(value)
         except Exception:
-            return {"overall_score": None, "role_score": None}
+            continue
         score = max(0.0, min(100.0, score))
         weight = float(weights.get(key, 0.0))
         if weight <= 0:
@@ -106,14 +105,17 @@ def compute_scores(role: str, radar: Dict[str, Any]) -> Dict[str, Optional[float
         pairs.append((score, weight))
 
     if not pairs:
-        return {"overall_score": None, "role_score": None}
+        return {"overall_score": None, "role_score": None, "weight_sum": 0.0}
 
     weighted_sum = sum(score * weight for score, weight in pairs)
-    weight_sum = sum(weight for _, weight in pairs) or 1.0
+    weight_sum = sum(weight for _, weight in pairs)
+    if weight_sum <= 0:
+        return {"overall_score": None, "role_score": None, "weight_sum": 0.0}
+
     value = weighted_sum / weight_sum
     value = max(0.0, min(100.0, value))
     rounded = round(value, 1)
-    return {"overall_score": rounded, "role_score": rounded}
+    return {"overall_score": rounded, "role_score": rounded, "weight_sum": weight_sum}
 
 
 def _fallback_radar_from_tracking(
@@ -287,6 +289,7 @@ def compute_evaluation(
     score_payload = compute_scores(role, sanitized_radar)
     overall = score_payload.get("overall_score")
     role_score = score_payload.get("role_score")
+    weight_sum = score_payload.get("weight_sum", 0.0) or 0.0
     if overall is None or role_score is None:
         average_score = _average_radar_score(sanitized_radar)
         overall = round(average_score, 1)
@@ -295,4 +298,5 @@ def compute_evaluation(
         "radar": sanitized_radar,
         "overall_score": overall,
         "role_score": role_score,
+        "weight_sum": weight_sum,
     }
