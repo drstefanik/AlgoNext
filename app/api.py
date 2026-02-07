@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
+from app.core.ai_report import generate_ai_report
 from app.core.normalizers import normalize_failure_reason
 from app.schemas import (
     JobCreate,
@@ -65,6 +66,7 @@ S3_SECRET_KEY = (os.environ.get("S3_SECRET_KEY") or "").strip()
 S3_BUCKET = (os.environ.get("S3_BUCKET") or "").strip()
 SIGNED_URL_EXPIRES_SECONDS = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 FILENAME_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+MAX_AI_CLIPS = int(os.environ.get("AI_REPORT_MAX_CLIPS", "10"))
 
 
 def normalize_status(status: str) -> str:
@@ -144,6 +146,37 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
 
     assets = {"inputVideoUrl": input_video_url, "clips": clips}
     return result, assets
+
+
+def _build_ai_report_payload(job: AnalysisJob) -> Dict[str, Any]:
+    result_payload = normalize_payload(job.result)
+    result, assets = _build_result_assets(result_payload)
+    clips_raw = assets.get("clips") or []
+    clips: List[Dict[str, Any]] = []
+    for clip in clips_raw:
+        if not isinstance(clip, dict):
+            continue
+        if not clip.get("url"):
+            continue
+        clips.append(
+            {
+                "label": clip.get("label"),
+                "url": clip.get("url"),
+                "startSec": clip.get("startSec"),
+                "endSec": clip.get("endSec"),
+            }
+        )
+    return {
+        "role": job.role,
+        "category": job.category,
+        "overall_score": result.get("overall_score"),
+        "radar": result.get("radar") or {},
+        "evidence_metrics": result.get("evidence_metrics") or {},
+        "clips": clips[:MAX_AI_CLIPS],
+        "limitations": [
+            "Non sono disponibili dati palla/eventi o etichette tecnico-tattiche.",
+        ],
+    }
 
 
 def _build_candidate_payload(
@@ -1023,6 +1056,63 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
         },
         request,
     )
+
+
+@router.post("/jobs/{job_id}/ai-report")
+def job_ai_report(job_id: str, request: Request, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    if job.status == "FAILED":
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_FAILED", job.error or "Job failed"),
+        )
+
+    if job.status not in ("COMPLETED", "PARTIAL"):
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_NOT_COMPLETED", "Job not completed yet"),
+        )
+
+    result_payload = normalize_payload(job.result)
+    if not result_payload:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_RESULT_MISSING", "Job result is missing"),
+        )
+
+    ai_payload = _build_ai_report_payload(job)
+    if not ai_payload.get("clips"):
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_CLIPS_MISSING", "Job clips are missing"),
+        )
+
+    try:
+        ai_report = generate_ai_report(ai_payload)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc)),
+        ) from exc
+    except Exception as exc:
+        logger.exception("AI report generation failed")
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail("AI_REPORT_FAILED", "AI report generation failed"),
+        ) from exc
+
+    job.ai_report = ai_report
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    return ok_response({"ai_report": ai_report}, request)
 
 
 @router.get("/jobs/{job_id}/candidates")
