@@ -91,6 +91,7 @@ def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
     end = clip.get("end_sec", clip.get("end"))
     url = clip.get("url") or clip.get("signed_url")
     label = clip.get("label")
+    clip_type = clip.get("type")
     if label is None and start is not None and end is not None:
         label = f"{start}s-{end}s"
     return {
@@ -98,6 +99,7 @@ def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
         "url": url,
         "startSec": start,
         "endSec": end,
+        "type": clip_type,
     }
 
 
@@ -131,6 +133,9 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
         or result_payload.get("evidenceMetrics")
         or {}
     )
+    if match_rating_10 is not None:
+        overall = None
+        role_score = None
     result = {
         "match_rating_10": match_rating_10,
         "impact_100": impact_100,
@@ -162,6 +167,9 @@ def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any]
 
 def _build_ai_report_payload(job: AnalysisJob) -> Dict[str, Any]:
     result_payload = normalize_payload(job.result)
+    if result_payload:
+        context = load_s3_context()
+        result_payload = attach_presigned_urls(result_payload, context)
     result, assets = _build_result_assets(result_payload)
     clips_raw = assets.get("clips") or []
     clips: List[Dict[str, Any]] = []
@@ -183,7 +191,6 @@ def _build_ai_report_payload(job: AnalysisJob) -> Dict[str, Any]:
         "category": job.category,
         "match_rating_10": result.get("match_rating_10"),
         "impact_100": result.get("impact_100"),
-        "overall_score": result.get("overall_score"),
         "radar": result.get("radar") or {},
         "evidence_metrics": result.get("evidence_metrics") or {},
         "clips": clips[:MAX_AI_CLIPS],
@@ -1073,7 +1080,12 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
 
 
 @router.post("/jobs/{job_id}/ai-report")
-def job_ai_report(job_id: str, request: Request, db: Session = Depends(get_db)):
+def job_ai_report(
+    job_id: str,
+    request: Request,
+    force: int = 0,
+    db: Session = Depends(get_db),
+):
     job = db.get(AnalysisJob, job_id)
     if not job:
         raise HTTPException(
@@ -1087,18 +1099,23 @@ def job_ai_report(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_FAILED", job.error or "Job failed"),
         )
 
-    if job.status not in ("COMPLETED", "PARTIAL"):
+    result_payload = normalize_payload(job.result)
+    progress_step = (job.progress or {}).get("step")
+    is_done_step = progress_step == "DONE"
+    is_allowed_status = job.status in ("DONE", "COMPLETED", "PARTIAL")
+    if not is_done_step and not is_allowed_status:
         raise HTTPException(
             status_code=409,
             detail=error_detail("JOB_NOT_COMPLETED", "Job not completed yet"),
         )
-
-    result_payload = normalize_payload(job.result)
-    if not result_payload:
+    if not result_payload and not is_done_step:
         raise HTTPException(
             status_code=409,
             detail=error_detail("JOB_RESULT_MISSING", "Job result is missing"),
         )
+
+    if job.ai_report and not force:
+        return ok_response({"ai_report": job.ai_report}, request)
 
     ai_payload = _build_ai_report_payload(job)
     if not ai_payload.get("clips"):
@@ -1107,19 +1124,24 @@ def job_ai_report(job_id: str, request: Request, db: Session = Depends(get_db)):
             detail=error_detail("JOB_CLIPS_MISSING", "Job clips are missing"),
         )
 
+    model = (os.environ.get("OPENAI_MODEL") or "gpt-5.2").strip()
+    logger.info("AI_REPORT_START job_id=%s model=%s", job.id, model)
     try:
-        ai_report = generate_ai_report(ai_payload)
+        ai_report, usage = generate_ai_report(ai_payload)
     except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc)),
-        ) from exc
+        logger.error("AI_REPORT_FAIL job_id=%s error=%s", job.id, exc)
+        raise HTTPException(status_code=503, detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc))) from exc
     except Exception as exc:
-        logger.exception("AI report generation failed")
+        logger.error("AI_REPORT_FAIL job_id=%s error=%s", job.id, exc)
         raise HTTPException(
             status_code=500,
-            detail=error_detail("AI_REPORT_FAILED", "AI report generation failed"),
+            detail=error_detail("AI_REPORT_FAILED", str(exc)),
         ) from exc
+
+    if usage is not None:
+        logger.info("AI_REPORT_OK job_id=%s usage=%s", job.id, usage)
+    else:
+        logger.info("AI_REPORT_OK job_id=%s", job.id)
 
     job.ai_report = ai_report
     db.add(job)
