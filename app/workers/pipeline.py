@@ -21,6 +21,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import celery
+from app.workers.ai_report import generate_ai_report_task
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
@@ -392,6 +393,41 @@ def _normalize_time(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_time_label(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes = total_seconds // 60
+    secs = total_seconds % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _extract_target_time_sec(target: Dict[str, Any] | None) -> Optional[float]:
+    if not isinstance(target, dict):
+        return None
+    selection = target.get("selection")
+    if isinstance(selection, dict):
+        for key in ("time_sec", "frame_time_sec"):
+            time_val = _normalize_time(selection.get(key))
+            if time_val is not None:
+                return time_val
+    selections = target.get("selections") or []
+    if selections and isinstance(selections[0], dict):
+        for key in ("time_sec", "frame_time_sec"):
+            time_val = _normalize_time(selections[0].get(key))
+            if time_val is not None:
+                return time_val
+    return None
+
+
+def _extract_player_ref_time_sec(player_ref: Dict[str, Any] | None) -> Optional[float]:
+    if not isinstance(player_ref, dict):
+        return None
+    for key in ("t", "frame_time_sec"):
+        time_val = _normalize_time(player_ref.get(key))
+        if time_val is not None:
+            return time_val
+    return None
 
 
 def _collect_target_times(target: Dict[str, Any] | None) -> List[float]:
@@ -1358,17 +1394,39 @@ def _build_report_v1(
     return report_payload
 
 
-def extract_clips(input_path: Path, out_dir: Path) -> Tuple[List[Dict], Optional[str]]:
-    """
-    Clip demo: 2 segmenti (5s ciascuno).
-    Se input è troppo corto, ffmpeg può fallire: in quel caso generiamo 1 clip breve.
-    """
+def extract_clips(
+    input_path: Path,
+    out_dir: Path,
+    target_time_sec: Optional[float],
+    player_ref_time_sec: Optional[float],
+) -> Tuple[List[Dict], Optional[str]]:
+    """Extract key-moment clips centered around target/player_ref timestamps."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    clips = [
-        {"name": "clip_001.mp4", "start": 2, "duration": 5},
-        {"name": "clip_002.mp4", "start": 12, "duration": 5},
-    ]
+    clips: List[Dict[str, Any]] = []
+    duration = 6.0
+    if target_time_sec is not None:
+        start = max(float(target_time_sec) - 3.0, 0.0)
+        clips.append(
+            {
+                "name": "clip_target.mp4",
+                "start": start,
+                "duration": duration,
+                "label": f"TARGET T+{_format_time_label(target_time_sec)}",
+                "type": "target",
+            }
+        )
+    if player_ref_time_sec is not None:
+        start = max(float(player_ref_time_sec) - 3.0, 0.0)
+        clips.append(
+            {
+                "name": "clip_player_ref.mp4",
+                "start": start,
+                "duration": duration,
+                "label": f"PLAYER REF T+{_format_time_label(player_ref_time_sec)}",
+                "type": "player_ref",
+            }
+        )
 
     created: List[Dict] = []
     error: Optional[str] = None
@@ -1394,31 +1452,12 @@ def extract_clips(input_path: Path, out_dir: Path) -> Tuple[List[Dict], Optional
                     "file": out_path,
                     "start": c["start"],
                     "end": c["start"] + c["duration"],
+                    "label": c.get("label"),
+                    "type": c.get("type"),
                 }
             )
         except Exception as exc:
             error = str(exc)
-            if not created:
-                fallback = out_dir / "clip_001.mp4"
-                try:
-                    _run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-ss",
-                            "0",
-                            "-i",
-                            str(input_path),
-                            "-t",
-                            "3",
-                            "-c",
-                            "copy",
-                            str(fallback),
-                        ]
-                    )
-                    created.append({"file": fallback, "start": 0, "end": 3})
-                except Exception as fallback_exc:
-                    error = f"{error}\n{fallback_exc}"
             break
 
     return created, error
@@ -2758,7 +2797,16 @@ def run_analysis(self, job_id: str):
             job_id,
             lambda job: set_progress(job, "EXTRACTING", 55, "Extracting clips"),
         )
-        extracted, clip_extraction_error = extract_clips(input_path, clips_dir)
+        target_time_sec = _extract_target_time_sec(job.target if isinstance(job.target, dict) else None)
+        player_ref_time_sec = _extract_player_ref_time_sec(
+            job.player_ref if isinstance(job.player_ref, dict) else None
+        )
+        extracted, clip_extraction_error = extract_clips(
+            input_path,
+            clips_dir,
+            target_time_sec,
+            player_ref_time_sec,
+        )
 
         # Upload clips + signed
         update_job(
@@ -2779,11 +2827,12 @@ def run_analysis(self, job_id: str):
             clips_out.append(
                 {
                     "index": i,
-                    "label": f"{clip_start}s-{clip_end}s",
+                    "label": c.get("label") or f"{clip_start}s-{clip_end}s",
                     "start_sec": clip_start,
                     "end_sec": clip_end,
                     "bucket": s3_bucket,
                     "key": clip_key,
+                    "type": c.get("type"),
                 }
             )
 
@@ -3013,6 +3062,16 @@ def run_analysis(self, job_id: str):
             set_progress(job, "DONE", 100, "Completed")
 
         update_job(db, job_id, finalize_job)
+
+        try:
+            job_after = reload_job(db, job_id)
+            if job_after and job_after.result:
+                is_done_step = (job_after.progress or {}).get("step") == "DONE"
+                is_ready_status = job_after.status in {"DONE", "COMPLETED", "PARTIAL"}
+                if is_done_step or is_ready_status:
+                    generate_ai_report_task.delay(job_id)
+        except Exception:
+            logger.exception("AI report auto-generation enqueue failed job_id=%s", job_id)
 
     except TrackingTimeoutError:
         try:

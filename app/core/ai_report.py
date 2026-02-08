@@ -16,34 +16,12 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
             "maxItems": 5,
             "items": {"type": "string"},
         },
-        "strengths": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "title": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "metric_refs": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["title", "evidence", "metric_refs"],
-            },
-        },
-        "risks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "title": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "metric_refs": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["title", "evidence", "metric_refs"],
-            },
-        },
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
         "key_moments": {
             "type": "array",
+            "minItems": 2,
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -57,28 +35,8 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
                 "required": ["title", "why", "clip_url", "startSec", "endSec"],
             },
         },
-        "training_plan_14d": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "day_range": {"type": "string"},
-                    "focus": {"type": "string"},
-                    "drills": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["day_range", "focus", "drills"],
-            },
-        },
-        "comparison_notes": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "what_this_score_means": {"type": "string"},
-                "limitations": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["what_this_score_means", "limitations"],
-        },
+        "training_plan_14d": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": [
@@ -88,7 +46,7 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
         "risks",
         "key_moments",
         "training_plan_14d",
-        "comparison_notes",
+        "limitations",
         "confidence",
     ],
 }
@@ -96,9 +54,9 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
 
 SYSTEM_PROMPT = (
     "Sei un AI scout calcistico. Genera un report stile eyeball.club con tono "
-    "professionale e conciso in italiano. Usa solo i dati forniti (niente eventi palla, "
-    "niente azioni tecniche o tattiche non osservabili). Se mancano dati, "
-    "esplicita i limiti. Evidenzia i riferimenti alle metriche usando i nomi forniti."
+    "professionale e conciso in italiano. Usa solo i dati forniti (nessun dato palla/"
+    "eventi; non inventare etichette tecniche o tattiche non osservabili). Se mancano dati, "
+    "esplicita i limiti. I key moments devono riferirsi solo ai clip_url forniti."
 )
 
 
@@ -118,13 +76,14 @@ def _extract_output_json(response: Any) -> Dict[str, Any]:
     raise ValueError("No JSON output found in OpenAI response.")
 
 
-def generate_ai_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+def generate_ai_report(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured.")
     model = (os.environ.get("OPENAI_MODEL") or "gpt-5.2").strip()
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.responses.create(
         model=model,
         input=[
@@ -143,4 +102,5 @@ def generate_ai_report(payload: Dict[str, Any]) -> Dict[str, Any]:
             },
         },
     )
-    return _extract_output_json(response)
+    usage = getattr(response, "usage", None)
+    return _extract_output_json(response), usage
