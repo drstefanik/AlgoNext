@@ -86,6 +86,32 @@ def normalize_payload(payload: object) -> dict:
     return {"value": encoded}
 
 
+def _extract_frames_processed(result_payload: Dict[str, Any] | None) -> int | None:
+    if not isinstance(result_payload, dict):
+        return None
+    evidence_metrics = (
+        result_payload.get("evidence_metrics")
+        or result_payload.get("evidenceMetrics")
+        or {}
+    )
+    if not isinstance(evidence_metrics, dict):
+        return None
+    candidate_metrics = (
+        evidence_metrics.get("candidate_metrics")
+        or evidence_metrics.get("candidateMetrics")
+        or {}
+    )
+    if not isinstance(candidate_metrics, dict):
+        return None
+    sample_frames_count = candidate_metrics.get("sampleFramesCount")
+    if sample_frames_count is None:
+        return None
+    try:
+        return int(sample_frames_count)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
     start = clip.get("start_sec", clip.get("start"))
     end = clip.get("end_sec", clip.get("end"))
@@ -875,6 +901,7 @@ def get_job(job_id: str, request: Request, view: str = "lite"):
         public_video_url = build_public_video_url(job, context)
 
         result_payload = result_payload or {}
+        frames_processed = _extract_frames_processed(result_payload)
         result, assets = _build_result_assets(result_payload)
         if view == "full":
             result = result_payload
@@ -899,6 +926,7 @@ def get_job(job_id: str, request: Request, view: str = "lite"):
                 "video_url": public_video_url or job.video_url,
                 "preview_frames": preview_frames,
                 "progress": normalize_payload(job.progress),
+                "frames_processed": frames_processed,
                 "warnings": list(job.warnings or []),
                 "player_ref": player_ref,
                 "playerSaved": player_saved,
@@ -929,6 +957,7 @@ def job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    frames_processed = _extract_frames_processed(normalize_payload(job.result))
 
     return ok_response(
         {
@@ -936,6 +965,7 @@ def job_status(job_id: str, request: Request, db: Session = Depends(get_db)):
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
+            "frames_processed": frames_processed,
             "warnings": list(job.warnings or []),
             "error": job.error,
             "failure_reason": job.failure_reason,
@@ -955,6 +985,7 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
         )
 
     result_payload = normalize_payload(job.result)
+    frames_processed = _extract_frames_processed(result_payload)
     if result_payload:
         context = load_s3_context()
         result_payload = attach_presigned_urls(result_payload, context)
@@ -966,6 +997,7 @@ def job_poll(job_id: str, request: Request, db: Session = Depends(get_db)):
             "id": job.id,
             "status": normalize_status(job.status),
             "progress": normalize_payload(job.progress),
+            "frames_processed": frames_processed,
             "warnings": list(job.warnings or []),
             "error": job.error,
             "failure_reason": job.failure_reason,
