@@ -9,19 +9,11 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "headline": {"type": "string"},
-        "summary_bullets": {
-            "type": "array",
-            "minItems": 3,
-            "maxItems": 5,
-            "items": {"type": "string"},
-        },
+        "summary": {"type": "string"},
         "strengths": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "array", "items": {"type": "string"}},
         "key_moments": {
             "type": "array",
-            "minItems": 2,
-            "maxItems": 3,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -29,23 +21,22 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
                     "title": {"type": "string"},
                     "why": {"type": "string"},
                     "clip_url": {"type": "string"},
-                    "startSec": {"type": "number"},
-                    "endSec": {"type": "number"},
+                    "start_sec": {"type": "number"},
+                    "end_sec": {"type": "number"},
                 },
-                "required": ["title", "why", "clip_url", "startSec", "endSec"],
+                "required": ["title", "why", "clip_url", "start_sec", "end_sec"],
             },
         },
-        "training_plan_14d": {"type": "array", "items": {"type": "string"}},
+        "training_plan_14_days": {"type": "array", "items": {"type": "string"}},
         "limitations": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": [
-        "headline",
-        "summary_bullets",
+        "summary",
         "strengths",
         "risks",
         "key_moments",
-        "training_plan_14d",
+        "training_plan_14_days",
         "limitations",
         "confidence",
     ],
@@ -54,9 +45,12 @@ AI_REPORT_SCHEMA: Dict[str, Any] = {
 
 SYSTEM_PROMPT = (
     "Sei un AI scout calcistico. Genera un report stile eyeball.club con tono "
-    "professionale e conciso in italiano. Usa solo i dati forniti (nessun dato palla/"
-    "eventi; non inventare etichette tecniche o tattiche non osservabili). Se mancano dati, "
-    "esplicita i limiti. I key moments devono riferirsi solo ai clip_url forniti."
+    "professionale e conciso in italiano. Rispondi in JSON rigoroso rispettando "
+    "esattamente i campi richiesti: summary, strengths, risks, key_moments, "
+    "training_plan_14_days, limitations, confidence. Usa solo i dati forniti "
+    "(nessun dato palla/eventi; non inventare etichette tecniche o tattiche non "
+    "osservabili). Se mancano dati, esplicita i limiti. I key moments devono "
+    "riferirsi solo ai clip_url forniti."
 )
 
 

@@ -28,7 +28,7 @@ celery = Celery(
     "fnh_worker",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["app.workers.pipeline"],  # <-- IMPORTANTISSIMO
+    include=["app.workers.pipeline", "app.workers.ai_report"],
 )
 
 celery.conf.update(

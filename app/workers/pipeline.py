@@ -21,7 +21,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import celery
-from app.workers.ai_report import generate_ai_report_task
+from app.workers.ai_report import generate_report
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
@@ -3069,7 +3069,7 @@ def run_analysis(self, job_id: str):
                 is_done_step = (job_after.progress or {}).get("step") == "DONE"
                 is_ready_status = job_after.status in {"DONE", "COMPLETED", "PARTIAL"}
                 if is_done_step or is_ready_status:
-                    generate_ai_report_task.delay(job_id)
+                    generate_report.delay(job_id)
         except Exception:
             logger.exception("AI report auto-generation enqueue failed job_id=%s", job_id)
 

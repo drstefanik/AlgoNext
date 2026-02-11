@@ -46,6 +46,9 @@ class AnalysisJob(Base):
         server_default=text("'[]'::jsonb"),
     )
     ai_report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    report_status: Mapped[str] = mapped_column(String, default="PENDING", nullable=False, server_default="PENDING")
+    report_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
