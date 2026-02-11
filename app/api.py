@@ -1111,20 +1111,7 @@ def job_result(job_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/jobs/{job_id}/ai-report")
-def job_ai_report(
-    job_id: str,
-    request: Request,
-    force: int = 0,
-    db: Session = Depends(get_db),
-):
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
-        )
-
+def _ensure_job_reportable(job: AnalysisJob) -> None:
     if job.status == "FAILED":
         raise HTTPException(
             status_code=409,
@@ -1146,8 +1133,85 @@ def job_ai_report(
             detail=error_detail("JOB_RESULT_MISSING", "Job result is missing"),
         )
 
-    if job.ai_report and not force:
-        return ok_response({"ai_report": job.ai_report}, request)
+
+@router.post("/jobs/{job_id}/report")
+def enqueue_job_report(
+    job_id: str,
+    request: Request,
+    force: int = 1,
+    db: Session = Depends(get_db),
+):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    _ensure_job_reportable(job)
+
+    if job.report and not force:
+        return ok_response({"status": "DONE", "report": job.report}, request)
+
+    ai_payload = _build_ai_report_payload(job)
+    if not ai_payload.get("clips"):
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail("JOB_CLIPS_MISSING", "Job clips are missing"),
+        )
+
+    from app.workers.ai_report import generate_report
+
+    job.report_status = "PENDING"
+    job.report_error = None
+    if force:
+        job.report = None
+    db.add(job)
+    db.commit()
+
+    generate_report.delay(job.id, force=bool(force))
+    return ok_response({"status": "PENDING"}, request)
+
+
+@router.get("/jobs/{job_id}/report")
+def get_job_report(job_id: str, request: Request, db: Session = Depends(get_db)):
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+
+    status = (job.report_status or "PENDING").upper()
+    if status not in {"PENDING", "RUNNING", "DONE", "FAILED"}:
+        status = "PENDING"
+
+    payload: Dict[str, Any] = {"status": status}
+    if status == "DONE" and isinstance(job.report, dict):
+        payload["report"] = job.report
+    if status == "FAILED" and job.report_error:
+        payload["error"] = job.report_error
+    return ok_response(payload, request)
+
+
+@router.post("/jobs/{job_id}/ai-report")
+def job_ai_report(
+    job_id: str,
+    request: Request,
+    force: int = 0,
+    db: Session = Depends(get_db),
+):
+    # backward compatibility with existing clients, now backed by /report data
+    job = db.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+    _ensure_job_reportable(job)
+
+    if job.report and not force:
+        return ok_response({"ai_report": job.report}, request)
 
     ai_payload = _build_ai_report_payload(job)
     if not ai_payload.get("clips"):
@@ -1157,25 +1221,28 @@ def job_ai_report(
         )
 
     model = (os.environ.get("OPENAI_MODEL") or "gpt-5.2").strip()
-    logger.info("AI_REPORT_START job_id=%s model=%s", job.id, model)
+    logger.info("AI_REPORT_START_SYNC job_id=%s model=%s", job.id, model)
     try:
         ai_report, usage = generate_ai_report(ai_payload)
     except RuntimeError as exc:
-        logger.error("AI_REPORT_FAIL job_id=%s error=%s", job.id, exc)
+        logger.error("AI_REPORT_FAIL_SYNC job_id=%s error=%s", job.id, exc)
         raise HTTPException(status_code=503, detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc))) from exc
     except Exception as exc:
-        logger.error("AI_REPORT_FAIL job_id=%s error=%s", job.id, exc)
+        logger.error("AI_REPORT_FAIL_SYNC job_id=%s error=%s", job.id, exc)
         raise HTTPException(
             status_code=500,
             detail=error_detail("AI_REPORT_FAILED", str(exc)),
         ) from exc
 
     if usage is not None:
-        logger.info("AI_REPORT_OK job_id=%s usage=%s", job.id, usage)
+        logger.info("AI_REPORT_OK_SYNC job_id=%s usage=%s", job.id, usage)
     else:
-        logger.info("AI_REPORT_OK job_id=%s", job.id)
+        logger.info("AI_REPORT_OK_SYNC job_id=%s", job.id)
 
     job.ai_report = ai_report
+    job.report = ai_report
+    job.report_status = "DONE"
+    job.report_error = None
     db.add(job)
     db.commit()
     db.refresh(job)

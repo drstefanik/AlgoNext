@@ -108,3 +108,27 @@ Recommended server setup (manual):
 - Repository already cloned in `/opt/AlgoNext`.
 - Docker and Docker Compose installed.
 - `.env` present on the VPS (not committed to git).
+
+
+## Async AI Scout Report API
+
+The AI scout report can now be generated asynchronously via Celery:
+
+- `POST /jobs/{id}/report` → enqueues `generate_report(job_id)`
+- `GET /jobs/{id}/report` → returns report task status payload:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "status": "PENDING"
+  }
+}
+```
+
+When ready (`DONE`), the payload includes `report` with strict JSON fields:
+`summary`, `strengths`, `risks`, `key_moments`, `training_plan_14_days`, `limitations`, `confidence`.
+
+Environment:
+- `OPENAI_MODEL` defaults to `gpt-5.2`
+
