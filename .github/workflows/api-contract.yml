@@ -7,13 +7,19 @@ on:
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
+      - "app/benchmark/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "scripts/evaluate_tracking.py"
+      - "scripts/convert_tracking_output.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
+      - "tests/test_tracking_benchmark.py"
+      - "tests/test_tracking_adapter.py"
+      - "tests/fixtures/tracking_benchmark/**"
       - ".github/workflows/api-contract.yml"
   push:
     branches:
@@ -23,13 +29,19 @@ on:
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
+      - "app/benchmark/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "scripts/evaluate_tracking.py"
+      - "scripts/convert_tracking_output.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
+      - "tests/test_tracking_benchmark.py"
+      - "tests/test_tracking_adapter.py"
+      - "tests/fixtures/tracking_benchmark/**"
       - ".github/workflows/api-contract.yml"
 
 permissions:
@@ -76,3 +88,41 @@ jobs:
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
+
+  tracking-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile benchmark modules and CLIs
+        run: >-
+          python -m py_compile
+          app/benchmark/__init__.py
+          app/benchmark/schema.py
+          app/benchmark/tracking_metrics.py
+          app/benchmark/adapters.py
+          scripts/evaluate_tracking.py
+          scripts/convert_tracking_output.py
+          tests/test_tracking_benchmark.py
+          tests/test_tracking_adapter.py
+
+      - name: Run tracking metric and adapter tests
+        run: >-
+          python -m unittest
+          tests/test_tracking_benchmark.py
+          tests/test_tracking_adapter.py
+
+      - name: Run benchmark CLI quality-gate smoke test
+        run: >-
+          python scripts/evaluate_tracking.py
+          --annotations tests/fixtures/tracking_benchmark/annotations
+          --predictions tests/fixtures/tracking_benchmark/predictions
+          --json-out /tmp/tracking-benchmark.json
+          --fail-on-gate

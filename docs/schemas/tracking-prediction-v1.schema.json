@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/tracking-prediction-v1.schema.json",
+  "title": "AlgoNext tracking prediction v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "video_id", "frames"],
+  "properties": {
+    "schema_version": {"const": "tracking-prediction-v1"},
+    "video_id": {"type": "string", "minLength": 1},
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["frame_index", "tracks"],
+        "properties": {
+          "frame_index": {"type": "integer", "minimum": 0},
+          "time_sec": {"type": "number", "minimum": 0},
+          "tracks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["track_id", "bbox"],
+              "properties": {
+                "track_id": {
+                  "oneOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "integer"}
+                  ]
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "bbox": {"$ref": "#/$defs/bbox"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "bbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "w": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "h": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+      }
+    }
+  }
+}
