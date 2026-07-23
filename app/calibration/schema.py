@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from app.calibration.model import PitchDimensions, landmark_coordinates
 
@@ -142,7 +142,12 @@ class CalibrationCorrespondence:
         image = ImagePoint.from_payload(value.get("image"), f"{path}.image")
         field_payload = value.get("field")
         landmark = value.get("landmark")
-        if field_payload is None and landmark is not None:
+        if (field_payload is None) == (landmark is None):
+            raise CalibrationValidationError(
+                path,
+                "provide exactly one of field or landmark",
+            )
+        if landmark is not None:
             landmark_name = _string(landmark, f"{path}.landmark")
             try:
                 x_m, y_m = landmark_coordinates(landmark_name, dimensions)
@@ -314,7 +319,6 @@ def load_calibration_request(path: str | Path) -> CalibrationRequest:
         raise CalibrationValidationError(str(file_path), "file not found") from exc
     except json.JSONDecodeError as exc:
         raise CalibrationValidationError(
-            str(file_path),
-            f"invalid JSON at line {exc.lineno}, column {exc.colno}",
+            str(file_path), f"invalid JSON at line {exc.lineno}, column {exc.colno}"
         ) from exc
     return CalibrationRequest.from_payload(payload, path=str(file_path))
