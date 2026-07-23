@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 EVALUATION_SCHEMA_VERSION = "evaluation-truth-v1"
 TRACKING_QUALITY_VERSION = "tracking-quality-v1"
@@ -56,6 +56,10 @@ def _first_number(*values: Any) -> Optional[float]:
     return None
 
 
+def _first_present(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
 def _collect_tracking_bboxes(tracking: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     segments = tracking.get("segments")
     if isinstance(segments, list):
@@ -67,7 +71,11 @@ def _collect_tracking_bboxes(tracking: Mapping[str, Any]) -> List[Mapping[str, A
                 if isinstance(bbox, Mapping):
                     collected.append(bbox)
         return collected
-    return [bbox for bbox in (tracking.get("bboxes") or []) if isinstance(bbox, Mapping)]
+    return [
+        bbox
+        for bbox in (tracking.get("bboxes") or [])
+        if isinstance(bbox, Mapping)
+    ]
 
 
 def _collect_lost_segments(tracking: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -88,12 +96,10 @@ def _collect_lost_segments(tracking: Mapping[str, Any]) -> List[Mapping[str, Any
     ]
 
 
-def compute_image_motion_metrics(tracking: Mapping[str, Any] | None) -> Dict[str, Any]:
-    """Compute image-plane diagnostics without pretending pixels are metres.
-
-    The coordinates are normalized to the video frame. Camera motion is not removed,
-    so these values are useful only as tracking diagnostics, never as athletic data.
-    """
+def compute_image_motion_metrics(
+    tracking: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Return image-plane diagnostics without converting pixels into metres."""
 
     source = _as_mapping(tracking)
     points: List[tuple[float, float, float]] = []
@@ -105,7 +111,13 @@ def compute_image_motion_metrics(tracking: Mapping[str, Any] | None) -> Dict[str
         h = _safe_float(bbox.get("h"))
         if None in (t, x, y, w, h):
             continue
-        points.append((float(t), float(x) + float(w) / 2.0, float(y) + float(h) / 2.0))
+        points.append(
+            (
+                float(t),
+                float(x) + float(w) / 2.0,
+                float(y) + float(h) / 2.0,
+            )
+        )
 
     points.sort(key=lambda item: item[0])
     path_length = 0.0
@@ -129,11 +141,18 @@ def compute_image_motion_metrics(tracking: Mapping[str, Any] | None) -> Dict[str
             motion_bursts += 1
         above_threshold = is_above
 
-    tracked_span_sec = points[-1][0] - points[0][0] if len(points) >= 2 else 0.0
-    average_speed = path_length / tracked_span_sec if tracked_span_sec > 0 else 0.0
+    tracked_span_sec = (
+        points[-1][0] - points[0][0] if len(points) >= 2 else 0.0
+    )
+    average_speed = (
+        path_length / tracked_span_sec if tracked_span_sec > 0 else 0.0
+    )
     sorted_speeds = sorted(speeds)
     if sorted_speeds:
-        p95_index = min(len(sorted_speeds) - 1, int(round(0.95 * (len(sorted_speeds) - 1))))
+        p95_index = min(
+            len(sorted_speeds) - 1,
+            int(round(0.95 * (len(sorted_speeds) - 1))),
+        )
         p95_speed = sorted_speeds[p95_index]
     else:
         p95_speed = 0.0
@@ -151,14 +170,18 @@ def compute_image_motion_metrics(tracking: Mapping[str, Any] | None) -> Dict[str
     }
 
 
-def sanitize_evidence_metrics(evidence_metrics: Mapping[str, Any] | None) -> Dict[str, Any]:
+def sanitize_evidence_metrics(
+    evidence_metrics: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
     source = _as_mapping(evidence_metrics)
     sanitized = {
         key: value
         for key, value in source.items()
         if key not in _UNVALIDATED_PHYSICAL_METRICS
     }
-    removed = sorted(key for key in _UNVALIDATED_PHYSICAL_METRICS if key in source)
+    removed = sorted(
+        key for key in _UNVALIDATED_PHYSICAL_METRICS if key in source
+    )
     if removed:
         sanitized["removed_unvalidated_metrics"] = removed
     return sanitized
@@ -174,57 +197,62 @@ def build_tracking_evaluation(
     image_motion = compute_image_motion_metrics(tracking_source)
 
     coverage_pct = _as_percent(
-        next(
-            (
-                value
-                for value in (
-                    tracking_source.get("coverage_pct_total"),
-                    tracking_source.get("coverage_pct"),
-                    candidate.get("coveragePct"),
-                    candidate.get("coverage_pct"),
-                )
-                if value is not None
-            ),
-            None,
+        _first_present(
+            tracking_source.get("coverage_pct_total"),
+            tracking_source.get("coverage_pct"),
+            candidate.get("coveragePct"),
+            candidate.get("coverage_pct"),
         )
     )
     coverage_pct = coverage_pct if coverage_pct is not None else 0.0
 
     continuity_pct = _as_percent(
-        next(
-            (
-                value
-                for value in (
-                    candidate.get("stabilityScore"),
-                    candidate.get("stability_score"),
-                    tracking_source.get("stability_score"),
-                )
-                if value is not None
-            ),
-            None,
+        _first_present(
+            candidate.get("stabilityScore"),
+            candidate.get("stability_score"),
+            tracking_source.get("stability_score"),
         )
     )
     lost_segments = _collect_lost_segments(tracking_source)
-    if continuity_pct is None:
+    observed_samples = int(image_motion.get("observed_samples") or 0)
+    if continuity_pct is not None:
+        continuity_source = "reported_stability"
+    elif observed_samples >= 2:
         continuity_pct = _clamp(100.0 - len(lost_segments) * 12.5)
+        continuity_source = "lost_segments_proxy"
+    else:
+        continuity_pct = 0.0
+        continuity_source = "unavailable"
 
+    candidate_samples = _first_number(
+        candidate.get("sampleFramesCount"),
+        candidate.get("sample_frames_count"),
+    )
+    if candidate_samples is None and isinstance(candidate.get("sample_frames"), list):
+        candidate_samples = float(len(candidate.get("sample_frames") or []))
     samples_used = int(
         max(
             0.0,
             _first_number(
-                candidate.get("sampleFramesCount"),
-                candidate.get("sample_frames_count"),
+                candidate_samples,
                 tracking_source.get("bboxes_count"),
-                image_motion.get("observed_samples"),
+                observed_samples,
             )
             or 0.0,
         )
     )
-    sample_sufficiency_pct = _clamp((samples_used / _TRACKING_SAMPLE_TARGET) * 100.0)
+    sample_sufficiency_pct = _clamp(
+        (samples_used / _TRACKING_SAMPLE_TARGET) * 100.0
+    )
 
-    segments_total = int(max(0.0, _safe_float(tracking_source.get("segments_total")) or 0.0))
+    segments_total = int(
+        max(0.0, _safe_float(tracking_source.get("segments_total")) or 0.0)
+    )
     segments_with_player = int(
-        max(0.0, _safe_float(tracking_source.get("segments_with_player")) or 0.0)
+        max(
+            0.0,
+            _safe_float(tracking_source.get("segments_with_player")) or 0.0,
+        )
     )
     segments_with_player_pct = (
         _clamp((segments_with_player / float(segments_total)) * 100.0)
@@ -242,7 +270,11 @@ def build_tracking_evaluation(
         1,
     )
 
-    if coverage_pct >= 50.0 and continuity_pct >= 70.0 and samples_used >= 60:
+    if (
+        coverage_pct >= 50.0
+        and continuity_pct >= 70.0
+        and samples_used >= 60
+    ):
         tracking_confidence = "medium"
     else:
         tracking_confidence = "low"
@@ -250,7 +282,9 @@ def build_tracking_evaluation(
     reason_codes: List[str] = []
     if coverage_pct < _LOW_COVERAGE_PCT:
         reason_codes.append("LOW_TRACKING_COVERAGE")
-    if continuity_pct < _LOW_CONTINUITY_PCT:
+    if continuity_source == "unavailable":
+        reason_codes.append("CONTINUITY_NOT_MEASURED")
+    elif continuity_pct < _LOW_CONTINUITY_PCT:
         reason_codes.append("LOW_TRACKLET_CONTINUITY")
     if samples_used < _MIN_TRACKING_SAMPLES:
         reason_codes.append("INSUFFICIENT_TRACKING_SAMPLES")
@@ -296,16 +330,23 @@ def build_tracking_evaluation(
         "signals": {
             "coverage_pct": round(coverage_pct, 2),
             "tracklet_continuity_pct": round(continuity_pct, 2),
+            "tracklet_continuity_source": continuity_source,
             "sample_sufficiency_pct": round(sample_sufficiency_pct, 2),
             "samples_used": samples_used,
-            "segments_total": segments_total or None,
-            "segments_with_player": segments_with_player or None,
+            "segments_total": segments_total if segments_total > 0 else None,
+            "segments_with_player": (
+                segments_with_player if segments_total > 0 else None
+            ),
             "segments_with_player_pct": (
                 round(segments_with_player_pct, 2)
                 if segments_with_player_pct is not None
                 else None
             ),
-            "largest_gap_sec": round(largest_gap_sec, 2) if largest_gap_sec is not None else None,
+            "largest_gap_sec": (
+                round(largest_gap_sec, 2)
+                if largest_gap_sec is not None
+                else None
+            ),
             "image_motion": image_motion,
         },
         "reason_codes": reason_codes,
@@ -328,11 +369,15 @@ def apply_evaluation_truth_gate(
     evidence_metrics: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     updated: Dict[str, Any] = dict(_as_mapping(result))
-    sanitized_evidence = sanitize_evidence_metrics(evidence_metrics or updated.get("evidence_metrics"))
+    sanitized_evidence = sanitize_evidence_metrics(
+        evidence_metrics or updated.get("evidence_metrics")
+    )
     if candidate_metrics:
         sanitized_evidence["candidate_metrics"] = dict(candidate_metrics)
     if tracking:
-        sanitized_evidence["image_motion"] = compute_image_motion_metrics(tracking)
+        sanitized_evidence["image_motion"] = compute_image_motion_metrics(
+            tracking
+        )
 
     evaluation = build_tracking_evaluation(
         candidate_metrics=candidate_metrics,
@@ -368,7 +413,9 @@ def apply_evaluation_truth_gate(
         {
             "evaluation_status": evaluation["status"],
             "player_evaluation_available": False,
-            "tracking_quality_index": evaluation["tracking_quality_index"],
+            "tracking_quality_index": evaluation[
+                "tracking_quality_index"
+            ],
             "match_rating_10": None,
             "impact_100": None,
             "overall_score": None,
@@ -383,7 +430,10 @@ def apply_evaluation_truth_gate(
             "evaluation_status": evaluation["status"],
             "score_kind": evaluation["score_kind"],
             "player_evaluation_available": False,
-            "tracking_quality_index": evaluation["tracking_quality_index"],
+            "legacy_scores_suppressed": True,
+            "tracking_quality_index": evaluation[
+                "tracking_quality_index"
+            ],
             "tracking_quality": evaluation,
             "tracking_signals": evaluation["signals"],
             "score_provenance": evaluation["provenance"],
