@@ -11,6 +11,7 @@ from app.reid.association import (
     merge_descriptors,
     update_identity_profile,
 )
+from app.reid.runtime import install_windowed_reid, reid_enabled
 
 __all__ = [
     "ASSOCIATION_VERSION",
@@ -24,4 +25,6 @@ __all__ = [
     "cosine_similarity",
     "merge_descriptors",
     "update_identity_profile",
+    "install_windowed_reid",
+    "reid_enabled",
 ]
