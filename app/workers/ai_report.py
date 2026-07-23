@@ -13,11 +13,31 @@ from app.workers.celery_app import celery
 logger = logging.getLogger(__name__)
 
 
+UNAVAILABLE_MESSAGE = (
+    "Player evaluation is unavailable until player ReID, pitch calibration, "
+    "ball events, and the scoring model are validated."
+)
+
+
 def _is_job_ready(job: AnalysisJob) -> bool:
     if job.status in {"DONE", "COMPLETED", "PARTIAL"} and job.result:
         return True
     progress_step = (job.progress or {}).get("step")
     return progress_step == "DONE" and bool(job.result)
+
+
+def _player_evaluation_available(job: AnalysisJob) -> bool:
+    result = job.result or {}
+    if not isinstance(result, dict):
+        return False
+    provenance = result.get("score_provenance") or {}
+    if not isinstance(provenance, dict):
+        return False
+    return bool(
+        result.get("player_evaluation_available") is True
+        and provenance.get("kind") == "player_evaluation"
+        and provenance.get("validated_player_score") is True
+    )
 
 
 def _save_report_failure(db: Session, job: AnalysisJob, error: str) -> None:
@@ -26,6 +46,24 @@ def _save_report_failure(db: Session, job: AnalysisJob, error: str) -> None:
     job.report = None
     # backward compatibility for old endpoint clients
     job.ai_report = {"error": error}
+    db.add(job)
+    db.commit()
+
+
+def _save_report_unavailable(db: Session, job: AnalysisJob) -> None:
+    job.report_status = "UNAVAILABLE"
+    job.report_error = UNAVAILABLE_MESSAGE
+    job.report = {
+        "summary": "Valutazione del giocatore non disponibile.",
+        "strengths": [],
+        "risks": [],
+        "key_moments": [],
+        "training_plan_14_days": [],
+        "limitations": list((job.result or {}).get("limitations") or [UNAVAILABLE_MESSAGE]),
+        "confidence": 0.0,
+    }
+    # backward compatibility for old endpoint clients
+    job.ai_report = job.report
     db.add(job)
     db.commit()
 
@@ -40,6 +78,10 @@ def _generate_report_impl(job_id: str, force: bool = False) -> None:
         if not _is_job_ready(job):
             logger.info("AI_REPORT_SKIP job_id=%s reason=job_not_ready", job_id)
             _save_report_failure(db, job, "Job not completed yet")
+            return
+        if not _player_evaluation_available(job):
+            logger.info("AI_REPORT_SKIP job_id=%s reason=player_evaluation_unavailable", job_id)
+            _save_report_unavailable(db, job)
             return
         if job.report and not force:
             logger.info("AI_REPORT_SKIP job_id=%s reason=already_exists", job_id)
@@ -68,7 +110,6 @@ def _generate_report_impl(job_id: str, force: bool = False) -> None:
             logger.error("AI_REPORT_FAIL job_id=%s error=%s", job.id, exc)
             _save_report_failure(db, job, str(exc))
             return
-
         if usage is not None:
             logger.info("AI_REPORT_OK job_id=%s usage=%s", job.id, usage)
         else:

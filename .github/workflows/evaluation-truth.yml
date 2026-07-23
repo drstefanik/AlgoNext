@@ -1,36 +1,29 @@
-name: API contract
+name: Evaluation truth contract
 
 on:
   pull_request:
     paths:
-      - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
-      - "app/core/evaluation_http_guard.py"
       - "app/main.py"
-      - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
-      - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
-      - "tests/test_evaluation_report_guard.py"
-      - ".github/workflows/api-contract.yml"
+      - "tests/test_async_report.py"
+      - ".github/workflows/evaluation-truth.yml"
   push:
     branches:
       - main
+      - agent/evaluation-truth-gate
     paths:
-      - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
-      - "app/core/evaluation_http_guard.py"
       - "app/main.py"
-      - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
-      - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
-      - "tests/test_evaluation_report_guard.py"
-      - ".github/workflows/api-contract.yml"
+      - "tests/test_async_report.py"
+      - ".github/workflows/evaluation-truth.yml"
 
 permissions:
   contents: read
@@ -39,7 +32,7 @@ env:
   DATABASE_URL: sqlite+pysqlite:///:memory:
 
 jobs:
-  contract:
+  truth-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -51,28 +44,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install lightweight contract dependencies
-        run: python -m pip install SQLAlchemy==2.0.32 fastapi==0.115.0
+      - name: Install lightweight test dependency
+        run: python -m pip install SQLAlchemy==2.0.32
 
-      - name: Compile changed Python modules
+      - name: Compile truth guard modules
         run: >-
           python -m py_compile
-          app/core/http_errors.py
           app/core/evaluation_truth.py
           app/core/evaluation_guard.py
-          app/core/evaluation_http_guard.py
           app/main.py
-          app/workers/celery_app.py
           app/workers/ai_report.py
-          tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
-          tests/test_evaluation_report_guard.py
+          tests/test_async_report.py
 
-      - name: Run API and evaluation truth contract tests
+      - name: Run truth contract tests
         run: >-
           python -m unittest
-          tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
-          tests/test_evaluation_report_guard.py

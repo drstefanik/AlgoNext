@@ -37,5 +37,7 @@ class HttpErrorContractTests(unittest.TestCase):
         self.assertEqual(error["message"], "Invalid bbox")
 
 
+# This file remains in the existing workflow path filter so contract extensions
+# are exercised by GitHub Actions on the implementation branch.
 if __name__ == "__main__":
     unittest.main()

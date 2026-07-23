@@ -65,6 +65,11 @@ class AsyncReportTests(unittest.TestCase):
             role="player",
             progress={"step": "DONE", "pct": 100},
             result={
+                "player_evaluation_available": True,
+                "score_provenance": {
+                    "kind": "player_evaluation",
+                    "validated_player_score": True,
+                },
                 "assets": {
                     "clips": [
                         {
@@ -73,7 +78,7 @@ class AsyncReportTests(unittest.TestCase):
                             "end_sec": 4.0,
                         }
                     ]
-                }
+                },
             },
             created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
             updated_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
@@ -83,9 +88,10 @@ class AsyncReportTests(unittest.TestCase):
         self.request.state.request_id = "req-rpt"
 
     def test_post_report_enqueues_task_and_sets_pending(self):
-        with patch("app.api._build_ai_report_payload", return_value={"clips": [{"url": "https://example.com/c.mp4"}]}), patch(
-            "app.workers.ai_report.generate_report"
-        ) as mock_task:
+        with patch(
+            "app.api._build_ai_report_payload",
+            return_value={"clips": [{"url": "https://example.com/c.mp4"}]},
+        ), patch("app.workers.ai_report.generate_report") as mock_task:
             mock_task.delay.return_value = None
             payload = api.enqueue_job_report(self.job.id, self.request, 1, self.session)
 
@@ -117,11 +123,42 @@ class AsyncReportTests(unittest.TestCase):
         with patch("app.workers.ai_report.SessionLocal", return_value=self.session), patch(
             "app.workers.ai_report._build_ai_report_payload",
             return_value={"clips": [{"url": "https://example.com/c.mp4"}]},
-        ), patch("app.workers.ai_report.generate_ai_report", return_value=(expected, None)):
+        ), patch(
+            "app.workers.ai_report.generate_ai_report", return_value=(expected, None)
+        ):
             ai_report_worker._generate_report_impl(self.job.id, force=True)
 
         self.assertEqual(self.job.report_status, "DONE")
         self.assertEqual(self.job.report, expected)
+
+    def test_worker_abstains_when_player_evaluation_is_not_validated(self):
+        self.job.result = {
+            "player_evaluation_available": False,
+            "score_provenance": {
+                "kind": "tracking_quality",
+                "validated_player_score": False,
+            },
+            "limitations": ["Identity not verified across shots."],
+            "assets": {
+                "clips": [
+                    {
+                        "url": "https://example.com/clip1.mp4",
+                        "start_sec": 1.0,
+                        "end_sec": 4.0,
+                    }
+                ]
+            },
+        }
+
+        with patch("app.workers.ai_report.SessionLocal", return_value=self.session), patch(
+            "app.workers.ai_report.generate_ai_report"
+        ) as generate_mock:
+            ai_report_worker._generate_report_impl(self.job.id, force=True)
+
+        generate_mock.assert_not_called()
+        self.assertEqual(self.job.report_status, "UNAVAILABLE")
+        self.assertEqual(self.job.report["confidence"], 0.0)
+        self.assertIn("Identity not verified", self.job.report["limitations"][0])
 
 
 if __name__ == "__main__":
