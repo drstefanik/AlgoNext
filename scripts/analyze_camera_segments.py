@@ -5,16 +5,21 @@ import argparse
 import json
 import math
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from app.vision.camera_analysis import (
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from app.vision.camera_analysis import (  # noqa: E402
     CameraAnalysisThresholds,
     analyze_camera_video,
 )
-from app.vision.pitch_geometry import PitchGeometryThresholds
-from app.vision.shot_segmentation import ShotSegmentationThresholds
+from app.vision.pitch_geometry import PitchGeometryThresholds  # noqa: E402
+from app.vision.shot_segmentation import ShotSegmentationThresholds  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,7 +107,7 @@ def main() -> int:
         payload = result.to_payload(include_samples=args.include_samples)
         _write_json_atomic(Path(args.output), payload)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        print(f"camera analysis failed: {exc}", file=os.sys.stderr)
+        print(f"camera analysis failed: {exc}", file=sys.stderr)
         return 2
 
     summary = payload["summary"]
