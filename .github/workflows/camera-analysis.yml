@@ -1,0 +1,89 @@
+name: Camera analysis contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/vision/**"
+      - "scripts/analyze_camera_segments.py"
+      - "tests/test_pitch_geometry.py"
+      - "tests/test_shot_segmentation.py"
+      - "tests/test_camera_analysis*.py"
+      - "tests/synthetic_pitch.py"
+      - "docs/camera_analysis.md"
+      - "docs/schemas/camera-analysis-v1.schema.json"
+      - ".github/workflows/camera-analysis.yml"
+  pull_request:
+    paths:
+      - "app/vision/**"
+      - "scripts/analyze_camera_segments.py"
+      - "tests/test_pitch_geometry.py"
+      - "tests/test_shot_segmentation.py"
+      - "tests/test_camera_analysis*.py"
+      - "tests/synthetic_pitch.py"
+      - "docs/camera_analysis.md"
+      - "docs/schemas/camera-analysis-v1.schema.json"
+      - ".github/workflows/camera-analysis.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  camera-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: >-
+          python -m pip install --quiet
+          numpy==1.26.4
+          opencv-python-headless==4.10.0.84
+          jsonschema==4.23.0
+
+      - name: Compile camera-analysis modules, CLI and tests
+        run: >-
+          python -m py_compile
+          app/vision/__init__.py
+          app/vision/pitch_geometry.py
+          app/vision/shot_segmentation.py
+          app/vision/camera_analysis.py
+          scripts/analyze_camera_segments.py
+          tests/synthetic_pitch.py
+          tests/test_pitch_geometry.py
+          tests/test_shot_segmentation.py
+          tests/test_camera_analysis.py
+          tests/test_camera_analysis_schema.py
+          tests/test_camera_analysis_video.py
+
+      - name: Run deterministic camera-analysis tests
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          python -m unittest \
+            tests/test_pitch_geometry.py \
+            tests/test_shot_segmentation.py \
+            tests/test_camera_analysis.py \
+            tests/test_camera_analysis_schema.py \
+            tests/test_camera_analysis_video.py \
+            > /tmp/camera-analysis-tests.log 2>&1
+          status=$?
+          cat /tmp/camera-analysis-tests.log
+          exit "$status"
+
+      - name: Upload camera-analysis test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-analysis-test-diagnostics
+          path: /tmp/camera-analysis-tests.log
+          if-no-files-found: error
+          retention-days: 3
