@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
