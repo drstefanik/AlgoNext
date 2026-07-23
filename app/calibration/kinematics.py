@@ -230,6 +230,7 @@ def project_tracking_footpoints(
 def _smooth_points(
     points: Sequence[CalibratedTrackPoint],
     window: int,
+    maximum_gap_sec: float,
 ) -> list[CalibratedTrackPoint]:
     if window <= 1 or len(points) < 3:
         return list(points)
@@ -242,7 +243,7 @@ def _smooth_points(
             item
             for item in points[start:end]
             if item.calibration_id == point.calibration_id
-            and abs(item.time_sec - point.time_sec) <= 1.0
+            and abs(item.time_sec - point.time_sec) <= maximum_gap_sec
         ]
         smoothed.append(
             CalibratedTrackPoint(
@@ -295,7 +296,11 @@ def calculate_calibrated_motion(
     )
     if len(points) < thresholds.minimum_projected_points:
         reason_codes.append("INSUFFICIENT_CALIBRATED_TRACK_POINTS")
-    smoothed = _smooth_points(points, thresholds.smoothing_window)
+    smoothed = _smooth_points(
+        points,
+        thresholds.smoothing_window,
+        thresholds.maximum_gap_sec,
+    )
 
     total_distance = 0.0
     observed_duration = 0.0
