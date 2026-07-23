@@ -88,6 +88,7 @@ def _maximum_weight_assignment(
     maximum = max(max(row) for row in padded)
     costs = [[maximum - value for value in row] for row in padded]
 
+    # Hungarian algorithm for minimum-cost assignment, 1-indexed.
     u = [0] * (size + 1)
     v = [0] * (size + 1)
     p = [0] * (size + 1)
@@ -158,7 +159,12 @@ def _match_frame(
     ]
     tracks = prediction.tracks if prediction is not None else ()
 
-    cardinality_bonus = 1_000_000
+    # Valid pairs receive a cardinality bonus large enough that one additional
+    # match always dominates every possible total-IoU difference in the frame.
+    # This creates a true lexicographic objective: match count first, IoU second.
+    iou_scale = 100_000
+    maximum_matches = min(len(active_gt_indices), len(tracks))
+    cardinality_bonus = (maximum_matches + 1) * iou_scale
     weights: list[list[int]] = []
     ious: dict[tuple[int, int], float] = {}
     for gt_index in active_gt_indices:
@@ -167,7 +173,7 @@ def _match_frame(
             overlap = bbox_iou(annotation.objects[gt_index].bbox, track.bbox)
             ious[(gt_index, prediction_index)] = overlap
             if overlap >= iou_threshold:
-                row.append(cardinality_bonus + int(round(overlap * 100_000)))
+                row.append(cardinality_bonus + int(round(overlap * iou_scale)))
             else:
                 row.append(0)
         weights.append(row)
