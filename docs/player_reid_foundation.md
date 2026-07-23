@@ -2,11 +2,11 @@
 
 ## Status
 
-This module is an **experimental ReID foundation**, not a validated cross-camera
-player identity system. It is deliberately not wired into the production worker
-in this change.
+Player ReID is now connected to the full-match windowed tracker behind a feature
+flag. It remains an **experimental association system**, not a validated
+cross-camera player identity capability.
 
-The production capability must remain:
+The public capability must therefore remain:
 
 ```json
 {
@@ -14,31 +14,67 @@ The production capability must remain:
 }
 ```
 
-until the implementation is connected to the windowed tracker and passes the
-held-out tracking benchmark with documented model/configuration hashes.
+until the locked tracking benchmark passes with a documented dataset,
+configuration and model hash. Enabling the implementation does not make the
+capability scientifically validated.
+
+## Runtime activation and rollback
+
+The worker installs the ReID implementation before `pipeline.py` imports
+`track_player_windowed`.
+
+```text
+PLAYER_REID_ENABLED=1       # install experimental tracker
+PLAYER_REID_ENABLED=0       # immediate kill switch
+PLAYER_REID_FAIL_OPEN=1     # return to legacy geometry tracker on runtime error
+PLAYER_REID_FAIL_OPEN=0     # fail the job instead
+```
+
+Docker Compose enables ReID by default for the worker while preserving both
+overrides through environment variables.
+
+A `TrackingTimeoutError` never triggers a second legacy run. Other unexpected
+exceptions fail open by default and return a `reid_summary.status` of
+`FALLBACK_LEGACY`.
 
 ## Goal
 
 ByteTrack identifiers are local to a continuous tracking context. A numeric ID
-reappearing after a tracker reset, camera cut, replay, or separate processing
+reappearing after a tracker reset, camera cut, replay or separate processing
 window is not evidence that the same player was found.
 
-The ReID foundation introduces three explicit concepts:
+The ReID implementation introduces four explicit concepts:
 
 1. **Appearance descriptor**: a versioned vector derived from player crops.
 2. **Identity profile**: a manually anchored player descriptor updated only after
    accepted associations.
-3. **Association decision**: an auditable `ACCEPTED` or `ABSTAINED` result with
+3. **Candidate set**: multiple local ByteTrack tracks evaluated in every window.
+4. **Association decision**: an auditable `ACCEPTED` or `ABSTAINED` result with
    candidate scores and reason codes.
+
+## Window processing order
+
+The tracker no longer begins blindly at minute zero. It:
+
+1. finds the processing window containing the manually selected anchor;
+2. resolves the anchor to one local ByteTrack track;
+3. builds the initial identity descriptor from several crops in that track;
+4. processes later windows in chronological order;
+5. independently processes earlier windows in reverse order;
+6. keeps a separate profile history for each direction, both rooted in the
+   manual anchor.
+
+This avoids using a weak early-window geometry guess to define the identity for
+the entire match.
 
 ## Appearance descriptor
 
 `hsv-torso-v1` is a lightweight baseline built from:
 
 - separate upper- and lower-body regions;
-- hue, saturation, and value histograms;
+- hue, saturation and value histograms;
 - per-region colour means and standard deviations;
-- crop quality based on size, sharpness, saturation, and human-like aspect ratio.
+- crop quality based on size, sharpness, saturation and human-like aspect ratio.
 
 It is intended to make the association contract executable before a learned
 person-ReID model is introduced. It is not expected to separate teammates with
@@ -52,16 +88,41 @@ Descriptors carry:
 - `quality` in `[0, 1]`.
 
 Profiles with incompatible descriptor versions or dimensions cannot be merged.
+Descriptor vectors are not written to the public tracking summary; only version,
+sample count and quality are persisted.
+
+## Candidate generation
+
+Every window exposes several local tracks rather than only the geometry winner.
+Candidates are ranked for descriptor extraction using:
+
+- temporal overlap with the most recent accepted window;
+- boundary geometry consistency;
+- detection count;
+- average detector confidence.
+
+The default maximum is six candidates with up to five temporally distributed
+crop samples per candidate. These limits are configurable.
+
+```text
+PLAYER_REID_MAX_CANDIDATES=6
+PLAYER_REID_SAMPLES_PER_CANDIDATE=5
+PLAYER_REID_MIN_TRACK_HITS=3
+PLAYER_REID_MIN_INDIVIDUAL_CROP_QUALITY=0.18
+```
+
+The sampling routine spreads observations across the track and always preserves
+the strongest confidence-by-area crop.
 
 ## Association inputs
 
 Each candidate may contribute:
 
 - appearance similarity;
-- temporal-overlap consistency between adjacent windows;
-- geometry consistency;
+- temporal-overlap consistency at common absolute timestamps;
+- geometry consistency at the processing boundary;
 - descriptor quality and sample count;
-- detection count and arbitrary audit metadata.
+- detection count and audit metadata.
 
 The default normalized score weights are:
 
@@ -76,20 +137,20 @@ sufficient because a missing appearance descriptor is a hard failure.
 
 ## Default hard gates
 
-| Gate | Default |
-|---|---:|
-| Combined score | >= 0.76 |
-| Appearance similarity | >= 0.78 |
-| Strong overlap exception | >= 0.65 |
-| Best-vs-second margin | >= 0.07 |
-| Descriptor quality | >= 0.30 |
-| Descriptor samples | >= 2 |
+| Gate | Default | Environment variable |
+|---|---:|---|
+| Combined score | >= 0.76 | `PLAYER_REID_MIN_COMBINED_SCORE` |
+| Appearance similarity | >= 0.78 | `PLAYER_REID_MIN_APPEARANCE_SIMILARITY` |
+| Strong overlap exception | >= 0.65 | `PLAYER_REID_STRONG_OVERLAP_SCORE` |
+| Best-vs-second margin | >= 0.07 | `PLAYER_REID_MIN_MARGIN` |
+| Descriptor quality | >= 0.30 | `PLAYER_REID_MIN_DESCRIPTOR_QUALITY` |
+| Descriptor samples | >= 2 | `PLAYER_REID_MIN_DESCRIPTOR_SAMPLES` |
 
 The strong-overlap exception permits a lower appearance score only when adjacent
 windows contain compelling temporal overlap. It does not allow an association
 without an appearance descriptor.
 
-## Abstention reasons
+## Abstention policy
 
 The decision returns `ABSTAINED` for conditions including:
 
@@ -100,12 +161,14 @@ The decision returns `ABSTAINED` for conditions including:
 - `INSUFFICIENT_DESCRIPTOR_SAMPLES`;
 - `LOW_APPEARANCE_SIMILARITY`;
 - `LOW_COMBINED_SCORE`;
-- `AMBIGUOUS_CANDIDATE_MARGIN`.
+- `AMBIGUOUS_CANDIDATE_MARGIN`;
+- `WINDOW_PROCESSING_FAILED`.
 
-Similar-kit candidates with a small score margin must abstain. The profile is
-updated only after the caller observes an explicit accepted decision.
+An abstained window receives no selected track and contributes no player boxes.
+The last accepted profile is not mutated. This intentionally prefers missing
+data over assigning a teammate to the selected player.
 
-Every decision currently contains:
+Every automatic decision currently contains:
 
 ```json
 {
@@ -113,6 +176,27 @@ Every decision currently contains:
   "validated": false
 }
 ```
+
+## Tracking artifact
+
+The output keeps `mode: full_match_windowed` for pipeline compatibility and adds:
+
+```json
+{
+  "identity_mode": "appearance_reid_v1",
+  "method": "yolo+bytetrack+appearance_reid",
+  "reid_summary": {
+    "status": "EXPERIMENTAL",
+    "validated": false,
+    "accepted_associations": 0,
+    "abstained_associations": 0
+  }
+}
+```
+
+Each segment includes its local track, direction, identity status and full
+association decision. Coverage is computed from unique sampled timestamps so
+overlapping windows are not counted twice.
 
 ## Benchmark integration
 
@@ -141,31 +225,29 @@ identity/selected-player
 ```
 
 An `ABSTAINED` decision remains local and cannot receive free IDF1 continuity.
-An incorrect accepted association is therefore penalized by the global identity
-assignment, ID switches, and HOTA-style association metric.
+An incorrect accepted association is penalized by global identity assignment,
+ID switches and the HOTA-style association metric.
 
-## Production activation checklist
+## Validation still required
 
-Do not connect this module to `track_player_windowed` until all of the following
-are complete:
+The implementation is deployable but not yet validated. Promotion of
+`cross_shot_player_reidentification` to `true` requires all of the following:
 
-1. manual anchor crop extraction is deterministic and logged;
-2. every window exposes multiple candidate profiles, not only the currently
-   selected local track;
-3. temporal overlap is computed from common absolute timestamps;
-4. ambiguous windows abstain without mutating the identity profile;
-5. development and validation sets include similar-kit teammates, cuts, replay,
-   occlusion, zoom, and small boxes;
-6. thresholds are selected on validation data, not the held-out test split;
-7. the locked test split passes the tracking release gate;
-8. per-sequence failures are reviewed, especially ID switches and long gaps;
-9. the feature is deployed behind a kill switch;
-10. capability metadata remains false until production monitoring confirms the
-    same validated configuration.
+1. an annotated development, validation and locked test split;
+2. similar-kit teammates, camera cuts, replay, occlusion, zoom and small boxes;
+3. threshold selection on validation data only;
+4. release-gate success for detection F1, IDF1, coverage, identity switches and
+   HOTA-style association;
+5. per-sequence review of false accepted associations;
+6. production monitoring using the exact validated configuration;
+7. documented descriptor/model and configuration hashes.
+
+Player scoring, athletic metrics and technical-tactical claims remain disabled
+regardless of ReID status.
 
 ## Tests
 
-The current tests verify:
+The test suite verifies:
 
 - clear multi-signal candidate acceptance;
 - same-kit ambiguity abstention;
@@ -175,4 +257,10 @@ The current tests verify:
 - profile updates are explicit;
 - synthetic same-uniform crops are closer than different-uniform crops;
 - tiny crops are rejected;
+- anchor-first bidirectional processing order;
+- descriptor sampling preserves temporal spread and the best crop;
+- overlap and geometry scoring behaviour;
+- coverage deduplication across overlapping windows;
+- feature-flag installation, idempotence, fail-open and fail-closed behaviour;
+- tracking timeouts never restart a second legacy pass;
 - only accepted ReID decisions receive cross-window benchmark continuity.
