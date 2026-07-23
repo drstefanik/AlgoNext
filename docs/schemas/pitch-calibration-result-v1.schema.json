@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/pitch-calibration-result-v1.schema.json",
+  "title": "AlgoNext pitch calibration result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "camera_segment_id",
+    "status",
+    "validated",
+    "method",
+    "source",
+    "pitch",
+    "matrix_image_to_field",
+    "matrix_field_to_image",
+    "quality",
+    "thresholds",
+    "reason_codes",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pitch-calibration-result-v1"
+    },
+    "camera_segment_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": ["VALIDATED", "REJECTED"]
+    },
+    "validated": {
+      "type": "boolean"
+    },
+    "method": {
+      "const": "opencv-findHomography-ransac-v1"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "start_sec": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "end_sec": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "pitch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["length_m", "width_m"],
+      "properties": {
+        "length_m": {
+          "type": "number",
+          "minimum": 90,
+          "maximum": 120
+        },
+        "width_m": {
+          "type": "number",
+          "minimum": 45,
+          "maximum": 90
+        }
+      }
+    },
+    "matrix_image_to_field": {
+      "$ref": "#/$defs/matrix3x3"
+    },
+    "matrix_field_to_image": {
+      "$ref": "#/$defs/matrix3x3"
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_correspondences",
+        "inlier_count",
+        "inlier_mask",
+        "inlier_ratio",
+        "rmse_m",
+        "median_error_m",
+        "p95_error_m",
+        "maximum_error_m",
+        "image_hull_area_ratio",
+        "field_hull_area_ratio",
+        "condition_number",
+        "minimum_projective_denominator"
+      ],
+      "properties": {
+        "total_correspondences": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "inlier_count": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "inlier_mask": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "type": "boolean"
+          }
+        },
+        "inlier_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "rmse_m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "median_error_m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p95_error_m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "maximum_error_m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "image_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "field_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "condition_number": {
+          "type": "number",
+          "minimum": 0
+        },
+        "minimum_projective_denominator": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "thresholds": {
+      "$ref": "#/$defs/thresholds"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coordinate_input",
+        "coordinate_output",
+        "opencv_version",
+        "quality_gate",
+        "ransac_seed"
+      ],
+      "properties": {
+        "coordinate_input": {
+          "const": "image_normalized_0_1"
+        },
+        "coordinate_output": {
+          "const": "pitch_metres"
+        },
+        "opencv_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "quality_gate": {
+          "const": "pitch-calibration-gate-v1"
+        },
+        "ransac_seed": {
+          "const": 0
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "VALIDATED"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validated": {
+            "const": true
+          },
+          "reason_codes": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "REJECTED"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validated": {
+            "const": false
+          },
+          "reason_codes": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "matrix3x3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": {
+          "type": "number"
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_correspondences",
+        "ransac_reprojection_threshold_m",
+        "minimum_inlier_ratio",
+        "maximum_rmse_m",
+        "maximum_p95_error_m",
+        "minimum_image_hull_area_ratio",
+        "minimum_field_hull_area_ratio",
+        "maximum_condition_number",
+        "minimum_projective_denominator"
+      ],
+      "properties": {
+        "minimum_correspondences": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "ransac_reprojection_threshold_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_inlier_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_rmse_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "maximum_p95_error_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_image_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "minimum_field_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_condition_number": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_projective_denominator": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    }
+  }
+}
