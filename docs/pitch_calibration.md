@@ -86,8 +86,16 @@ or one of the canonical landmarks:
 ```
 
 The Python parser rejects duplicate points, invalid dimensions, out-of-frame
-image coordinates, out-of-pitch field coordinates and invalid time intervals.
-The JSON Schema is available in `docs/schemas`.
+image coordinates, out-of-pitch field coordinates, invalid time intervals and
+unknown fields. A correspondence must contain exactly one of `field` or
+`landmark`.
+
+The request deliberately exposes no user-controlled weight. Every point has the
+same influence on quality measurements, so a poor calibration cannot be made to
+pass by down-weighting inconvenient reprojection errors.
+
+The JSON Schema is available in `docs/schemas` and is tested against the Python
+parser and serialized result objects.
 
 ## Homography fitting
 
@@ -95,18 +103,28 @@ The solver uses OpenCV `findHomography` with RANSAC and then evaluates all
 reported inliers in metres. Four points are mathematically sufficient to fit a
 homography, but the default validation gate requires at least six.
 
+RANSAC uses a recorded fixed seed and a process lock around OpenCV's global RNG.
+This makes concurrent server fits reproducible for the same input, OpenCV
+version and thresholds.
+
 The result includes:
 
 - image-to-field and field-to-image matrices;
 - the complete inlier mask;
 - inlier ratio;
-- weighted RMSE in metres;
+- unweighted RMSE in metres;
 - median, p95 and maximum inlier error;
 - convex-hull coverage in image space;
 - convex-hull coverage on the field;
 - normalized homography condition number;
-- minimum projective denominator sampled across the frame;
-- reason codes and exact thresholds.
+- the minimum projective denominator over the frame;
+- reason codes and exact thresholds;
+- OpenCV version, quality-gate version and RANSAC seed.
+
+The projective denominator is checked analytically at the four frame corners.
+Because it is affine in image coordinates, a sign change at the corners proves
+that the projective horizon crosses the frame; such a fit is rejected even if a
+finite sampling grid misses the exact zero.
 
 ## Default quality gate
 
@@ -114,7 +132,7 @@ The result includes:
 |---|---:|
 | Correspondences | >= 6 |
 | RANSAC inlier ratio | >= 0.75 |
-| Weighted RMSE | <= 1.5 m |
+| RMSE | <= 1.5 m |
 | p95 inlier error | <= 3.0 m |
 | Image convex-hull coverage | >= 2% |
 | Field convex-hull coverage | >= 8% |
@@ -122,7 +140,8 @@ The result includes:
 | Projective denominator | >= 0.005 |
 
 A failed gate returns `status: REJECTED`, `validated: false` and one or more
-reason codes. Downstream metric code ignores rejected calibrations.
+reason codes. Downstream metric code ignores rejected calibrations. A result
+with non-finite matrices, projections or quality values is not serializable.
 
 Point coverage matters because six precise points concentrated around the centre
 circle do not constrain the corners of the pitch. Low reprojection error alone
@@ -145,6 +164,10 @@ Motion projection selects a validated calibration by timestamp. It never reuses
 a homography outside its declared interval. If several validated calibrations
 overlap, the most specific interval with the lowest RMSE is chosen.
 
+No movement transition, smoothing neighbourhood or sprint interval is allowed
+to cross from one `camera_segment_id` to another. The first sample after a camera
+change starts a new trajectory fragment.
+
 A future shot-boundary and pitch-keypoint stage must generate these segments
 automatically. Replay and non-pitch shots must be marked uncalibrated.
 
@@ -157,9 +180,12 @@ automatically. Replay and non-pitch shots must be marked uncalibrated.
 3. projects the centre-bottom point through the matching calibration;
 4. removes samples outside the pitch plus a small tolerance;
 5. deduplicates overlapping-window samples by timestamp and confidence;
-6. optionally applies a short median smoother inside the same camera segment;
-7. rejects long temporal gaps, implausible speed and implausible acceleration;
-8. reports only accepted, observed transitions.
+6. applies median smoothing only inside the same camera segment and accepted
+   temporal neighbourhood;
+7. rejects camera changes, long temporal gaps, implausible speed and implausible
+   acceleration;
+8. requires continuous accepted duration for a sprint proxy;
+9. reports only accepted, observed transitions.
 
 Outputs deliberately use names such as:
 
@@ -187,7 +213,8 @@ Default motion filters:
 | Minimum projected points | 10 |
 
 These are engineering filters, not normative definitions of athletic
-performance. All values are returned in provenance and are configurable.
+performance. Every value is returned with the diagnostic result and is
+configurable.
 
 ## CLI
 
@@ -211,7 +238,8 @@ python scripts/apply_pitch_calibration.py \
 ```
 
 The calibration argument may contain one result, an array of results, or an
-object with a `calibrations` array.
+object with a `calibrations` array. Both CLIs persist the exact thresholds used
+in their output.
 
 ## Validation required before production capability
 
