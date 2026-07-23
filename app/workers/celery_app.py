@@ -9,8 +9,10 @@ from app.core.env import load_env
 load_env()
 
 from app.core.evaluation_guard import install_evaluation_guard
+from app.reid.runtime import install_windowed_reid
 
 install_evaluation_guard()
+install_windowed_reid()
 
 logger = logging.getLogger(__name__)
 

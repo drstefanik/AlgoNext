@@ -162,6 +162,8 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       MINIO_BUCKET: fnh
       TRACKING_TIMEOUT_SECONDS: "3600"
+      PLAYER_REID_ENABLED: "${PLAYER_REID_ENABLED:-1}"
+      PLAYER_REID_FAIL_OPEN: "${PLAYER_REID_FAIL_OPEN:-1}"
 
       # OpenAI (valore preso da .env sul server)
       OPENAI_API_KEY: ${OPENAI_API_KEY}
