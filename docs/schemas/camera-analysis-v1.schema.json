@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/camera-analysis-v1.schema.json",
+  "title": "AlgoNext camera analysis v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "shot_analysis",
+    "segments",
+    "automatic_calibration_available",
+    "reason_codes",
+    "thresholds",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {"const": "camera-analysis-v1"},
+    "shot_analysis": {"$ref": "#/$defs/shotAnalysis"},
+    "segments": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/segment"}
+    },
+    "automatic_calibration_available": {"const": false},
+    "reason_codes": {"$ref": "#/$defs/reasonCodes"},
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "geometry_frames_per_shot",
+        "minimum_candidate_geometry_frames",
+        "minimum_mean_pitch_probability"
+      ],
+      "properties": {
+        "geometry_frames_per_shot": {"type": "integer", "minimum": 1},
+        "minimum_candidate_geometry_frames": {"type": "integer", "minimum": 1},
+        "minimum_mean_pitch_probability": {"$ref": "#/$defs/probability"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shot_count",
+        "pitch_candidate_shots",
+        "geometry_candidate_shots",
+        "excluded_shots"
+      ],
+      "properties": {
+        "shot_count": {"type": "integer", "minimum": 1},
+        "pitch_candidate_shots": {"type": "integer", "minimum": 0},
+        "geometry_candidate_shots": {"type": "integer", "minimum": 0},
+        "excluded_shots": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "probability": {"type": "number", "minimum": 0, "maximum": 1},
+    "reasonCodes": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "pitchEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "green_ratio",
+        "white_line_ratio",
+        "edge_density",
+        "line_count",
+        "orientation_family_count",
+        "intersection_count",
+        "pitch_probability",
+        "classification"
+      ],
+      "properties": {
+        "green_ratio": {"$ref": "#/$defs/probability"},
+        "white_line_ratio": {"$ref": "#/$defs/probability"},
+        "edge_density": {"$ref": "#/$defs/probability"},
+        "line_count": {"type": "integer", "minimum": 0},
+        "orientation_family_count": {"type": "integer", "minimum": 0},
+        "intersection_count": {"type": "integer", "minimum": 0},
+        "pitch_probability": {"$ref": "#/$defs/probability"},
+        "classification": {"enum": ["PITCH_CANDIDATE", "NON_PITCH", "UNKNOWN"]}
+      }
+    },
+    "line": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x1", "y1", "x2", "y2", "angle_deg",
+        "length_fraction", "mask_support", "confidence"
+      ],
+      "properties": {
+        "x1": {"$ref": "#/$defs/probability"},
+        "y1": {"$ref": "#/$defs/probability"},
+        "x2": {"$ref": "#/$defs/probability"},
+        "y2": {"$ref": "#/$defs/probability"},
+        "angle_deg": {"type": "number", "minimum": 0, "exclusiveMaximum": 180},
+        "length_fraction": {"type": "number", "minimum": 0},
+        "mask_support": {"$ref": "#/$defs/probability"},
+        "confidence": {"$ref": "#/$defs/probability"}
+      }
+    },
+    "keypoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x", "y", "kind", "confidence", "source_line_indices", "semantic_landmark"
+      ],
+      "properties": {
+        "x": {"$ref": "#/$defs/probability"},
+        "y": {"$ref": "#/$defs/probability"},
+        "kind": {"const": "line_intersection"},
+        "confidence": {"$ref": "#/$defs/probability"},
+        "source_line_indices": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "semantic_landmark": {"type": ["string", "null"]}
+      }
+    },
+    "geometryProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "status", "evidence", "lines", "keypoints",
+        "semantic_landmarks_available", "calibration_ready", "reason_codes"
+      ],
+      "properties": {
+        "schema_version": {"const": "pitch-geometry-proposal-v1"},
+        "status": {"enum": ["CANDIDATE", "INSUFFICIENT"]},
+        "evidence": {"$ref": "#/$defs/pitchEvidence"},
+        "lines": {"type": "array", "items": {"$ref": "#/$defs/line"}},
+        "keypoints": {"type": "array", "items": {"$ref": "#/$defs/keypoint"}},
+        "semantic_landmarks_available": {"const": false},
+        "calibration_ready": {"const": false},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"}
+      }
+    },
+    "shot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shot_id", "start_sec", "end_sec", "duration_sec",
+        "sample_start_index", "sample_end_index", "representative_sample_index",
+        "representative_time_sec", "classification", "pitch_probability",
+        "pitch_frame_ratio", "short_insert", "calibration_candidate",
+        "exclude_from_calibration", "reason_codes"
+      ],
+      "properties": {
+        "shot_id": {"type": "string", "pattern": "^shot-[0-9]{4}$"},
+        "start_sec": {"type": "number", "minimum": 0},
+        "end_sec": {"type": "number", "minimum": 0},
+        "duration_sec": {"type": "number", "minimum": 0},
+        "sample_start_index": {"type": "integer", "minimum": 0},
+        "sample_end_index": {"type": "integer", "minimum": 0},
+        "representative_sample_index": {"type": "integer", "minimum": 0},
+        "representative_time_sec": {"type": "number", "minimum": 0},
+        "classification": {"enum": ["PITCH_CANDIDATE", "NON_PITCH", "UNKNOWN"]},
+        "pitch_probability": {"$ref": "#/$defs/probability"},
+        "pitch_frame_ratio": {"$ref": "#/$defs/probability"},
+        "short_insert": {"type": "boolean"},
+        "calibration_candidate": {"type": "boolean"},
+        "exclude_from_calibration": {"type": "boolean"},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"}
+      }
+    },
+    "geometryFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_index", "time_sec", "proposal"],
+      "properties": {
+        "sample_index": {"type": "integer", "minimum": 0},
+        "time_sec": {"type": "number", "minimum": 0},
+        "proposal": {"$ref": "#/$defs/geometryProposal"}
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shot", "status", "geometry_candidate_count", "geometry_frames",
+        "automatic_calibration_available", "reason_codes"
+      ],
+      "properties": {
+        "shot": {"$ref": "#/$defs/shot"},
+        "status": {"enum": ["EXCLUDED", "INSUFFICIENT", "GEOMETRY_CANDIDATE"]},
+        "geometry_candidate_count": {"type": "integer", "minimum": 0},
+        "geometry_frames": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/geometryFrame"}
+        },
+        "automatic_calibration_available": {"const": false},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"}
+      }
+    },
+    "boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "time_sec", "before_sample_index", "after_sample_index", "score", "threshold", "kind"
+      ],
+      "properties": {
+        "time_sec": {"type": "number", "minimum": 0},
+        "before_sample_index": {"type": "integer", "minimum": 0},
+        "after_sample_index": {"type": "integer", "minimum": 0},
+        "score": {"$ref": "#/$defs/probability"},
+        "threshold": {"$ref": "#/$defs/probability"},
+        "kind": {"const": "HARD_CUT"}
+      }
+    },
+    "frameObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["time_sec", "distance_from_previous", "brightness", "contrast", "pitch"],
+      "properties": {
+        "time_sec": {"type": "number", "minimum": 0},
+        "distance_from_previous": {"$ref": "#/$defs/probability"},
+        "brightness": {"$ref": "#/$defs/probability"},
+        "contrast": {"$ref": "#/$defs/probability"},
+        "pitch": {"$ref": "#/$defs/pitchEvidence"}
+      }
+    },
+    "shotAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "sampled_fps", "source_duration_sec", "adaptive_threshold",
+        "sample_count", "boundaries", "shots"
+      ],
+      "properties": {
+        "schema_version": {"const": "camera-shot-analysis-v1"},
+        "sampled_fps": {"type": "number", "exclusiveMinimum": 0},
+        "source_duration_sec": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "adaptive_threshold": {"$ref": "#/$defs/probability"},
+        "sample_count": {"type": "integer", "minimum": 1},
+        "boundaries": {"type": "array", "items": {"$ref": "#/$defs/boundary"}},
+        "shots": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/shot"}},
+        "samples": {"type": "array", "items": {"$ref": "#/$defs/frameObservation"}}
+      }
+    }
+  }
+}
