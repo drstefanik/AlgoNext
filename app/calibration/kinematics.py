@@ -29,10 +29,16 @@ class MotionThresholds:
             "sprint_threshold_mps",
             "minimum_sprint_duration_sec",
         ):
-            if float(getattr(self, field_name)) <= 0:
-                raise ValueError(f"{field_name} must be positive")
-        if self.pitch_margin_m < 0:
-            raise ValueError("pitch_margin_m must be >= 0")
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field_name} must be finite and positive")
+        margin = float(self.pitch_margin_m)
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError("pitch_margin_m must be finite and >= 0")
+        if self.sprint_threshold_mps > self.maximum_speed_mps:
+            raise ValueError(
+                "sprint_threshold_mps must not exceed maximum_speed_mps"
+            )
         if self.smoothing_window < 1 or self.smoothing_window % 2 == 0:
             raise ValueError("smoothing_window must be a positive odd integer")
         if self.minimum_projected_points < 2:
@@ -48,6 +54,20 @@ class CalibratedTrackPoint:
     confidence: float | None = None
     image_x: float | None = None
     image_y: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.calibration_id.strip():
+            raise ValueError("calibration_id must not be empty")
+        for field_name in ("time_sec", "x_m", "y_m"):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be finite")
+        if self.time_sec < 0:
+            raise ValueError("time_sec must be >= 0")
+        for field_name in ("confidence", "image_x", "image_y"):
+            value = getattr(self, field_name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{field_name} must be finite when present")
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -153,6 +173,7 @@ def project_tracking_footpoints(
             or y is None
             or width is None
             or height is None
+            or time_sec < 0
             or width <= 0
             or height <= 0
         ):
@@ -279,14 +300,19 @@ def calculate_calibrated_motion(
     total_distance = 0.0
     observed_duration = 0.0
     accepted_transitions = 0
+    rejected_camera_changes = 0
     rejected_gaps = 0
     rejected_speed = 0
     rejected_acceleration = 0
     speed_samples: list[float] = []
-    accepted_steps: list[tuple[float, float, float]] = []
+    accepted_steps: list[tuple[float, float, float, str]] = []
     previous_speed: float | None = None
 
     for previous, current in zip(smoothed, smoothed[1:]):
+        if previous.calibration_id != current.calibration_id:
+            rejected_camera_changes += 1
+            previous_speed = None
+            continue
         dt = current.time_sec - previous.time_sec
         if dt <= 0 or dt > thresholds.maximum_gap_sec:
             rejected_gaps += 1
@@ -311,7 +337,9 @@ def calculate_calibrated_motion(
         observed_duration += dt
         accepted_transitions += 1
         speed_samples.append(speed)
-        accepted_steps.append((previous.time_sec, current.time_sec, speed))
+        accepted_steps.append(
+            (previous.time_sec, current.time_sec, speed, current.calibration_id)
+        )
         previous_speed = speed
 
     minimum_transitions = max(1, thresholds.minimum_projected_points // 2)
@@ -322,9 +350,11 @@ def calculate_calibrated_motion(
     sprint_duration = 0.0
     active_start: float | None = None
     active_end: float | None = None
+    active_calibration_id: str | None = None
 
     def close_active_sprint() -> None:
         nonlocal sprint_count, sprint_duration, active_start, active_end
+        nonlocal active_calibration_id
         if (
             active_start is not None
             and active_end is not None
@@ -335,13 +365,20 @@ def calculate_calibrated_motion(
             sprint_duration += active_end - active_start
         active_start = None
         active_end = None
+        active_calibration_id = None
 
-    for start, end, speed in accepted_steps:
+    for start, end, speed, calibration_id in accepted_steps:
+        if (
+            active_calibration_id is not None
+            and calibration_id != active_calibration_id
+        ):
+            close_active_sprint()
         if active_end is not None and start - active_end > 1e-6:
             close_active_sprint()
         if speed >= thresholds.sprint_threshold_mps:
             if active_start is None:
                 active_start = start
+                active_calibration_id = calibration_id
             active_end = end
         else:
             close_active_sprint()
@@ -381,6 +418,7 @@ def calculate_calibrated_motion(
             **counters,
             "calibration_coverage_ratio": round(coverage_ratio, 6),
             "accepted_transitions": accepted_transitions,
+            "rejected_camera_changes": rejected_camera_changes,
             "rejected_gaps": rejected_gaps,
             "rejected_speed_outliers": rejected_speed,
             "rejected_acceleration_outliers": rejected_acceleration,
