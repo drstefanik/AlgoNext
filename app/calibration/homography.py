@@ -77,6 +77,65 @@ def _matrix_from_value(value: Any, field: str) -> np.ndarray:
     return matrix
 
 
+def _payload_number(
+    value: Any,
+    field: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be finite")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field} must be >= {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{field} must be <= {maximum}")
+    return parsed
+
+
+def _payload_optional_number(
+    value: Any,
+    field: str,
+    *,
+    minimum: float | None = None,
+) -> float | None:
+    if value is None:
+        return None
+    return _payload_number(value, field, minimum=minimum)
+
+
+def _payload_integer(
+    value: Any,
+    field: str,
+    *,
+    minimum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field} must be >= {minimum}")
+    return value
+
+
+def _matrix_from_payload(value: Any, field: str) -> np.ndarray:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{field} must be a 3x3 numeric array")
+    rows: list[list[float]] = []
+    for row_index, row in enumerate(value):
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError(f"{field}[{row_index}] must contain three numbers")
+        rows.append(
+            [
+                _payload_number(item, f"{field}[{row_index}][{column_index}]")
+                for column_index, item in enumerate(row)
+            ]
+        )
+    return np.asarray(rows, dtype=np.float64)
+
+
 def _convex_hull_area(points: np.ndarray) -> float:
     if len(points) < 3:
         return 0.0
@@ -96,16 +155,10 @@ def _percentile(values: np.ndarray, percentile: float) -> float:
     return float(np.percentile(values, percentile))
 
 
-def _weighted_rmse(errors: np.ndarray, weights: np.ndarray) -> float:
+def _rmse(errors: np.ndarray) -> float:
     if errors.size == 0:
         return float("inf")
-    safe_weights = np.maximum(0.01, np.asarray(weights, dtype=np.float64))
-    return float(
-        math.sqrt(
-            float(np.sum(safe_weights * np.square(errors)))
-            / float(np.sum(safe_weights))
-        )
-    )
+    return float(math.sqrt(float(np.mean(np.square(errors)))))
 
 
 def _condition_number(
@@ -128,13 +181,7 @@ def _condition_number(
 
 
 def _minimum_denominator(matrix: np.ndarray) -> float:
-    """Return the smallest absolute projective denominator on the unit frame.
-
-    The denominator is affine in image x/y, so its extrema occur at the four
-    corners. A sign change between corners proves that the projective horizon
-    crosses the frame and therefore the true minimum is zero, even when none of
-    a finite set of sample points lies exactly on that horizon.
-    """
+    """Return the smallest absolute projective denominator on the unit frame."""
 
     corners = np.array(
         [
@@ -172,18 +219,68 @@ def _require_non_empty_string(value: Any, field: str) -> str:
     return value.strip()
 
 
+def _require_allowed_keys(
+    value: Mapping[str, Any],
+    allowed: set[str],
+    field: str,
+) -> None:
+    unknown = sorted(set(value.keys()) - allowed)
+    if unknown:
+        raise ValueError(f"{field} contains unknown fields: {', '.join(unknown)}")
+
+
 def _require_exact_keys(
     value: Mapping[str, Any],
     expected: set[str],
     field: str,
 ) -> None:
-    actual = set(value.keys())
-    missing = sorted(expected - actual)
-    unknown = sorted(actual - expected)
+    _require_allowed_keys(value, expected, field)
+    missing = sorted(expected - set(value.keys()))
     if missing:
         raise ValueError(f"{field} is missing fields: {', '.join(missing)}")
-    if unknown:
-        raise ValueError(f"{field} contains unknown fields: {', '.join(unknown)}")
+
+
+def _normalized_identity_product(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> np.ndarray:
+    product = first @ second
+    scale = float(product[2, 2])
+    if not np.isfinite(product).all() or abs(scale) <= 1e-12:
+        raise ValueError("homography matrices do not form a finite inverse pair")
+    return product / scale
+
+
+def _gate_reason_codes(
+    *,
+    total_correspondences: int,
+    inlier_ratio: float,
+    rmse_m: float,
+    p95_error_m: float,
+    image_hull_area_ratio: float,
+    field_hull_area_ratio: float,
+    condition_number: float,
+    minimum_projective_denominator: float,
+    thresholds: CalibrationThresholds,
+) -> tuple[str, ...]:
+    reason_codes: list[str] = []
+    if total_correspondences < thresholds.minimum_correspondences:
+        reason_codes.append("INSUFFICIENT_CALIBRATION_POINTS")
+    if inlier_ratio < thresholds.minimum_inlier_ratio:
+        reason_codes.append("LOW_CALIBRATION_INLIER_RATIO")
+    if rmse_m > thresholds.maximum_rmse_m:
+        reason_codes.append("HIGH_CALIBRATION_RMSE")
+    if p95_error_m > thresholds.maximum_p95_error_m:
+        reason_codes.append("HIGH_CALIBRATION_P95_ERROR")
+    if image_hull_area_ratio < thresholds.minimum_image_hull_area_ratio:
+        reason_codes.append("LOW_IMAGE_POINT_COVERAGE")
+    if field_hull_area_ratio < thresholds.minimum_field_hull_area_ratio:
+        reason_codes.append("LOW_FIELD_POINT_COVERAGE")
+    if condition_number > thresholds.maximum_condition_number:
+        reason_codes.append("ILL_CONDITIONED_HOMOGRAPHY")
+    if minimum_projective_denominator < thresholds.minimum_projective_denominator:
+        reason_codes.append("PROJECTIVE_HORIZON_INTERSECTS_FRAME")
+    return tuple(reason_codes)
 
 
 @dataclass(frozen=True)
@@ -217,6 +314,10 @@ class PitchCalibration:
     def __post_init__(self) -> None:
         _require_non_empty_string(self.camera_segment_id, "camera_segment_id")
         _require_non_empty_string(self.source, "source")
+        if not isinstance(self.pitch, PitchDimensions):
+            raise ValueError("pitch must be PitchDimensions")
+        if not isinstance(self.thresholds, CalibrationThresholds):
+            raise ValueError("thresholds must be CalibrationThresholds")
         if self.schema_version != CALIBRATION_RESULT_SCHEMA_VERSION:
             raise ValueError(
                 "schema_version must equal "
@@ -237,22 +338,34 @@ class PitchCalibration:
             raise ValueError("reason_codes must contain non-empty strings")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("reason_codes must not contain duplicates")
-        if self.validated and self.reason_codes:
-            raise ValueError("validated calibration cannot contain reason codes")
-        if not self.validated and not self.reason_codes:
-            raise ValueError("rejected calibration must contain reason codes")
-        if self.total_correspondences < 4:
-            raise ValueError("total_correspondences must be >= 4")
+        if (
+            isinstance(self.total_correspondences, bool)
+            or not isinstance(self.total_correspondences, int)
+            or self.total_correspondences < 4
+        ):
+            raise ValueError("total_correspondences must be an integer >= 4")
+        if (
+            isinstance(self.inlier_count, bool)
+            or not isinstance(self.inlier_count, int)
+            or self.inlier_count < 4
+        ):
+            raise ValueError("inlier_count must be an integer >= 4")
+        if self.inlier_count > self.total_correspondences:
+            raise ValueError("inlier_count cannot exceed total_correspondences")
         if len(self.inlier_mask) != self.total_correspondences:
             raise ValueError("inlier_mask length must match total_correspondences")
         if any(not isinstance(value, bool) for value in self.inlier_mask):
             raise ValueError("inlier_mask must contain booleans")
         if self.inlier_count != sum(self.inlier_mask):
             raise ValueError("inlier_count must match inlier_mask")
-        if self.inlier_count < 4:
-            raise ValueError("inlier_count must be >= 4")
-        if not 0.0 <= _require_finite(self.inlier_ratio, "inlier_ratio") <= 1.0:
+
+        inlier_ratio = _require_finite(self.inlier_ratio, "inlier_ratio")
+        if not 0.0 <= inlier_ratio <= 1.0:
             raise ValueError("inlier_ratio must be in [0, 1]")
+        expected_ratio = self.inlier_count / float(self.total_correspondences)
+        if not math.isclose(inlier_ratio, expected_ratio, rel_tol=0.0, abs_tol=1e-8):
+            raise ValueError("inlier_ratio must match inlier counts")
+
         for field_name in (
             "rmse_m",
             "median_error_m",
@@ -270,6 +383,11 @@ class PitchCalibration:
             raise ValueError("image_hull_area_ratio must be in [0, 1]")
         if not 0.0 <= self.field_hull_area_ratio <= 1.0:
             raise ValueError("field_hull_area_ratio must be in [0, 1]")
+        if self.median_error_m > self.maximum_error_m:
+            raise ValueError("median_error_m cannot exceed maximum_error_m")
+        if self.p95_error_m > self.maximum_error_m:
+            raise ValueError("p95_error_m cannot exceed maximum_error_m")
+
         if self.start_sec is not None:
             _require_finite(self.start_sec, "start_sec")
             if self.start_sec < 0:
@@ -284,14 +402,64 @@ class PitchCalibration:
             and self.end_sec <= self.start_sec
         ):
             raise ValueError("end_sec must be greater than start_sec")
-        _matrix_from_value(
+
+        image_to_field = _matrix_from_value(
             self.matrix_image_to_field,
             "matrix_image_to_field",
         )
-        _matrix_from_value(
+        field_to_image = _matrix_from_value(
             self.matrix_field_to_image,
             "matrix_field_to_image",
         )
+        identity = np.eye(3, dtype=np.float64)
+        if not np.allclose(
+            _normalized_identity_product(image_to_field, field_to_image),
+            identity,
+            rtol=1e-6,
+            atol=1e-6,
+        ) or not np.allclose(
+            _normalized_identity_product(field_to_image, image_to_field),
+            identity,
+            rtol=1e-6,
+            atol=1e-6,
+        ):
+            raise ValueError("homography matrices are not inverse pairs")
+
+        computed_condition = _condition_number(image_to_field, self.pitch)
+        if not math.isclose(
+            computed_condition,
+            self.condition_number,
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        ):
+            raise ValueError("condition_number does not match homography")
+        computed_denominator = _minimum_denominator(image_to_field)
+        if not math.isclose(
+            computed_denominator,
+            self.minimum_projective_denominator,
+            rel_tol=1e-6,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "minimum_projective_denominator does not match homography"
+            )
+
+        expected_reasons = _gate_reason_codes(
+            total_correspondences=self.total_correspondences,
+            inlier_ratio=self.inlier_ratio,
+            rmse_m=self.rmse_m,
+            p95_error_m=self.p95_error_m,
+            image_hull_area_ratio=self.image_hull_area_ratio,
+            field_hull_area_ratio=self.field_hull_area_ratio,
+            condition_number=self.condition_number,
+            minimum_projective_denominator=self.minimum_projective_denominator,
+            thresholds=self.thresholds,
+        )
+        if self.reason_codes != expected_reasons:
+            raise ValueError("reason_codes do not match the calibration gate")
+        expected_status = "VALIDATED" if not expected_reasons else "REJECTED"
+        if self.status != expected_status:
+            raise ValueError("status does not match the calibration gate")
 
     def contains_time(self, time_sec: float) -> bool:
         timestamp = _require_finite(time_sec, "time_sec")
@@ -401,6 +569,27 @@ class PitchCalibration:
     def from_payload(cls, payload: Mapping[str, Any]) -> "PitchCalibration":
         if not isinstance(payload, Mapping):
             raise ValueError("calibration payload must be an object")
+        _require_allowed_keys(
+            payload,
+            {
+                "schema_version",
+                "camera_segment_id",
+                "status",
+                "validated",
+                "method",
+                "source",
+                "start_sec",
+                "end_sec",
+                "pitch",
+                "matrix_image_to_field",
+                "matrix_field_to_image",
+                "quality",
+                "thresholds",
+                "reason_codes",
+                "provenance",
+            },
+            "calibration",
+        )
         schema_version = payload.get("schema_version")
         if schema_version != CALIBRATION_RESULT_SCHEMA_VERSION:
             raise ValueError(
@@ -453,10 +642,49 @@ class PitchCalibration:
             "thresholds",
         )
         thresholds = CalibrationThresholds(
-            **{
-                key: thresholds_payload[key]
-                for key in threshold_defaults
-            }
+            minimum_correspondences=_payload_integer(
+                thresholds_payload["minimum_correspondences"],
+                "thresholds.minimum_correspondences",
+                minimum=4,
+            ),
+            ransac_reprojection_threshold_m=_payload_number(
+                thresholds_payload["ransac_reprojection_threshold_m"],
+                "thresholds.ransac_reprojection_threshold_m",
+            ),
+            minimum_inlier_ratio=_payload_number(
+                thresholds_payload["minimum_inlier_ratio"],
+                "thresholds.minimum_inlier_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            maximum_rmse_m=_payload_number(
+                thresholds_payload["maximum_rmse_m"],
+                "thresholds.maximum_rmse_m",
+            ),
+            maximum_p95_error_m=_payload_number(
+                thresholds_payload["maximum_p95_error_m"],
+                "thresholds.maximum_p95_error_m",
+            ),
+            minimum_image_hull_area_ratio=_payload_number(
+                thresholds_payload["minimum_image_hull_area_ratio"],
+                "thresholds.minimum_image_hull_area_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            minimum_field_hull_area_ratio=_payload_number(
+                thresholds_payload["minimum_field_hull_area_ratio"],
+                "thresholds.minimum_field_hull_area_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            maximum_condition_number=_payload_number(
+                thresholds_payload["maximum_condition_number"],
+                "thresholds.maximum_condition_number",
+            ),
+            minimum_projective_denominator=_payload_number(
+                thresholds_payload["minimum_projective_denominator"],
+                "thresholds.minimum_projective_denominator",
+            ),
         )
 
         provenance = payload.get("provenance")
@@ -483,10 +711,15 @@ class PitchCalibration:
         )
         if provenance.get("quality_gate") != CALIBRATION_QUALITY_GATE:
             raise ValueError("provenance.quality_gate is invalid")
-        if provenance.get("ransac_seed") != RANSAC_SEED:
+        if (
+            _payload_integer(
+                provenance.get("ransac_seed"),
+                "provenance.ransac_seed",
+            )
+            != RANSAC_SEED
+        ):
             raise ValueError("provenance.ransac_seed is invalid")
 
-        status = str(payload.get("status") or "")
         inlier_mask_value = quality.get("inlier_mask")
         if not isinstance(inlier_mask_value, list) or any(
             not isinstance(value, bool) for value in inlier_mask_value
@@ -497,54 +730,110 @@ class PitchCalibration:
             not isinstance(value, str) for value in reason_codes_value
         ):
             raise ValueError("reason_codes must be an array of strings")
+
         return cls(
             camera_segment_id=_require_non_empty_string(
                 payload.get("camera_segment_id"),
                 "camera_segment_id",
             ),
-            status=status,
+            status=_require_non_empty_string(payload.get("status"), "status"),
             validated=validated_value,
             method=method,
             matrix_image_to_field=_matrix_to_tuple(
-                _matrix_from_value(
+                _matrix_from_payload(
                     payload.get("matrix_image_to_field"),
                     "matrix_image_to_field",
                 )
             ),
             matrix_field_to_image=_matrix_to_tuple(
-                _matrix_from_value(
+                _matrix_from_payload(
                     payload.get("matrix_field_to_image"),
                     "matrix_field_to_image",
                 )
             ),
             pitch=PitchDimensions(
-                length_m=float(pitch_payload["length_m"]),
-                width_m=float(pitch_payload["width_m"]),
+                length_m=_payload_number(
+                    pitch_payload["length_m"],
+                    "pitch.length_m",
+                    minimum=90.0,
+                    maximum=120.0,
+                ),
+                width_m=_payload_number(
+                    pitch_payload["width_m"],
+                    "pitch.width_m",
+                    minimum=45.0,
+                    maximum=90.0,
+                ),
             ),
             source=_require_non_empty_string(payload.get("source"), "source"),
-            start_sec=(
-                float(payload["start_sec"])
-                if payload.get("start_sec") is not None
-                else None
+            start_sec=_payload_optional_number(
+                payload.get("start_sec"),
+                "start_sec",
+                minimum=0.0,
             ),
-            end_sec=(
-                float(payload["end_sec"])
-                if payload.get("end_sec") is not None
-                else None
+            end_sec=_payload_optional_number(
+                payload.get("end_sec"),
+                "end_sec",
+                minimum=0.0,
             ),
-            total_correspondences=int(quality["total_correspondences"]),
-            inlier_count=int(quality["inlier_count"]),
+            total_correspondences=_payload_integer(
+                quality["total_correspondences"],
+                "quality.total_correspondences",
+                minimum=4,
+            ),
+            inlier_count=_payload_integer(
+                quality["inlier_count"],
+                "quality.inlier_count",
+                minimum=4,
+            ),
             inlier_mask=tuple(inlier_mask_value),
-            inlier_ratio=float(quality["inlier_ratio"]),
-            rmse_m=float(quality["rmse_m"]),
-            median_error_m=float(quality["median_error_m"]),
-            p95_error_m=float(quality["p95_error_m"]),
-            maximum_error_m=float(quality["maximum_error_m"]),
-            image_hull_area_ratio=float(quality["image_hull_area_ratio"]),
-            field_hull_area_ratio=float(quality["field_hull_area_ratio"]),
-            condition_number=float(quality["condition_number"]),
-            minimum_projective_denominator=float(
-                quality["minimum_projective_denominator"]
+            inlier_ratio=_payload_number(
+                quality["inlier_ratio"],
+                "quality.inlier_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            rmse_m=_payload_number(
+                quality["rmse_m"],
+                "quality.rmse_m",
+                minimum=0.0,
+            ),
+            median_error_m=_payload_number(
+                quality["median_error_m"],
+                "quality.median_error_m",
+                minimum=0.0,
+            ),
+            p95_error_m=_payload_number(
+                quality["p95_error_m"],
+                "quality.p95_error_m",
+                minimum=0.0,
+            ),
+            maximum_error_m=_payload_number(
+                quality["maximum_error_m"],
+                "quality.maximum_error_m",
+                minimum=0.0,
+            ),
+            image_hull_area_ratio=_payload_number(
+                quality["image_hull_area_ratio"],
+                "quality.image_hull_area_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            field_hull_area_ratio=_payload_number(
+                quality["field_hull_area_ratio"],
+                "quality.field_hull_area_ratio",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            condition_number=_payload_number(
+                quality["condition_number"],
+                "quality.condition_number",
+                minimum=0.0,
+            ),
+            minimum_projective_denominator=_payload_number(
+                quality["minimum_projective_denominator"],
+                "quality.minimum_projective_denominator",
+                minimum=0.0,
             ),
             reason_codes=tuple(reason_codes_value),
             thresholds=thresholds,
@@ -570,10 +859,6 @@ def fit_pitch_calibration(
             [correspondence.field.x_m, correspondence.field.y_m]
             for correspondence in request.correspondences
         ],
-        dtype=np.float64,
-    )
-    weights = np.array(
-        [correspondence.weight for correspondence in request.correspondences],
         dtype=np.float64,
     )
 
@@ -625,10 +910,9 @@ def fit_pitch_calibration(
             "estimated homography has fewer than four RANSAC inliers"
         )
     inlier_errors = errors[inlier_mask]
-    inlier_weights = weights[inlier_mask]
     total_count = len(source_points)
     inlier_ratio = inlier_count / float(total_count)
-    rmse = _weighted_rmse(inlier_errors, inlier_weights)
+    rmse = _rmse(inlier_errors)
     median_error = float(np.median(inlier_errors))
     p95_error = _percentile(inlier_errors, 95.0)
     maximum_error = float(np.max(inlier_errors))
@@ -652,24 +936,17 @@ def fit_pitch_calibration(
                 f"estimated homography produced non-finite {field_name}"
             )
 
-    reason_codes: list[str] = []
-    if total_count < thresholds.minimum_correspondences:
-        reason_codes.append("INSUFFICIENT_CALIBRATION_POINTS")
-    if inlier_ratio < thresholds.minimum_inlier_ratio:
-        reason_codes.append("LOW_CALIBRATION_INLIER_RATIO")
-    if rmse > thresholds.maximum_rmse_m:
-        reason_codes.append("HIGH_CALIBRATION_RMSE")
-    if p95_error > thresholds.maximum_p95_error_m:
-        reason_codes.append("HIGH_CALIBRATION_P95_ERROR")
-    if image_hull_ratio < thresholds.minimum_image_hull_area_ratio:
-        reason_codes.append("LOW_IMAGE_POINT_COVERAGE")
-    if field_hull_ratio < thresholds.minimum_field_hull_area_ratio:
-        reason_codes.append("LOW_FIELD_POINT_COVERAGE")
-    if condition_number > thresholds.maximum_condition_number:
-        reason_codes.append("ILL_CONDITIONED_HOMOGRAPHY")
-    if minimum_denominator < thresholds.minimum_projective_denominator:
-        reason_codes.append("PROJECTIVE_HORIZON_INTERSECTS_FRAME")
-
+    reason_codes = _gate_reason_codes(
+        total_correspondences=total_count,
+        inlier_ratio=inlier_ratio,
+        rmse_m=rmse,
+        p95_error_m=p95_error,
+        image_hull_area_ratio=image_hull_ratio,
+        field_hull_area_ratio=field_hull_ratio,
+        condition_number=condition_number,
+        minimum_projective_denominator=minimum_denominator,
+        thresholds=thresholds,
+    )
     status = "VALIDATED" if not reason_codes else "REJECTED"
     return PitchCalibration(
         camera_segment_id=request.camera_segment_id,
@@ -693,6 +970,6 @@ def fit_pitch_calibration(
         field_hull_area_ratio=field_hull_ratio,
         condition_number=condition_number,
         minimum_projective_denominator=minimum_denominator,
-        reason_codes=tuple(reason_codes),
+        reason_codes=reason_codes,
         thresholds=thresholds,
     )
