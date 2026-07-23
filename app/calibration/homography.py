@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -14,7 +15,9 @@ from app.calibration.schema import (
 )
 
 CALIBRATION_METHOD = "opencv-findHomography-ransac-v1"
+CALIBRATION_QUALITY_GATE = "pitch-calibration-gate-v1"
 RANSAC_SEED = 0
+_RANSAC_LOCK = threading.Lock()
 
 
 class CalibrationFitError(RuntimeError):
@@ -34,8 +37,12 @@ class CalibrationThresholds:
     minimum_projective_denominator: float = 0.005
 
     def __post_init__(self) -> None:
-        if self.minimum_correspondences < 4:
-            raise ValueError("minimum_correspondences must be >= 4")
+        if (
+            isinstance(self.minimum_correspondences, bool)
+            or not isinstance(self.minimum_correspondences, int)
+            or self.minimum_correspondences < 4
+        ):
+            raise ValueError("minimum_correspondences must be an integer >= 4")
         for field_name in (
             "ransac_reprojection_threshold_m",
             "maximum_rmse_m",
@@ -163,6 +170,20 @@ def _require_non_empty_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    field: str,
+) -> None:
+    actual = set(value.keys())
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing:
+        raise ValueError(f"{field} is missing fields: {', '.join(missing)}")
+    if unknown:
+        raise ValueError(f"{field} contains unknown fields: {', '.join(unknown)}")
 
 
 @dataclass(frozen=True)
@@ -371,13 +392,15 @@ class PitchCalibration:
                 "coordinate_input": "image_normalized_0_1",
                 "coordinate_output": "pitch_metres",
                 "opencv_version": cv2.__version__,
-                "quality_gate": "pitch-calibration-gate-v1",
+                "quality_gate": CALIBRATION_QUALITY_GATE,
                 "ransac_seed": RANSAC_SEED,
             },
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PitchCalibration":
+        if not isinstance(payload, Mapping):
+            raise ValueError("calibration payload must be an object")
         schema_version = payload.get("schema_version")
         if schema_version != CALIBRATION_RESULT_SCHEMA_VERSION:
             raise ValueError(
@@ -390,22 +413,79 @@ class PitchCalibration:
         validated_value = payload.get("validated")
         if not isinstance(validated_value, bool):
             raise ValueError("validated must be a boolean")
+
         pitch_payload = payload.get("pitch")
         if not isinstance(pitch_payload, Mapping):
             raise ValueError("pitch must be an object")
+        _require_exact_keys(
+            pitch_payload,
+            {"length_m", "width_m"},
+            "pitch",
+        )
+
         quality = payload.get("quality")
         if not isinstance(quality, Mapping):
             raise ValueError("quality must be an object")
+        quality_fields = {
+            "total_correspondences",
+            "inlier_count",
+            "inlier_mask",
+            "inlier_ratio",
+            "rmse_m",
+            "median_error_m",
+            "p95_error_m",
+            "maximum_error_m",
+            "image_hull_area_ratio",
+            "field_hull_area_ratio",
+            "condition_number",
+            "minimum_projective_denominator",
+        }
+        _require_exact_keys(quality, quality_fields, "quality")
+
+        threshold_defaults = asdict(CalibrationThresholds())
+        threshold_fields = set(threshold_defaults)
         thresholds_payload = payload.get("thresholds")
         if not isinstance(thresholds_payload, Mapping):
             raise ValueError("thresholds must be an object")
+        _require_exact_keys(
+            thresholds_payload,
+            threshold_fields,
+            "thresholds",
+        )
         thresholds = CalibrationThresholds(
             **{
                 key: thresholds_payload[key]
-                for key in asdict(CalibrationThresholds())
-                if key in thresholds_payload
+                for key in threshold_defaults
             }
         )
+
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError("provenance must be an object")
+        _require_exact_keys(
+            provenance,
+            {
+                "coordinate_input",
+                "coordinate_output",
+                "opencv_version",
+                "quality_gate",
+                "ransac_seed",
+            },
+            "provenance",
+        )
+        if provenance.get("coordinate_input") != "image_normalized_0_1":
+            raise ValueError("provenance.coordinate_input is invalid")
+        if provenance.get("coordinate_output") != "pitch_metres":
+            raise ValueError("provenance.coordinate_output is invalid")
+        _require_non_empty_string(
+            provenance.get("opencv_version"),
+            "provenance.opencv_version",
+        )
+        if provenance.get("quality_gate") != CALIBRATION_QUALITY_GATE:
+            raise ValueError("provenance.quality_gate is invalid")
+        if provenance.get("ransac_seed") != RANSAC_SEED:
+            raise ValueError("provenance.ransac_seed is invalid")
+
         status = str(payload.get("status") or "")
         inlier_mask_value = quality.get("inlier_mask")
         if not isinstance(inlier_mask_value, list) or any(
@@ -438,8 +518,8 @@ class PitchCalibration:
                 )
             ),
             pitch=PitchDimensions(
-                length_m=float(pitch_payload.get("length_m")),
-                width_m=float(pitch_payload.get("width_m")),
+                length_m=float(pitch_payload["length_m"]),
+                width_m=float(pitch_payload["width_m"]),
             ),
             source=_require_non_empty_string(payload.get("source"), "source"),
             start_sec=(
@@ -452,23 +532,19 @@ class PitchCalibration:
                 if payload.get("end_sec") is not None
                 else None
             ),
-            total_correspondences=int(quality.get("total_correspondences") or 0),
-            inlier_count=int(quality.get("inlier_count") or 0),
+            total_correspondences=int(quality["total_correspondences"]),
+            inlier_count=int(quality["inlier_count"]),
             inlier_mask=tuple(inlier_mask_value),
-            inlier_ratio=float(quality.get("inlier_ratio") or 0.0),
-            rmse_m=float(quality.get("rmse_m") or 0.0),
-            median_error_m=float(quality.get("median_error_m") or 0.0),
-            p95_error_m=float(quality.get("p95_error_m") or 0.0),
-            maximum_error_m=float(quality.get("maximum_error_m") or 0.0),
-            image_hull_area_ratio=float(
-                quality.get("image_hull_area_ratio") or 0.0
-            ),
-            field_hull_area_ratio=float(
-                quality.get("field_hull_area_ratio") or 0.0
-            ),
-            condition_number=float(quality.get("condition_number") or 0.0),
+            inlier_ratio=float(quality["inlier_ratio"]),
+            rmse_m=float(quality["rmse_m"]),
+            median_error_m=float(quality["median_error_m"]),
+            p95_error_m=float(quality["p95_error_m"]),
+            maximum_error_m=float(quality["maximum_error_m"]),
+            image_hull_area_ratio=float(quality["image_hull_area_ratio"]),
+            field_hull_area_ratio=float(quality["field_hull_area_ratio"]),
+            condition_number=float(quality["condition_number"]),
             minimum_projective_denominator=float(
-                quality.get("minimum_projective_denominator") or 0.0
+                quality["minimum_projective_denominator"]
             ),
             reason_codes=tuple(reason_codes_value),
             thresholds=thresholds,
@@ -508,15 +584,16 @@ def fit_pitch_calibration(
     if field_hull_area <= 1e-6:
         raise CalibrationFitError("field correspondences are collinear")
 
-    cv2.setRNGSeed(RANSAC_SEED)
-    matrix, mask = cv2.findHomography(
-        source_points,
-        field_points,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=thresholds.ransac_reprojection_threshold_m,
-        maxIters=10_000,
-        confidence=0.999,
-    )
+    with _RANSAC_LOCK:
+        cv2.setRNGSeed(RANSAC_SEED)
+        matrix, mask = cv2.findHomography(
+            source_points,
+            field_points,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=thresholds.ransac_reprojection_threshold_m,
+            maxIters=10_000,
+            confidence=0.999,
+        )
     if matrix is None or not np.isfinite(matrix).all():
         raise CalibrationFitError("OpenCV could not estimate a finite homography")
     if abs(float(matrix[2, 2])) <= 1e-12:
