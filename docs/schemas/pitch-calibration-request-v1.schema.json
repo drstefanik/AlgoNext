@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/pitch-calibration-request-v1.schema.json",
+  "title": "AlgoNext pitch calibration request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "camera_segment_id", "correspondences"],
+  "properties": {
+    "schema_version": {
+      "const": "pitch-calibration-request-v1"
+    },
+    "camera_segment_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "default": "manual"
+    },
+    "start_sec": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "end_sec": {
+      "type": ["number", "null"],
+      "exclusiveMinimum": 0
+    },
+    "pitch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "length_m": {
+          "type": "number",
+          "minimum": 90,
+          "maximum": 120,
+          "default": 105
+        },
+        "width_m": {
+          "type": "number",
+          "minimum": 45,
+          "maximum": 90,
+          "default": 68
+        }
+      }
+    },
+    "correspondences": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["image"],
+        "properties": {
+          "image": {
+            "$ref": "#/$defs/imagePoint"
+          },
+          "field": {
+            "$ref": "#/$defs/fieldPoint"
+          },
+          "landmark": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "type": ["string", "null"]
+          },
+          "weight": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 100,
+            "default": 1
+          }
+        },
+        "oneOf": [
+          {
+            "required": ["field"],
+            "not": {
+              "required": ["landmark"]
+            }
+          },
+          {
+            "required": ["landmark"],
+            "not": {
+              "required": ["field"]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "imagePoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "fieldPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x_m", "y_m"],
+      "properties": {
+        "x_m": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "y_m": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 90
+        }
+      }
+    }
+  }
+}
