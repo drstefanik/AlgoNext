@@ -135,6 +135,86 @@ class AlgoNextTrackingAdapterTests(unittest.TestCase):
         self.assertEqual(prediction.frames[0].tracks[0].confidence, 0.9)
         self.assertEqual(prediction.frames[0].tracks[0].bbox.x, 0.2)
 
+    def test_only_accepted_reid_identity_earns_cross_window_continuity(self):
+        prediction = prediction_from_algonext_tracking(
+            {
+                "fps": 5,
+                "segments": [
+                    {
+                        "selected_track_id": 1,
+                        "reid": {
+                            "status": "ACCEPTED",
+                            "identity_id": "selected-player",
+                            "validated": False,
+                        },
+                        "bboxes": [
+                            {
+                                "t": 1.0,
+                                "x": 0.1,
+                                "y": 0.2,
+                                "w": 0.1,
+                                "h": 0.2,
+                            }
+                        ],
+                    },
+                    {
+                        "selected_track_id": 8,
+                        "reid": {
+                            "status": "ACCEPTED",
+                            "identity_id": "selected-player",
+                            "validated": False,
+                        },
+                        "bboxes": [
+                            {
+                                "t": 2.0,
+                                "x": 0.2,
+                                "y": 0.2,
+                                "w": 0.1,
+                                "h": 0.2,
+                            }
+                        ],
+                    },
+                ],
+            },
+            video_id="video-1",
+        )
+
+        self.assertEqual(
+            [frame.tracks[0].track_id for frame in prediction.frames],
+            ["identity/selected-player", "identity/selected-player"],
+        )
+
+    def test_abstained_reid_does_not_earn_identity_continuity(self):
+        prediction = prediction_from_algonext_tracking(
+            {
+                "fps": 5,
+                "segments": [
+                    {
+                        "selected_track_id": 1,
+                        "reid": {
+                            "status": "ABSTAINED",
+                            "identity_id": "selected-player",
+                        },
+                        "bboxes": [
+                            {
+                                "t": 1.0,
+                                "x": 0.1,
+                                "y": 0.2,
+                                "w": 0.1,
+                                "h": 0.2,
+                            }
+                        ],
+                    }
+                ],
+            },
+            video_id="video-1",
+        )
+
+        self.assertEqual(
+            prediction.frames[0].tracks[0].track_id,
+            "segment-0001/track-1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
