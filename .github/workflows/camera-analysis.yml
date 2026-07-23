@@ -43,7 +43,7 @@ jobs:
 
       - name: Install test dependencies
         run: >-
-          python -m pip install
+          python -m pip install --quiet
           numpy==1.26.4
           opencv-python-headless==4.10.0.84
           jsonschema==4.23.0
@@ -64,10 +64,26 @@ jobs:
           tests/test_camera_analysis_video.py
 
       - name: Run deterministic camera-analysis tests
-        run: >-
-          python -m unittest
-          tests/test_pitch_geometry.py
-          tests/test_shot_segmentation.py
-          tests/test_camera_analysis.py
-          tests/test_camera_analysis_schema.py
-          tests/test_camera_analysis_video.py
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          python -m unittest \
+            tests/test_pitch_geometry.py \
+            tests/test_shot_segmentation.py \
+            tests/test_camera_analysis.py \
+            tests/test_camera_analysis_schema.py \
+            tests/test_camera_analysis_video.py \
+            > /tmp/camera-analysis-tests.log 2>&1
+          status=$?
+          cat /tmp/camera-analysis-tests.log
+          exit "$status"
+
+      - name: Upload camera-analysis test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-analysis-test-diagnostics
+          path: /tmp/camera-analysis-tests.log
+          if-no-files-found: error
+          retention-days: 3
