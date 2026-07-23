@@ -1,0 +1,51 @@
+{
+  "schema_version": "pitch-calibration-request-v1",
+  "camera_segment_id": "fixture-camera-1",
+  "source": "synthetic-ci-fixture",
+  "start_sec": 0.0,
+  "end_sec": 30.0,
+  "pitch": {
+    "length_m": 105.0,
+    "width_m": 68.0
+  },
+  "correspondences": [
+    {
+      "image": {"x": 0.0, "y": 0.0},
+      "landmark": "corner_left_top"
+    },
+    {
+      "image": {"x": 1.0, "y": 0.0},
+      "landmark": "corner_right_top"
+    },
+    {
+      "image": {"x": 0.0, "y": 1.0},
+      "landmark": "corner_left_bottom"
+    },
+    {
+      "image": {"x": 1.0, "y": 1.0},
+      "landmark": "corner_right_bottom"
+    },
+    {
+      "image": {"x": 0.5, "y": 0.0},
+      "landmark": "halfway_top"
+    },
+    {
+      "image": {"x": 0.5, "y": 1.0},
+      "landmark": "halfway_bottom"
+    },
+    {
+      "image": {"x": 0.0, "y": 0.5},
+      "field": {"x_m": 0.0, "y_m": 34.0},
+      "label": "left_touchline_midpoint"
+    },
+    {
+      "image": {"x": 1.0, "y": 0.5},
+      "field": {"x_m": 105.0, "y_m": 34.0},
+      "label": "right_touchline_midpoint"
+    },
+    {
+      "image": {"x": 0.5, "y": 0.5},
+      "landmark": "centre_spot"
+    }
+  ]
+}
