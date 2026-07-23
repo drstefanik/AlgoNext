@@ -25,6 +25,17 @@ class EvaluationTruthTests(unittest.TestCase):
         self.assertIn("LOW_TRACKING_COVERAGE", evaluation["reason_codes"])
         self.assertIn("PLAYER_SCORING_NOT_VALIDATED", evaluation["reason_codes"])
 
+    def test_no_evidence_means_zero_quality_not_free_continuity_points(self):
+        evaluation = build_tracking_evaluation()
+
+        self.assertEqual(evaluation["tracking_quality_index"], 0.0)
+        self.assertEqual(
+            evaluation["signals"]["tracklet_continuity_source"],
+            "unavailable",
+        )
+        self.assertIn("CONTINUITY_NOT_MEASURED", evaluation["reason_codes"])
+        self.assertIn("INSUFFICIENT_TRACKING_SAMPLES", evaluation["reason_codes"])
+
     def test_truth_gate_removes_legacy_player_scores(self):
         legacy_result = {
             "match_rating_10": 7.4,
@@ -59,6 +70,7 @@ class EvaluationTruthTests(unittest.TestCase):
         self.assertNotIn("avg_speed_kmh", result["evidence_metrics"])
         self.assertEqual(result["score_kind"], "tracking_quality")
         self.assertFalse(result["player_evaluation_available"])
+        self.assertTrue(result["legacy_scores_suppressed"])
 
     def test_image_motion_uses_explicit_normalized_coordinate_space(self):
         tracking = {
