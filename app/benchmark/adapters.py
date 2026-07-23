@@ -47,9 +47,9 @@ def prediction_from_algonext_tracking(
 ) -> SequencePrediction:
     """Convert AlgoNext tracking.json into the benchmark prediction contract.
 
-    Window-local ByteTrack identifiers are namespaced by segment. Reusing the
-    same numeric tracker ID in a later camera window therefore cannot create
-    fake cross-shot identity continuity.
+    Window-local ByteTrack identifiers are namespaced by segment. A cross-window
+    identity is used only when an explicit ReID decision is ACCEPTED, so the
+    benchmark can reward or penalize the association rather than granting it.
     """
 
     fps = (
@@ -88,12 +88,28 @@ def prediction_from_algonext_tracking(
             selected_track_id = segment.get("selected_track_id")
             if selected_track_id is None:
                 continue
-            namespaced_track_id = (
-                f"segment-{segment_index:04d}/track-{selected_track_id}"
+
+            reid = segment.get("reid")
+            if not isinstance(reid, Mapping):
+                reid = {}
+            identity_id = reid.get("identity_id") or segment.get("identity_id")
+            identity_status = reid.get("status") or segment.get(
+                "identity_status"
             )
+            if (
+                identity_status == "ACCEPTED"
+                and isinstance(identity_id, str)
+                and identity_id.strip()
+            ):
+                benchmark_track_id = f"identity/{identity_id.strip()}"
+            else:
+                benchmark_track_id = (
+                    f"segment-{segment_index:04d}/track-{selected_track_id}"
+                )
+
             for bbox in segment.get("bboxes") or []:
                 if isinstance(bbox, Mapping):
-                    add_bbox(bbox, namespaced_track_id)
+                    add_bbox(bbox, benchmark_track_id)
     else:
         selected_track_id = tracking.get("track_id")
         if selected_track_id is not None:
