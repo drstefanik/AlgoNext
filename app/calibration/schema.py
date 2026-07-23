@@ -174,6 +174,12 @@ class CalibrationCorrespondence:
         ):
             raise ValueError("label must be a non-empty string or None")
 
+    @property
+    def weight(self) -> float:
+        """Fixed internal quality weight; requests cannot override it."""
+
+        return 1.0
+
     @classmethod
     def from_payload(
         cls,
