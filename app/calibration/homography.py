@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -40,16 +40,17 @@ class CalibrationThresholds:
             "maximum_condition_number",
             "minimum_projective_denominator",
         ):
-            if float(getattr(self, field_name)) <= 0:
-                raise ValueError(f"{field_name} must be positive")
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field_name} must be finite and positive")
         for field_name in (
             "minimum_inlier_ratio",
             "minimum_image_hull_area_ratio",
             "minimum_field_hull_area_ratio",
         ):
             value = float(getattr(self, field_name))
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{field_name} must be in [0, 1]")
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be finite and in [0, 1]")
 
 
 def _matrix_to_tuple(matrix: np.ndarray) -> tuple[tuple[float, ...], ...]:
@@ -139,6 +140,13 @@ def _minimum_denominator(matrix: np.ndarray) -> float:
     return float(np.min(np.abs(denominators)))
 
 
+def _require_finite(value: float, field: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be finite")
+    return parsed
+
+
 @dataclass(frozen=True)
 class PitchCalibration:
     camera_segment_id: str
@@ -168,10 +176,57 @@ class PitchCalibration:
     validated: bool = False
 
     def __post_init__(self) -> None:
+        if not self.camera_segment_id.strip():
+            raise ValueError("camera_segment_id must not be empty")
         if self.status not in {"VALIDATED", "REJECTED"}:
             raise ValueError("calibration status must be VALIDATED or REJECTED")
         if self.validated != (self.status == "VALIDATED"):
             raise ValueError("validated must match status")
+        if self.validated and self.reason_codes:
+            raise ValueError("validated calibration cannot contain reason codes")
+        if not self.validated and not self.reason_codes:
+            raise ValueError("rejected calibration must contain reason codes")
+        if self.total_correspondences < 4:
+            raise ValueError("total_correspondences must be >= 4")
+        if len(self.inlier_mask) != self.total_correspondences:
+            raise ValueError("inlier_mask length must match total_correspondences")
+        if self.inlier_count != sum(bool(value) for value in self.inlier_mask):
+            raise ValueError("inlier_count must match inlier_mask")
+        if self.inlier_count < 4:
+            raise ValueError("inlier_count must be >= 4")
+        if not 0.0 <= _require_finite(self.inlier_ratio, "inlier_ratio") <= 1.0:
+            raise ValueError("inlier_ratio must be in [0, 1]")
+        for field_name in (
+            "rmse_m",
+            "median_error_m",
+            "p95_error_m",
+            "maximum_error_m",
+            "image_hull_area_ratio",
+            "field_hull_area_ratio",
+            "condition_number",
+            "minimum_projective_denominator",
+        ):
+            value = _require_finite(float(getattr(self, field_name)), field_name)
+            if value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+        if not 0.0 <= self.image_hull_area_ratio <= 1.0:
+            raise ValueError("image_hull_area_ratio must be in [0, 1]")
+        if not 0.0 <= self.field_hull_area_ratio <= 1.0:
+            raise ValueError("field_hull_area_ratio must be in [0, 1]")
+        if self.start_sec is not None:
+            _require_finite(self.start_sec, "start_sec")
+            if self.start_sec < 0:
+                raise ValueError("start_sec must be >= 0")
+        if self.end_sec is not None:
+            _require_finite(self.end_sec, "end_sec")
+            if self.end_sec < 0:
+                raise ValueError("end_sec must be >= 0")
+        if (
+            self.start_sec is not None
+            and self.end_sec is not None
+            and self.end_sec <= self.start_sec
+        ):
+            raise ValueError("end_sec must be greater than start_sec")
         _matrix_from_value(
             self.matrix_image_to_field,
             "matrix_image_to_field",
@@ -182,7 +237,7 @@ class PitchCalibration:
         )
 
     def contains_time(self, time_sec: float) -> bool:
-        timestamp = float(time_sec)
+        timestamp = _require_finite(time_sec, "time_sec")
         if self.start_sec is not None and timestamp < self.start_sec:
             return False
         if self.end_sec is not None and timestamp >= self.end_sec:
@@ -200,8 +255,13 @@ class PitchCalibration:
         )
         projected = _project(
             matrix,
-            np.array([[float(x), float(y)]], dtype=np.float64),
+            np.array(
+                [[_require_finite(x, "x"), _require_finite(y, "y")]],
+                dtype=np.float64,
+            ),
         )[0]
+        if not np.isfinite(projected).all():
+            raise ValueError("image point projects to a non-finite field point")
         return float(projected[0]), float(projected[1])
 
     def project_field_point(
@@ -215,8 +275,18 @@ class PitchCalibration:
         )
         projected = _project(
             matrix,
-            np.array([[float(x_m), float(y_m)]], dtype=np.float64),
+            np.array(
+                [
+                    [
+                        _require_finite(x_m, "x_m"),
+                        _require_finite(y_m, "y_m"),
+                    ]
+                ],
+                dtype=np.float64,
+            ),
         )[0]
+        if not np.isfinite(projected).all():
+            raise ValueError("field point projects to a non-finite image point")
         return float(projected[0]), float(projected[1])
 
     def to_payload(self) -> dict[str, Any]:
@@ -394,36 +464,42 @@ def fit_pitch_calibration(
     )
     if matrix is None or not np.isfinite(matrix).all():
         raise CalibrationFitError("OpenCV could not estimate a finite homography")
-    if abs(float(matrix[2, 2])) > 1e-12:
-        matrix = matrix / float(matrix[2, 2])
+    if abs(float(matrix[2, 2])) <= 1e-12:
+        raise CalibrationFitError("estimated homography has an invalid scale")
+    matrix = matrix / float(matrix[2, 2])
     try:
         inverse = np.linalg.inv(matrix)
     except np.linalg.LinAlgError as exc:
         raise CalibrationFitError("estimated homography is singular") from exc
-    if abs(float(inverse[2, 2])) > 1e-12:
-        inverse = inverse / float(inverse[2, 2])
+    if not np.isfinite(inverse).all() or abs(float(inverse[2, 2])) <= 1e-12:
+        raise CalibrationFitError("estimated inverse homography is invalid")
+    inverse = inverse / float(inverse[2, 2])
 
     projected = _project(matrix, source_points)
+    if not np.isfinite(projected).all():
+        raise CalibrationFitError("homography produced non-finite projected points")
     errors = np.linalg.norm(projected - field_points, axis=1)
+    if not np.isfinite(errors).all():
+        raise CalibrationFitError("homography produced non-finite reprojection errors")
     if mask is None:
         inlier_mask = np.ones(len(source_points), dtype=bool)
     else:
         inlier_mask = np.asarray(mask, dtype=np.uint8).reshape(-1).astype(bool)
     if inlier_mask.size != len(source_points):
         raise CalibrationFitError("OpenCV returned an invalid inlier mask")
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    if inlier_count < 4:
+        raise CalibrationFitError(
+            "estimated homography has fewer than four RANSAC inliers"
+        )
     inlier_errors = errors[inlier_mask]
     inlier_weights = weights[inlier_mask]
-    inlier_count = int(np.count_nonzero(inlier_mask))
     total_count = len(source_points)
     inlier_ratio = inlier_count / float(total_count)
     rmse = _weighted_rmse(inlier_errors, inlier_weights)
-    median_error = (
-        float(np.median(inlier_errors)) if inlier_errors.size else float("inf")
-    )
+    median_error = float(np.median(inlier_errors))
     p95_error = _percentile(inlier_errors, 95.0)
-    maximum_error = (
-        float(np.max(inlier_errors)) if inlier_errors.size else float("inf")
-    )
+    maximum_error = float(np.max(inlier_errors))
     image_hull_ratio = max(0.0, min(1.0, image_hull_area))
     field_hull_ratio = max(
         0.0,
@@ -431,6 +507,18 @@ def fit_pitch_calibration(
     )
     condition_number = _condition_number(matrix, request.pitch)
     minimum_denominator = _minimum_denominator(matrix)
+    for field_name, value in (
+        ("rmse", rmse),
+        ("median_error", median_error),
+        ("p95_error", p95_error),
+        ("maximum_error", maximum_error),
+        ("condition_number", condition_number),
+        ("minimum_projective_denominator", minimum_denominator),
+    ):
+        if not math.isfinite(value):
+            raise CalibrationFitError(
+                f"estimated homography produced non-finite {field_name}"
+            )
 
     reason_codes: list[str] = []
     if total_count < thresholds.minimum_correspondences:
@@ -445,10 +533,7 @@ def fit_pitch_calibration(
         reason_codes.append("LOW_IMAGE_POINT_COVERAGE")
     if field_hull_ratio < thresholds.minimum_field_hull_area_ratio:
         reason_codes.append("LOW_FIELD_POINT_COVERAGE")
-    if (
-        not math.isfinite(condition_number)
-        or condition_number > thresholds.maximum_condition_number
-    ):
+    if condition_number > thresholds.maximum_condition_number:
         reason_codes.append("ILL_CONDITIONED_HOMOGRAPHY")
     if minimum_denominator < thresholds.minimum_projective_denominator:
         reason_codes.append("PROJECTIVE_HORIZON_INTERSECTS_FRAME")
