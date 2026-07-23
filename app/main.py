@@ -16,6 +16,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.env import load_env
 from app.core.db import Base, SessionLocal, engine, DATABASE_URL
+from app.core.http_errors import normalize_http_exception_detail
 from app.api import router as api_router
 
 load_env()
@@ -154,26 +155,19 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    detail = exc.detail
-    if isinstance(detail, dict):
-        code = detail.get("code") or "HTTP_ERROR"
-        message = detail.get("message") or "Request failed"
-        details = detail.get("details")
-    else:
-        code = "HTTP_ERROR"
-        message = str(detail)
-        details = None
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "ok": False,
-            "error": _error_payload(code, message, details),
+            "error": normalize_http_exception_detail(exc.detail),
             "meta": _meta_payload(request),
         },
+        headers=exc.headers,
     )
 
+
 def init_db():
-    for _ in range(30):  # ~30s
+    for _ in range(30):
         try:
             Base.metadata.create_all(bind=engine)
             return
@@ -184,13 +178,16 @@ def init_db():
     except OperationalError:
         logger.warning("Database unavailable during init_db; continuing without DB.")
 
+
 init_db()
+
 
 def mask_database_url(url: str) -> str:
     try:
         return make_url(url).render_as_string(hide_password=True)
     except Exception:
         return "<invalid DATABASE_URL>"
+
 
 @app.on_event("startup")
 def fail_fast_db_check():
@@ -209,12 +206,44 @@ def fail_fast_db_check():
     finally:
         session.close()
 
+
 @app.get("/health", include_in_schema=False)
 def health():
     return {
         "ok": True,
         "service": "algonext-api",
+        "status": "live",
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/ready", include_in_schema=False)
+def ready():
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("Readiness check failed: database unavailable.")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "service": "algonext-api",
+                "status": "not_ready",
+                "dependencies": {"database": "unavailable"},
+                "ts": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    finally:
+        session.close()
+
+    return {
+        "ok": True,
+        "service": "algonext-api",
+        "status": "ready",
+        "dependencies": {"database": "ready"},
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 app.include_router(api_router)
