@@ -188,7 +188,6 @@ def project_tracking_footpoints(
                 image_y=foot_y,
             )
         )
-        counters["projected_points"] += 1
 
     best_by_time: dict[int, CalibratedTrackPoint] = {}
     for point in points:
@@ -221,7 +220,8 @@ def _smooth_points(
         neighbours = [
             item
             for item in points[start:end]
-            if abs(item.time_sec - point.time_sec) <= 1.0
+            if item.calibration_id == point.calibration_id
+            and abs(item.time_sec - point.time_sec) <= 1.0
         ]
         smoothed.append(
             CalibratedTrackPoint(
@@ -314,40 +314,51 @@ def calculate_calibrated_motion(
         accepted_steps.append((previous.time_sec, current.time_sec, speed))
         previous_speed = speed
 
+    minimum_transitions = max(1, thresholds.minimum_projected_points // 2)
+    if accepted_transitions < minimum_transitions:
+        reason_codes.append("INSUFFICIENT_ACCEPTED_MOTION_TRANSITIONS")
+
     sprint_count = 0
     sprint_duration = 0.0
     active_start: float | None = None
     active_end: float | None = None
+
+    def close_active_sprint() -> None:
+        nonlocal sprint_count, sprint_duration, active_start, active_end
+        if (
+            active_start is not None
+            and active_end is not None
+            and active_end - active_start
+            >= thresholds.minimum_sprint_duration_sec
+        ):
+            sprint_count += 1
+            sprint_duration += active_end - active_start
+        active_start = None
+        active_end = None
+
     for start, end, speed in accepted_steps:
+        if active_end is not None and start - active_end > 1e-6:
+            close_active_sprint()
         if speed >= thresholds.sprint_threshold_mps:
             if active_start is None:
                 active_start = start
             active_end = end
         else:
-            if (
-                active_start is not None
-                and active_end is not None
-                and active_end - active_start
-                >= thresholds.minimum_sprint_duration_sec
-            ):
-                sprint_count += 1
-                sprint_duration += active_end - active_start
-            active_start = None
-            active_end = None
-    if (
-        active_start is not None
-        and active_end is not None
-        and active_end - active_start >= thresholds.minimum_sprint_duration_sec
-    ):
-        sprint_count += 1
-        sprint_duration += active_end - active_start
+            close_active_sprint()
+    close_active_sprint()
 
     average_speed_mps = (
         total_distance / observed_duration if observed_duration > 0 else 0.0
     )
-    status = "AVAILABLE" if not reason_codes else "PARTIAL"
-    calibration_ids = sorted(
-        {point.calibration_id for point in points}
+    if accepted_transitions == 0:
+        status = "UNAVAILABLE"
+    else:
+        status = "AVAILABLE" if not reason_codes else "PARTIAL"
+    calibration_ids = sorted({point.calibration_id for point in points})
+    coverage_ratio = (
+        counters["projected_points"] / float(counters["input_bboxes"])
+        if counters["input_bboxes"] > 0
+        else 0.0
     )
     return {
         "schema_version": "calibrated-motion-diagnostic-v1",
@@ -368,6 +379,7 @@ def calculate_calibrated_motion(
         "sprint_duration_sec_proxy": round(sprint_duration, 3),
         "quality": {
             **counters,
+            "calibration_coverage_ratio": round(coverage_ratio, 6),
             "accepted_transitions": accepted_transitions,
             "rejected_gaps": rejected_gaps,
             "rejected_speed_outliers": rejected_speed,
