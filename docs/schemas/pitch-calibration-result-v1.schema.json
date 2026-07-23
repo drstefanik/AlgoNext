@@ -99,6 +99,7 @@
         },
         "inlier_mask": {
           "type": "array",
+          "minItems": 4,
           "items": {
             "type": "boolean"
           }
@@ -145,7 +146,7 @@
       }
     },
     "thresholds": {
-      "type": "object"
+      "$ref": "#/$defs/thresholds"
     },
     "reason_codes": {
       "type": "array",
@@ -185,6 +186,48 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "VALIDATED"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validated": {
+            "const": true
+          },
+          "reason_codes": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "REJECTED"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "validated": {
+            "const": false
+          },
+          "reason_codes": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "matrix3x3": {
       "type": "array",
@@ -196,6 +239,62 @@
         "maxItems": 3,
         "items": {
           "type": "number"
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_correspondences",
+        "ransac_reprojection_threshold_m",
+        "minimum_inlier_ratio",
+        "maximum_rmse_m",
+        "maximum_p95_error_m",
+        "minimum_image_hull_area_ratio",
+        "minimum_field_hull_area_ratio",
+        "maximum_condition_number",
+        "minimum_projective_denominator"
+      ],
+      "properties": {
+        "minimum_correspondences": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "ransac_reprojection_threshold_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_inlier_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_rmse_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "maximum_p95_error_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_image_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "minimum_field_hull_area_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_condition_number": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_projective_denominator": {
+          "type": "number",
+          "exclusiveMinimum": 0
         }
       }
     }
