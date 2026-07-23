@@ -4,22 +4,31 @@ on:
   pull_request:
     paths:
       - "app/core/evaluation_truth.py"
-      - "app/workers/pipeline.py"
-      - "app/api.py"
+      - "app/core/evaluation_guard.py"
+      - "app/main.py"
+      - "app/workers/ai_report.py"
       - "tests/test_evaluation_truth.py"
+      - "tests/test_evaluation_guard.py"
+      - "tests/test_async_report.py"
       - ".github/workflows/evaluation-truth.yml"
   push:
     branches:
       - main
     paths:
       - "app/core/evaluation_truth.py"
-      - "app/workers/pipeline.py"
-      - "app/api.py"
+      - "app/core/evaluation_guard.py"
+      - "app/main.py"
+      - "app/workers/ai_report.py"
       - "tests/test_evaluation_truth.py"
+      - "tests/test_evaluation_guard.py"
+      - "tests/test_async_report.py"
       - ".github/workflows/evaluation-truth.yml"
 
 permissions:
   contents: read
+
+env:
+  DATABASE_URL: sqlite+pysqlite:///:memory:
 
 jobs:
   truth-contract:
@@ -34,8 +43,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile truth contract
-        run: python -m py_compile app/core/evaluation_truth.py tests/test_evaluation_truth.py
+      - name: Install lightweight test dependency
+        run: python -m pip install SQLAlchemy==2.0.32
+
+      - name: Compile truth guard modules
+        run: >-
+          python -m py_compile
+          app/core/evaluation_truth.py
+          app/core/evaluation_guard.py
+          app/main.py
+          app/workers/ai_report.py
+          tests/test_evaluation_truth.py
+          tests/test_evaluation_guard.py
+          tests/test_async_report.py
 
       - name: Run truth contract tests
-        run: python -m unittest tests/test_evaluation_truth.py
+        run: >-
+          python -m unittest
+          tests/test_evaluation_truth.py
+          tests/test_evaluation_guard.py
