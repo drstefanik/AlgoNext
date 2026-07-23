@@ -18,6 +18,14 @@ REPORT_UNAVAILABLE_MESSAGE = (
     "ball events, and the scoring model are validated."
 )
 _REPORT_PATH = re.compile(r"^/jobs/([^/]+)/(report|ai-report)$")
+_REPORTABLE_STATUSES = {"DONE", "COMPLETED", "PARTIAL"}
+
+
+def job_ready_for_report(job: AnalysisJob) -> bool:
+    if job.status == "FAILED":
+        return False
+    progress_step = (job.progress or {}).get("step")
+    return progress_step == "DONE" or job.status in _REPORTABLE_STATUSES
 
 
 def validated_player_evaluation_available(
@@ -80,7 +88,7 @@ class EvaluationReportGuardMiddleware(BaseHTTPMiddleware):
         guarded_response: JSONResponse | None = None
         try:
             job = db.get(AnalysisJob, job_id)
-            if job is None:
+            if job is None or not job_ready_for_report(job):
                 passthrough = True
             else:
                 sanitize_analysis_job(job)
