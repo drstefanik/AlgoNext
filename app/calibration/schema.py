@@ -68,14 +68,48 @@ def _optional_number(
     return _number(value, path, minimum=minimum, maximum=maximum)
 
 
+def _require_allowed_keys(
+    value: Mapping[str, Any],
+    allowed: set[str],
+    path: str,
+) -> None:
+    unknown = sorted(set(value.keys()) - allowed)
+    if unknown:
+        raise CalibrationValidationError(
+            path,
+            "unknown fields: " + ", ".join(unknown),
+        )
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    path: str,
+) -> None:
+    _require_allowed_keys(value, expected, path)
+    missing = sorted(expected - set(value.keys()))
+    if missing:
+        raise CalibrationValidationError(
+            path,
+            "missing fields: " + ", ".join(missing),
+        )
+
+
 @dataclass(frozen=True)
 class ImagePoint:
     x: float
     y: float
 
+    def __post_init__(self) -> None:
+        for field_name in ("x", "y"):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"image {field_name} must be finite and in [0, 1]")
+
     @classmethod
     def from_payload(cls, payload: Any, path: str) -> "ImagePoint":
         value = _mapping(payload, path)
+        _require_exact_keys(value, {"x", "y"}, path)
         return cls(
             x=_number(value.get("x"), f"{path}.x", minimum=0.0, maximum=1.0),
             y=_number(value.get("y"), f"{path}.y", minimum=0.0, maximum=1.0),
@@ -90,6 +124,12 @@ class FieldPoint:
     x_m: float
     y_m: float
 
+    def __post_init__(self) -> None:
+        for field_name in ("x_m", "y_m"):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"field {field_name} must be finite and >= 0")
+
     @classmethod
     def from_payload(
         cls,
@@ -98,6 +138,7 @@ class FieldPoint:
         dimensions: PitchDimensions,
     ) -> "FieldPoint":
         value = _mapping(payload, path)
+        _require_exact_keys(value, {"x_m", "y_m"}, path)
         return cls(
             x_m=_number(
                 value.get("x_m"),
@@ -122,7 +163,16 @@ class CalibrationCorrespondence:
     image: ImagePoint
     field: FieldPoint
     label: str | None = None
-    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, ImagePoint):
+            raise ValueError("image must be an ImagePoint")
+        if not isinstance(self.field, FieldPoint):
+            raise ValueError("field must be a FieldPoint")
+        if self.label is not None and (
+            not isinstance(self.label, str) or not self.label.strip()
+        ):
+            raise ValueError("label must be a non-empty string or None")
 
     @classmethod
     def from_payload(
@@ -132,6 +182,11 @@ class CalibrationCorrespondence:
         dimensions: PitchDimensions,
     ) -> "CalibrationCorrespondence":
         value = _mapping(payload, path)
+        _require_allowed_keys(
+            value,
+            {"image", "field", "landmark", "label"},
+            path,
+        )
         label_value = value.get("label")
         if label_value is not None and (
             not isinstance(label_value, str) or not label_value.strip()
@@ -167,12 +222,6 @@ class CalibrationCorrespondence:
             image=image,
             field=field,
             label=label_value.strip() if isinstance(label_value, str) else None,
-            weight=_number(
-                value.get("weight", 1.0),
-                f"{path}.weight",
-                minimum=0.01,
-                maximum=100.0,
-            ),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -180,7 +229,6 @@ class CalibrationCorrespondence:
             "image": self.image.to_payload(),
             "field": self.field.to_payload(),
             "label": self.label,
-            "weight": self.weight,
         }
 
 
@@ -194,6 +242,58 @@ class CalibrationRequest:
     end_sec: float | None = None
     schema_version: str = CALIBRATION_REQUEST_SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.camera_segment_id, str) or not self.camera_segment_id.strip():
+            raise ValueError("camera_segment_id must be a non-empty string")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("source must be a non-empty string")
+        if self.schema_version != CALIBRATION_REQUEST_SCHEMA_VERSION:
+            raise ValueError(
+                "schema_version must equal "
+                f"{CALIBRATION_REQUEST_SCHEMA_VERSION!r}"
+            )
+        if not isinstance(self.pitch, PitchDimensions):
+            raise ValueError("pitch must be PitchDimensions")
+        if len(self.correspondences) < 4:
+            raise ValueError("at least four correspondences are required")
+        if any(
+            not isinstance(item, CalibrationCorrespondence)
+            for item in self.correspondences
+        ):
+            raise ValueError(
+                "correspondences must contain CalibrationCorrespondence values"
+            )
+        if self.start_sec is not None:
+            if not math.isfinite(float(self.start_sec)) or self.start_sec < 0:
+                raise ValueError("start_sec must be finite and >= 0")
+        if self.end_sec is not None:
+            if not math.isfinite(float(self.end_sec)) or self.end_sec < 0:
+                raise ValueError("end_sec must be finite and >= 0")
+        if (
+            self.start_sec is not None
+            and self.end_sec is not None
+            and self.end_sec <= self.start_sec
+        ):
+            raise ValueError("end_sec must be greater than start_sec")
+
+        seen_image: set[tuple[float, float]] = set()
+        seen_field: set[tuple[float, float]] = set()
+        for correspondence in self.correspondences:
+            image_key = (
+                round(correspondence.image.x, 8),
+                round(correspondence.image.y, 8),
+            )
+            field_key = (
+                round(correspondence.field.x_m, 6),
+                round(correspondence.field.y_m, 6),
+            )
+            if image_key in seen_image:
+                raise ValueError("duplicate image point")
+            if field_key in seen_field:
+                raise ValueError("duplicate field point")
+            seen_image.add(image_key)
+            seen_field.add(field_key)
+
     @classmethod
     def from_payload(
         cls,
@@ -201,8 +301,26 @@ class CalibrationRequest:
         path: str = "$",
     ) -> "CalibrationRequest":
         value = _mapping(payload, path)
+        _require_allowed_keys(
+            value,
+            {
+                "schema_version",
+                "camera_segment_id",
+                "source",
+                "start_sec",
+                "end_sec",
+                "pitch",
+                "correspondences",
+            },
+            path,
+        )
         pitch_payload = value.get("pitch") or {}
         pitch_value = _mapping(pitch_payload, f"{path}.pitch")
+        _require_allowed_keys(
+            pitch_value,
+            {"length_m", "width_m"},
+            f"{path}.pitch",
+        )
         pitch = PitchDimensions(
             length_m=_number(
                 pitch_value.get("length_m", 105.0),
@@ -232,29 +350,6 @@ class CalibrationRequest:
                 f"{path}.correspondences",
                 "at least four correspondences are required",
             )
-        seen_image: set[tuple[float, float]] = set()
-        seen_field: set[tuple[float, float]] = set()
-        for correspondence in correspondences:
-            image_key = (
-                round(correspondence.image.x, 8),
-                round(correspondence.image.y, 8),
-            )
-            field_key = (
-                round(correspondence.field.x_m, 6),
-                round(correspondence.field.y_m, 6),
-            )
-            if image_key in seen_image:
-                raise CalibrationValidationError(
-                    f"{path}.correspondences",
-                    "duplicate image point",
-                )
-            if field_key in seen_field:
-                raise CalibrationValidationError(
-                    f"{path}.correspondences",
-                    "duplicate field point",
-                )
-            seen_image.add(image_key)
-            seen_field.add(field_key)
 
         start_sec = _optional_number(
             value.get("start_sec"),
@@ -280,18 +375,21 @@ class CalibrationRequest:
                 f"{path}.schema_version",
                 f"expected {CALIBRATION_REQUEST_SCHEMA_VERSION!r}",
             )
-        return cls(
-            camera_segment_id=_string(
-                value.get("camera_segment_id"),
-                f"{path}.camera_segment_id",
-            ),
-            correspondences=correspondences,
-            pitch=pitch,
-            source=_string(value.get("source", "manual"), f"{path}.source"),
-            start_sec=start_sec,
-            end_sec=end_sec,
-            schema_version=schema_version,
-        )
+        try:
+            return cls(
+                camera_segment_id=_string(
+                    value.get("camera_segment_id"),
+                    f"{path}.camera_segment_id",
+                ),
+                correspondences=correspondences,
+                pitch=pitch,
+                source=_string(value.get("source", "manual"), f"{path}.source"),
+                start_sec=start_sec,
+                end_sec=end_sec,
+                schema_version=schema_version,
+            )
+        except ValueError as exc:
+            raise CalibrationValidationError(path, str(exc)) from exc
 
     def to_payload(self) -> dict[str, Any]:
         return {
