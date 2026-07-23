@@ -4,6 +4,7 @@ from app.calibration.homography import CalibrationThresholds, PitchCalibration
 from app.calibration.kinematics import (
     CalibratedTrackPoint,
     MotionThresholds,
+    _smooth_points,
     calculate_calibrated_motion,
     project_tracking_footpoints,
 )
@@ -82,6 +83,19 @@ class CalibratedKinematicsGuardTests(unittest.TestCase):
         self.assertEqual(result["observed_path_length_m"], 0.0)
         self.assertEqual(result["quality"]["accepted_transitions"], 0)
         self.assertEqual(result["quality"]["rejected_camera_changes"], 1)
+
+    def test_smoothing_never_uses_a_point_beyond_maximum_gap(self):
+        points = [
+            CalibratedTrackPoint(0.0, 0.0, 0.0, "camera-a"),
+            CalibratedTrackPoint(0.1, 0.1, 0.0, "camera-a"),
+            CalibratedTrackPoint(1.0, 100.0, 0.0, "camera-a"),
+        ]
+        smoothed = _smooth_points(
+            points,
+            window=3,
+            maximum_gap_sec=0.2,
+        )
+        self.assertAlmostEqual(smoothed[2].x_m, 100.0, places=6)
 
     def test_negative_timestamp_is_rejected_before_projection(self):
         points, counters = project_tracking_footpoints(
