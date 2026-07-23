@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/pitch-keypoint-annotation-v1.schema.json",
+  "title": "AlgoNext pitch keypoint annotation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "frames"],
+  "properties": {
+    "schema_version": {"const": "pitch-keypoint-annotation-v1"},
+    "frames": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/frame"}
+    }
+  },
+  "$defs": {
+    "landmark": {
+      "enum": [
+        "centre_circle_left", "centre_circle_right", "centre_spot",
+        "corner_left_bottom", "corner_left_top", "corner_right_bottom", "corner_right_top",
+        "halfway_bottom", "halfway_top",
+        "left_goal_area_bottom", "left_goal_area_top", "left_penalty_area_bottom",
+        "left_penalty_area_top", "left_penalty_spot",
+        "right_goal_area_bottom", "right_goal_area_top", "right_penalty_area_bottom",
+        "right_penalty_area_top", "right_penalty_spot"
+      ]
+    },
+    "keypoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["landmark", "x", "y", "visibility"],
+      "properties": {
+        "landmark": {"$ref": "#/$defs/landmark"},
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "visibility": {"enum": ["visible", "occluded"]}
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_id", "video_id", "shot_id", "time_sec", "width", "height",
+        "is_pitch_view", "split", "keypoints"
+      ],
+      "properties": {
+        "frame_id": {"type": "string", "minLength": 1},
+        "video_id": {"type": "string", "minLength": 1},
+        "shot_id": {"type": "string", "minLength": 1},
+        "time_sec": {"type": "number", "minimum": 0},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "is_pitch_view": {"type": "boolean"},
+        "split": {"enum": ["development", "validation", "test"]},
+        "keypoints": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/keypoint"}
+        }
+      }
+    }
+  }
+}
