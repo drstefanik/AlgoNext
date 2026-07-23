@@ -135,9 +135,48 @@ class PitchCalibrationGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "array of booleans"):
             PitchCalibration.from_payload(payload)
 
+    def test_result_parser_requires_every_threshold(self):
+        calibration = fit_pitch_calibration(request_with_six_points())
+        payload = calibration.to_payload()
+        payload["thresholds"].pop("maximum_rmse_m")
+        with self.assertRaisesRegex(ValueError, "thresholds is missing fields"):
+            PitchCalibration.from_payload(payload)
+
+    def test_result_parser_rejects_unknown_thresholds(self):
+        calibration = fit_pitch_calibration(request_with_six_points())
+        payload = calibration.to_payload()
+        payload["thresholds"]["unknown_gate"] = 1.0
+        with self.assertRaisesRegex(ValueError, "thresholds contains unknown fields"):
+            PitchCalibration.from_payload(payload)
+
+    def test_result_parser_requires_exact_provenance_seed(self):
+        calibration = fit_pitch_calibration(request_with_six_points())
+        payload = calibration.to_payload()
+        payload["provenance"]["ransac_seed"] = 7
+        with self.assertRaisesRegex(ValueError, "ransac_seed is invalid"):
+            PitchCalibration.from_payload(payload)
+
+    def test_result_parser_rejects_unknown_provenance_fields(self):
+        calibration = fit_pitch_calibration(request_with_six_points())
+        payload = calibration.to_payload()
+        payload["provenance"]["extra"] = "untracked"
+        with self.assertRaisesRegex(ValueError, "provenance contains unknown fields"):
+            PitchCalibration.from_payload(payload)
+
+    def test_result_parser_rejects_wrong_method(self):
+        calibration = fit_pitch_calibration(request_with_six_points())
+        payload = calibration.to_payload()
+        payload["method"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "method must equal"):
+            PitchCalibration.from_payload(payload)
+
     def test_thresholds_reject_nan(self):
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             CalibrationThresholds(maximum_rmse_m=float("nan"))
+
+    def test_minimum_correspondences_requires_an_integer(self):
+        with self.assertRaisesRegex(ValueError, "integer >= 4"):
+            CalibrationThresholds(minimum_correspondences=True)
 
 
 if __name__ == "__main__":
