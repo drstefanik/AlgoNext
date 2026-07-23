@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -233,7 +233,8 @@ def build_pitch_masks(
 
 
 def _line_angle_deg(x1: float, y1: float, x2: float, y2: float) -> float:
-    return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+    angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+    return angle
 
 
 def _angle_distance(first: float, second: float) -> float:
@@ -299,10 +300,7 @@ def detect_pitch_lines(
 
     edges = cv2.Canny(white_mask, 40, 120, apertureSize=3, L2gradient=True)
     edge_density = float(np.count_nonzero(edges)) / frame_area
-    minimum_length = max(
-        20,
-        int(round(min(height, width) * thresholds.minimum_line_length_fraction)),
-    )
+    minimum_length = max(20, int(round(min(height, width) * thresholds.minimum_line_length_fraction)))
     hough_threshold = max(15, int(round(min(height, width) * 0.025)))
     raw = cv2.HoughLinesP(
         edges,
@@ -322,9 +320,7 @@ def detect_pitch_lines(
             support = _sample_line_support(white_mask, x1, y1, x2, y2)
             if support < thresholds.minimum_line_support:
                 continue
-            confidence = _clamp(
-                0.55 * min(1.0, length_fraction / 0.35) + 0.45 * support
-            )
+            confidence = _clamp(0.55 * min(1.0, length_fraction / 0.35) + 0.45 * support)
             candidates.append(
                 DetectedLine(
                     x1=_clamp(x1 / float(width)),
@@ -339,17 +335,10 @@ def detect_pitch_lines(
             )
 
     selected: list[DetectedLine] = []
-    for candidate in sorted(
-        candidates,
-        key=lambda item: (item.confidence, item.length_fraction),
-        reverse=True,
-    ):
+    for candidate in sorted(candidates, key=lambda item: (item.confidence, item.length_fraction), reverse=True):
         duplicate = False
         for existing in selected:
-            if (
-                _angle_distance(candidate.angle_deg, existing.angle_deg)
-                > thresholds.duplicate_angle_deg
-            ):
+            if _angle_distance(candidate.angle_deg, existing.angle_deg) > thresholds.duplicate_angle_deg:
                 continue
             distance = _line_distance_pixels(candidate, existing, width, height)
             if distance <= thresholds.duplicate_distance_fraction * diagonal:
@@ -420,6 +409,7 @@ def cluster_line_orientations(
                 break
         if not placed:
             clusters.append([line.angle_deg])
+    # Merge wrap-around families around 0/180 degrees.
     if len(clusters) > 1:
         first_mean = _orientation_mean(clusters[0])
         last_mean = _orientation_mean(clusters[-1])
@@ -432,9 +422,7 @@ def _orientation_mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     radians = np.deg2rad(np.asarray(values, dtype=np.float64) * 2.0)
-    angle = math.degrees(
-        math.atan2(float(np.sin(radians).mean()), float(np.cos(radians).mean()))
-    )
+    angle = math.degrees(math.atan2(float(np.sin(radians).mean()), float(np.cos(radians).mean())))
     return (angle / 2.0) % 180.0
 
 
@@ -446,14 +434,8 @@ def _intersection(first: DetectedLine, second: DetectedLine) -> tuple[float, flo
         return None
     determinant_first = x1 * y2 - y1 * x2
     determinant_second = x3 * y4 - y3 * x4
-    x = (
-        determinant_first * (x3 - x4)
-        - (x1 - x2) * determinant_second
-    ) / denominator
-    y = (
-        determinant_first * (y3 - y4)
-        - (y1 - y2) * determinant_second
-    ) / denominator
+    x = (determinant_first * (x3 - x4) - (x1 - x2) * determinant_second) / denominator
+    y = (determinant_first * (y3 - y4) - (y1 - y2) * determinant_second) / denominator
     if not math.isfinite(x) or not math.isfinite(y):
         return None
     if not (-0.03 <= x <= 1.03 and -0.03 <= y <= 1.03):
@@ -478,9 +460,7 @@ def intersect_pitch_lines(
                 continue
             x, y = point
             angle_quality = math.sin(math.radians(separation))
-            confidence = _clamp(
-                math.sqrt(first.confidence * second.confidence) * angle_quality
-            )
+            confidence = _clamp(math.sqrt(first.confidence * second.confidence) * angle_quality)
             candidate = KeypointProposal(
                 x=x,
                 y=y,
@@ -531,6 +511,7 @@ def detect_pitch_geometry(
         reasons.append("INSUFFICIENT_LINE_ORIENTATION_FAMILIES")
     if evidence.intersection_count < thresholds.minimum_intersections:
         reasons.append("INSUFFICIENT_LINE_INTERSECTIONS")
+    # Geometry alone cannot assign canonical field coordinates safely.
     reasons.append("SEMANTIC_LANDMARKS_NOT_ASSIGNED")
     status = "CANDIDATE" if len(reasons) == 1 else "INSUFFICIENT"
     return PitchGeometryProposal(
