@@ -26,7 +26,7 @@ on:
       - "tests/test_tracking_adapter.py"
       - "tests/test_reid_*.py"
       - "tests/test_pitch_calibration*.py"
-      - "tests/test_calibrated_kinematics.py"
+      - "tests/test_calibrated_kinematics*.py"
       - "tests/fixtures/tracking_benchmark/**"
       - "tests/fixtures/pitch_calibration/**"
       - "docs/pitch_calibration.md"
@@ -59,7 +59,7 @@ on:
       - "tests/test_tracking_adapter.py"
       - "tests/test_reid_*.py"
       - "tests/test_pitch_calibration*.py"
-      - "tests/test_calibrated_kinematics.py"
+      - "tests/test_calibrated_kinematics*.py"
       - "tests/fixtures/tracking_benchmark/**"
       - "tests/fixtures/pitch_calibration/**"
       - "docs/pitch_calibration.md"
@@ -225,6 +225,7 @@ jobs:
           tests/test_pitch_calibration.py
           tests/test_pitch_calibration_guards.py
           tests/test_calibrated_kinematics.py
+          tests/test_calibrated_kinematics_guards.py
 
       - name: Run pitch calibration and kinematics tests
         run: >-
@@ -232,6 +233,7 @@ jobs:
           tests/test_pitch_calibration.py
           tests/test_pitch_calibration_guards.py
           tests/test_calibrated_kinematics.py
+          tests/test_calibrated_kinematics_guards.py
 
       - name: Run pitch calibration quality-gate smoke test
         run: >-
