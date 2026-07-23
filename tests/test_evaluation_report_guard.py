@@ -1,16 +1,32 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 from app.core.evaluation_http_guard import (
     REPORT_UNAVAILABLE_MESSAGE,
     build_unavailable_report,
+    job_ready_for_report,
     validated_player_evaluation_available,
 )
 
 
 class EvaluationReportGuardTests(unittest.TestCase):
+    def test_processing_job_remains_pending_instead_of_unavailable(self):
+        job = SimpleNamespace(status="RUNNING", progress={"step": "TRACKING"})
+
+        self.assertFalse(job_ready_for_report(job))
+
+    def test_completed_or_done_job_is_eligible_for_abstention_guard(self):
+        completed = SimpleNamespace(status="COMPLETED", progress={})
+        done_step = SimpleNamespace(status="RUNNING", progress={"step": "DONE"})
+        failed = SimpleNamespace(status="FAILED", progress={"step": "DONE"})
+
+        self.assertTrue(job_ready_for_report(completed))
+        self.assertTrue(job_ready_for_report(done_step))
+        self.assertFalse(job_ready_for_report(failed))
+
     def test_tracking_only_result_cannot_generate_player_report(self):
         result = {
             "player_evaluation_available": False,
