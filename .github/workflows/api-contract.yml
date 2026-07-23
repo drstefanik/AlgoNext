@@ -6,11 +6,14 @@ on:
       - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
+      - "app/core/evaluation_http_guard.py"
       - "app/main.py"
+      - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
+      - "tests/test_evaluation_report_guard.py"
       - ".github/workflows/api-contract.yml"
   push:
     branches:
@@ -19,11 +22,14 @@ on:
       - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
+      - "app/core/evaluation_http_guard.py"
       - "app/main.py"
+      - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
+      - "tests/test_evaluation_report_guard.py"
       - ".github/workflows/api-contract.yml"
 
 permissions:
@@ -45,8 +51,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install lightweight contract dependency
-        run: python -m pip install SQLAlchemy==2.0.32
+      - name: Install lightweight contract dependencies
+        run: python -m pip install SQLAlchemy==2.0.32 fastapi==0.115.0
 
       - name: Compile changed Python modules
         run: >-
@@ -54,11 +60,14 @@ jobs:
           app/core/http_errors.py
           app/core/evaluation_truth.py
           app/core/evaluation_guard.py
+          app/core/evaluation_http_guard.py
           app/main.py
+          app/workers/celery_app.py
           app/workers/ai_report.py
           tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
+          tests/test_evaluation_report_guard.py
 
       - name: Run API and evaluation truth contract tests
         run: >-
@@ -66,3 +75,4 @@ jobs:
           tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
+          tests/test_evaluation_report_guard.py
