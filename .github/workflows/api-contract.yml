@@ -164,6 +164,7 @@ jobs:
           tests/test_reid_association.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
+          tests/test_reid_windowed_tracking.py
 
       - name: Run ReID foundation and activation tests
         run: >-
@@ -172,6 +173,7 @@ jobs:
           tests/test_reid_association.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
+          tests/test_reid_windowed_tracking.py
 
       - name: Validate Compose kill-switch configuration
         run: docker compose config >/dev/null
