@@ -124,6 +124,54 @@ class TrackingBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["counts"]["id_switches"], 1)
         self.assertEqual(report["metrics"]["id_switches_per_100_matches"], 25.0)
 
+    def test_frame_assignment_prioritizes_match_cardinality_over_single_best_iou(self):
+        annotations = annotation(
+            "cardinality",
+            [
+                {
+                    "frame_index": 0,
+                    "objects": [
+                        {
+                            "identity": "player-a",
+                            "bbox": {"x": 0.10, "y": 0.1, "w": 0.20, "h": 0.2},
+                        },
+                        {
+                            "identity": "player-b",
+                            "bbox": {"x": 0.25, "y": 0.1, "w": 0.20, "h": 0.2},
+                        },
+                    ],
+                }
+            ],
+        )
+        predictions = prediction(
+            "cardinality",
+            [
+                {
+                    "frame_index": 0,
+                    "tracks": [
+                        {
+                            "track_id": "bridge",
+                            "bbox": {"x": 0.11, "y": 0.1, "w": 0.20, "h": 0.2},
+                        },
+                        {
+                            "track_id": "left-only",
+                            "bbox": {"x": 0.08, "y": 0.1, "w": 0.20, "h": 0.2},
+                        },
+                    ],
+                }
+            ],
+        )
+
+        report = evaluate_sequence(
+            annotations,
+            predictions,
+            iou_threshold=0.15,
+        )
+
+        self.assertEqual(report["counts"]["true_positives"], 2)
+        self.assertEqual(report["counts"]["false_negatives"], 0)
+        self.assertEqual(report["counts"]["false_positives"], 0)
+
     def test_missing_detection_and_false_positive(self):
         annotations = annotation(
             "errors",
