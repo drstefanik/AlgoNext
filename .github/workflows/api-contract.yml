@@ -9,12 +9,15 @@ on:
       - "app/core/evaluation_http_guard.py"
       - "app/benchmark/**"
       - "app/reid/**"
+      - "app/calibration/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
+      - "scripts/solve_pitch_calibration.py"
+      - "scripts/apply_pitch_calibration.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
@@ -22,7 +25,12 @@ on:
       - "tests/test_tracking_benchmark.py"
       - "tests/test_tracking_adapter.py"
       - "tests/test_reid_*.py"
+      - "tests/test_pitch_calibration.py"
+      - "tests/test_calibrated_kinematics.py"
       - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/pitch_calibration/**"
+      - "docs/pitch_calibration.md"
+      - "docs/schemas/pitch-calibration-*.schema.json"
       - ".github/workflows/api-contract.yml"
   push:
     branches:
@@ -34,12 +42,15 @@ on:
       - "app/core/evaluation_http_guard.py"
       - "app/benchmark/**"
       - "app/reid/**"
+      - "app/calibration/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
+      - "scripts/solve_pitch_calibration.py"
+      - "scripts/apply_pitch_calibration.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
@@ -47,7 +58,12 @@ on:
       - "tests/test_tracking_benchmark.py"
       - "tests/test_tracking_adapter.py"
       - "tests/test_reid_*.py"
+      - "tests/test_pitch_calibration.py"
+      - "tests/test_calibrated_kinematics.py"
       - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/pitch_calibration/**"
+      - "docs/pitch_calibration.md"
+      - "docs/schemas/pitch-calibration-*.schema.json"
       - ".github/workflows/api-contract.yml"
 
 permissions:
@@ -177,3 +193,56 @@ jobs:
 
       - name: Validate Compose kill-switch configuration
         run: docker compose config >/dev/null
+
+  pitch-calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install calibration test dependencies
+        run: >-
+          python -m pip install
+          numpy==1.26.4
+          opencv-python-headless==4.10.0.84
+
+      - name: Compile calibration modules, CLIs and tests
+        run: >-
+          python -m py_compile
+          app/calibration/__init__.py
+          app/calibration/model.py
+          app/calibration/schema.py
+          app/calibration/homography.py
+          app/calibration/kinematics.py
+          scripts/solve_pitch_calibration.py
+          scripts/apply_pitch_calibration.py
+          tests/test_pitch_calibration.py
+          tests/test_calibrated_kinematics.py
+
+      - name: Run pitch calibration and kinematics tests
+        run: >-
+          python -m unittest
+          tests/test_pitch_calibration.py
+          tests/test_calibrated_kinematics.py
+
+      - name: Run pitch calibration quality-gate smoke test
+        run: >-
+          python scripts/solve_pitch_calibration.py
+          --input tests/fixtures/pitch_calibration/exact-full-pitch.json
+          --output /tmp/pitch-calibration.json
+          --fail-on-gate
+
+      - name: Run calibrated motion CLI smoke test
+        run: >-
+          python scripts/apply_pitch_calibration.py
+          --tracking tests/fixtures/pitch_calibration/tracking-linear.json
+          --calibration /tmp/pitch-calibration.json
+          --output /tmp/calibrated-motion.json
+          --minimum-points 10
+          --fail-if-unavailable
