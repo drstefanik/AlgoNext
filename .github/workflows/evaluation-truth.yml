@@ -14,6 +14,7 @@ on:
   push:
     branches:
       - main
+      - agent/evaluation-truth-gate
     paths:
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
