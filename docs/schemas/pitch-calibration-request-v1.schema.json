@@ -24,7 +24,7 @@
     },
     "end_sec": {
       "type": ["number", "null"],
-      "exclusiveMinimum": 0
+      "minimum": 0
     },
     "pitch": {
       "type": "object",
@@ -64,12 +64,6 @@
           },
           "label": {
             "type": ["string", "null"]
-          },
-          "weight": {
-            "type": "number",
-            "minimum": 0.01,
-            "maximum": 100,
-            "default": 1
           }
         },
         "oneOf": [
