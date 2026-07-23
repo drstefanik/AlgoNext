@@ -17,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.core.env import load_env
 from app.core.db import Base, SessionLocal, engine, DATABASE_URL
 from app.core.evaluation_guard import install_evaluation_guard
+from app.core.evaluation_http_guard import EvaluationReportGuardMiddleware
 from app.core.http_errors import normalize_http_exception_detail
 from app.api import router as api_router
 
@@ -69,6 +70,9 @@ app = FastAPI(
     openapi_url=OPENAPI_URL,
 )
 
+# Added before the request/security wrappers so guarded responses still receive
+# request IDs and the standard security headers.
+app.add_middleware(EvaluationReportGuardMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
