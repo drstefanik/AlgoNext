@@ -211,6 +211,7 @@ jobs:
           python -m pip install
           numpy==1.26.4
           opencv-python-headless==4.10.0.84
+          jsonschema==4.23.0
 
       - name: Compile calibration modules, CLIs and tests
         run: >-
@@ -224,6 +225,7 @@ jobs:
           scripts/apply_pitch_calibration.py
           tests/test_pitch_calibration.py
           tests/test_pitch_calibration_guards.py
+          tests/test_pitch_calibration_json_schema.py
           tests/test_calibrated_kinematics.py
           tests/test_calibrated_kinematics_guards.py
 
@@ -232,6 +234,7 @@ jobs:
           python -m unittest
           tests/test_pitch_calibration.py
           tests/test_pitch_calibration_guards.py
+          tests/test_pitch_calibration_json_schema.py
           tests/test_calibrated_kinematics.py
           tests/test_calibrated_kinematics_guards.py
 
