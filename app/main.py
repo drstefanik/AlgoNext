@@ -16,10 +16,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.env import load_env
 from app.core.db import Base, SessionLocal, engine, DATABASE_URL
+from app.core.evaluation_guard import install_evaluation_guard
 from app.core.http_errors import normalize_http_exception_detail
 from app.api import router as api_router
 
 load_env()
+install_evaluation_guard()
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 DOCS_URL = None if APP_ENV == "production" else "/docs"
