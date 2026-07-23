@@ -20,7 +20,9 @@ REPORT_UNAVAILABLE_MESSAGE = (
 _REPORT_PATH = re.compile(r"^/jobs/([^/]+)/(report|ai-report)$")
 
 
-def validated_player_evaluation_available(result: Mapping[str, Any] | None) -> bool:
+def validated_player_evaluation_available(
+    result: Mapping[str, Any] | None,
+) -> bool:
     if not isinstance(result, Mapping):
         return False
     provenance = result.get("score_provenance")
@@ -33,7 +35,9 @@ def validated_player_evaluation_available(result: Mapping[str, Any] | None) -> b
     )
 
 
-def build_unavailable_report(result: Mapping[str, Any] | None) -> dict[str, Any]:
+def build_unavailable_report(
+    result: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     limitations = []
     if isinstance(result, Mapping) and isinstance(result.get("limitations"), list):
         limitations = [
@@ -72,53 +76,65 @@ class EvaluationReportGuardMiddleware(BaseHTTPMiddleware):
 
         job_id, endpoint = match.groups()
         db = SessionLocal()
+        passthrough = False
+        guarded_response: JSONResponse | None = None
         try:
             job = db.get(AnalysisJob, job_id)
             if job is None:
-                return await call_next(request)
-
-            sanitize_analysis_job(job)
-            if validated_player_evaluation_available(job.result):
-                return await call_next(request)
-
-            report = (
-                job.report
-                if job.report_status == "UNAVAILABLE" and isinstance(job.report, dict)
-                else build_unavailable_report(job.result)
-            )
-            if request.method == "POST":
-                job.report_status = "UNAVAILABLE"
-                job.report_error = REPORT_UNAVAILABLE_MESSAGE
-                job.report = report
-                job.ai_report = report
-                db.add(job)
-                db.commit()
-
-            request_id = (
-                getattr(request.state, "request_id", None)
-                or request.headers.get("x-request-id")
-                or str(uuid4())
-            )
-            if endpoint == "ai-report":
-                data = {
-                    "status": "UNAVAILABLE",
-                    "ai_report": report,
-                    "reason": REPORT_UNAVAILABLE_MESSAGE,
-                }
+                passthrough = True
             else:
-                data = {
-                    "status": "UNAVAILABLE",
-                    "report": report,
-                    "reason": REPORT_UNAVAILABLE_MESSAGE,
-                }
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": True,
-                    "data": data,
-                    "meta": _response_meta(request, request_id),
-                },
-                headers={"cache-control": "no-store", "x-request-id": request_id},
-            )
+                sanitize_analysis_job(job)
+                if validated_player_evaluation_available(job.result):
+                    passthrough = True
+                else:
+                    report = (
+                        job.report
+                        if job.report_status == "UNAVAILABLE"
+                        and isinstance(job.report, dict)
+                        else build_unavailable_report(job.result)
+                    )
+                    if request.method == "POST":
+                        job.report_status = "UNAVAILABLE"
+                        job.report_error = REPORT_UNAVAILABLE_MESSAGE
+                        job.report = report
+                        job.ai_report = report
+                        db.add(job)
+                        db.commit()
+
+                    request_id = (
+                        getattr(request.state, "request_id", None)
+                        or request.headers.get("x-request-id")
+                        or str(uuid4())
+                    )
+                    if endpoint == "ai-report":
+                        data = {
+                            "status": "UNAVAILABLE",
+                            "ai_report": report,
+                            "reason": REPORT_UNAVAILABLE_MESSAGE,
+                        }
+                    else:
+                        data = {
+                            "status": "UNAVAILABLE",
+                            "report": report,
+                            "reason": REPORT_UNAVAILABLE_MESSAGE,
+                        }
+                    guarded_response = JSONResponse(
+                        status_code=200,
+                        content={
+                            "ok": True,
+                            "data": data,
+                            "meta": _response_meta(request, request_id),
+                        },
+                        headers={
+                            "cache-control": "no-store",
+                            "x-request-id": request_id,
+                        },
+                    )
         finally:
             db.close()
+
+        if passthrough:
+            return await call_next(request)
+        if guarded_response is None:
+            raise RuntimeError("Evaluation report guard produced no response")
+        return guarded_response
