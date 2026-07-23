@@ -8,9 +8,11 @@ on:
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
       - "app/benchmark/**"
+      - "app/reid/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
       - "tests/test_http_error_contract.py"
@@ -19,6 +21,7 @@ on:
       - "tests/test_evaluation_report_guard.py"
       - "tests/test_tracking_benchmark.py"
       - "tests/test_tracking_adapter.py"
+      - "tests/test_reid_*.py"
       - "tests/fixtures/tracking_benchmark/**"
       - ".github/workflows/api-contract.yml"
   push:
@@ -30,9 +33,11 @@ on:
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
       - "app/benchmark/**"
+      - "app/reid/**"
       - "app/main.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
       - "tests/test_http_error_contract.py"
@@ -41,6 +46,7 @@ on:
       - "tests/test_evaluation_report_guard.py"
       - "tests/test_tracking_benchmark.py"
       - "tests/test_tracking_adapter.py"
+      - "tests/test_reid_*.py"
       - "tests/fixtures/tracking_benchmark/**"
       - ".github/workflows/api-contract.yml"
 
@@ -126,3 +132,46 @@ jobs:
           --predictions tests/fixtures/tracking_benchmark/predictions
           --json-out /tmp/tracking-benchmark.json
           --fail-on-gate
+
+  player-reid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ReID test dependencies
+        run: >-
+          python -m pip install
+          numpy==1.26.4
+          opencv-python-headless==4.10.0.84
+
+      - name: Compile ReID modules and tests
+        run: >-
+          python -m py_compile
+          app/reid/__init__.py
+          app/reid/appearance.py
+          app/reid/association.py
+          app/reid/window_logic.py
+          app/reid/runtime.py
+          app/reid/windowed_tracking.py
+          tests/test_reid_appearance.py
+          tests/test_reid_association.py
+          tests/test_reid_window_logic.py
+          tests/test_reid_runtime.py
+
+      - name: Run ReID foundation and activation tests
+        run: >-
+          python -m unittest
+          tests/test_reid_appearance.py
+          tests/test_reid_association.py
+          tests/test_reid_window_logic.py
+          tests/test_reid_runtime.py
+
+      - name: Validate Compose kill-switch configuration
+        run: docker compose config >/dev/null
