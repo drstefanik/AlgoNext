@@ -1,0 +1,39 @@
+name: API contract
+
+on:
+  pull_request:
+    paths:
+      - "app/core/http_errors.py"
+      - "app/main.py"
+      - "tests/test_http_error_contract.py"
+      - ".github/workflows/api-contract.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/core/http_errors.py"
+      - "app/main.py"
+      - "tests/test_http_error_contract.py"
+      - ".github/workflows/api-contract.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile changed Python modules
+        run: python -m py_compile app/core/http_errors.py app/main.py tests/test_http_error_contract.py
+
+      - name: Run API contract tests
+        run: python -m unittest tests/test_http_error_contract.py
