@@ -13,6 +13,9 @@ from app.calibration.schema import (
     CalibrationRequest,
 )
 
+CALIBRATION_METHOD = "opencv-findHomography-ransac-v1"
+RANSAC_SEED = 0
+
 
 class CalibrationFitError(RuntimeError):
     pass
@@ -118,25 +121,34 @@ def _condition_number(
 
 
 def _minimum_denominator(matrix: np.ndarray) -> float:
-    samples = np.array(
+    """Return the smallest absolute projective denominator on the unit frame.
+
+    The denominator is affine in image x/y, so its extrema occur at the four
+    corners. A sign change between corners proves that the projective horizon
+    crosses the frame and therefore the true minimum is zero, even when none of
+    a finite set of sample points lies exactly on that horizon.
+    """
+
+    corners = np.array(
         [
             [0.0, 0.0],
             [1.0, 0.0],
             [0.0, 1.0],
             [1.0, 1.0],
-            [0.5, 0.0],
-            [0.5, 1.0],
-            [0.0, 0.5],
-            [1.0, 0.5],
-            [0.5, 0.5],
         ],
         dtype=np.float64,
     )
     denominators = (
-        matrix[2, 0] * samples[:, 0]
-        + matrix[2, 1] * samples[:, 1]
+        matrix[2, 0] * corners[:, 0]
+        + matrix[2, 1] * corners[:, 1]
         + matrix[2, 2]
     )
+    if not np.isfinite(denominators).all():
+        return float("nan")
+    minimum = float(np.min(denominators))
+    maximum = float(np.max(denominators))
+    if minimum <= 0.0 <= maximum:
+        return 0.0
     return float(np.min(np.abs(denominators)))
 
 
@@ -145,6 +157,12 @@ def _require_finite(value: float, field: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"{field} must be finite")
     return parsed
+
+
+def _require_non_empty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
 
 
 @dataclass(frozen=True)
@@ -172,16 +190,32 @@ class PitchCalibration:
     reason_codes: tuple[str, ...]
     thresholds: CalibrationThresholds
     schema_version: str = CALIBRATION_RESULT_SCHEMA_VERSION
-    method: str = "opencv-findHomography-ransac-v1"
+    method: str = CALIBRATION_METHOD
     validated: bool = False
 
     def __post_init__(self) -> None:
-        if not self.camera_segment_id.strip():
-            raise ValueError("camera_segment_id must not be empty")
+        _require_non_empty_string(self.camera_segment_id, "camera_segment_id")
+        _require_non_empty_string(self.source, "source")
+        if self.schema_version != CALIBRATION_RESULT_SCHEMA_VERSION:
+            raise ValueError(
+                "schema_version must equal "
+                f"{CALIBRATION_RESULT_SCHEMA_VERSION!r}"
+            )
+        if self.method != CALIBRATION_METHOD:
+            raise ValueError(f"method must equal {CALIBRATION_METHOD!r}")
         if self.status not in {"VALIDATED", "REJECTED"}:
             raise ValueError("calibration status must be VALIDATED or REJECTED")
+        if not isinstance(self.validated, bool):
+            raise ValueError("validated must be a boolean")
         if self.validated != (self.status == "VALIDATED"):
             raise ValueError("validated must match status")
+        if any(
+            not isinstance(code, str) or not code.strip()
+            for code in self.reason_codes
+        ):
+            raise ValueError("reason_codes must contain non-empty strings")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("reason_codes must not contain duplicates")
         if self.validated and self.reason_codes:
             raise ValueError("validated calibration cannot contain reason codes")
         if not self.validated and not self.reason_codes:
@@ -190,7 +224,9 @@ class PitchCalibration:
             raise ValueError("total_correspondences must be >= 4")
         if len(self.inlier_mask) != self.total_correspondences:
             raise ValueError("inlier_mask length must match total_correspondences")
-        if self.inlier_count != sum(bool(value) for value in self.inlier_mask):
+        if any(not isinstance(value, bool) for value in self.inlier_mask):
+            raise ValueError("inlier_mask must contain booleans")
+        if self.inlier_count != sum(self.inlier_mask):
             raise ValueError("inlier_count must match inlier_mask")
         if self.inlier_count < 4:
             raise ValueError("inlier_count must be >= 4")
@@ -336,11 +372,24 @@ class PitchCalibration:
                 "coordinate_output": "pitch_metres",
                 "opencv_version": cv2.__version__,
                 "quality_gate": "pitch-calibration-gate-v1",
+                "ransac_seed": RANSAC_SEED,
             },
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PitchCalibration":
+        schema_version = payload.get("schema_version")
+        if schema_version != CALIBRATION_RESULT_SCHEMA_VERSION:
+            raise ValueError(
+                "schema_version must equal "
+                f"{CALIBRATION_RESULT_SCHEMA_VERSION!r}"
+            )
+        method = payload.get("method")
+        if method != CALIBRATION_METHOD:
+            raise ValueError(f"method must equal {CALIBRATION_METHOD!r}")
+        validated_value = payload.get("validated")
+        if not isinstance(validated_value, bool):
+            raise ValueError("validated must be a boolean")
         pitch_payload = payload.get("pitch")
         if not isinstance(pitch_payload, Mapping):
             raise ValueError("pitch must be an object")
@@ -358,14 +407,24 @@ class PitchCalibration:
             }
         )
         status = str(payload.get("status") or "")
-        inlier_mask_value = quality.get("inlier_mask") or []
-        if not isinstance(inlier_mask_value, list):
-            raise ValueError("quality.inlier_mask must be an array")
+        inlier_mask_value = quality.get("inlier_mask")
+        if not isinstance(inlier_mask_value, list) or any(
+            not isinstance(value, bool) for value in inlier_mask_value
+        ):
+            raise ValueError("quality.inlier_mask must be an array of booleans")
+        reason_codes_value = payload.get("reason_codes")
+        if not isinstance(reason_codes_value, list) or any(
+            not isinstance(value, str) for value in reason_codes_value
+        ):
+            raise ValueError("reason_codes must be an array of strings")
         return cls(
-            camera_segment_id=str(payload.get("camera_segment_id") or ""),
+            camera_segment_id=_require_non_empty_string(
+                payload.get("camera_segment_id"),
+                "camera_segment_id",
+            ),
             status=status,
-            validated=bool(payload.get("validated")),
-            method=str(payload.get("method") or "opencv-findHomography-ransac-v1"),
+            validated=validated_value,
+            method=method,
             matrix_image_to_field=_matrix_to_tuple(
                 _matrix_from_value(
                     payload.get("matrix_image_to_field"),
@@ -382,7 +441,7 @@ class PitchCalibration:
                 length_m=float(pitch_payload.get("length_m")),
                 width_m=float(pitch_payload.get("width_m")),
             ),
-            source=str(payload.get("source") or "unknown"),
+            source=_require_non_empty_string(payload.get("source"), "source"),
             start_sec=(
                 float(payload["start_sec"])
                 if payload.get("start_sec") is not None
@@ -395,7 +454,7 @@ class PitchCalibration:
             ),
             total_correspondences=int(quality.get("total_correspondences") or 0),
             inlier_count=int(quality.get("inlier_count") or 0),
-            inlier_mask=tuple(bool(value) for value in inlier_mask_value),
+            inlier_mask=tuple(inlier_mask_value),
             inlier_ratio=float(quality.get("inlier_ratio") or 0.0),
             rmse_m=float(quality.get("rmse_m") or 0.0),
             median_error_m=float(quality.get("median_error_m") or 0.0),
@@ -411,14 +470,9 @@ class PitchCalibration:
             minimum_projective_denominator=float(
                 quality.get("minimum_projective_denominator") or 0.0
             ),
-            reason_codes=tuple(
-                str(value) for value in (payload.get("reason_codes") or [])
-            ),
+            reason_codes=tuple(reason_codes_value),
             thresholds=thresholds,
-            schema_version=str(
-                payload.get("schema_version")
-                or CALIBRATION_RESULT_SCHEMA_VERSION
-            ),
+            schema_version=schema_version,
         )
 
 
@@ -454,6 +508,7 @@ def fit_pitch_calibration(
     if field_hull_area <= 1e-6:
         raise CalibrationFitError("field correspondences are collinear")
 
+    cv2.setRNGSeed(RANSAC_SEED)
     matrix, mask = cv2.findHomography(
         source_points,
         field_points,
