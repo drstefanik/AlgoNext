@@ -95,7 +95,7 @@
         },
         "inlier_count": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 4
         },
         "inlier_mask": {
           "type": "array",
@@ -150,8 +150,10 @@
     "reason_codes": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
     },
     "provenance": {
       "type": "object",
@@ -160,7 +162,8 @@
         "coordinate_input",
         "coordinate_output",
         "opencv_version",
-        "quality_gate"
+        "quality_gate",
+        "ransac_seed"
       ],
       "properties": {
         "coordinate_input": {
@@ -175,6 +178,9 @@
         },
         "quality_gate": {
           "const": "pitch-calibration-gate-v1"
+        },
+        "ransac_seed": {
+          "const": 0
         }
       }
     }
