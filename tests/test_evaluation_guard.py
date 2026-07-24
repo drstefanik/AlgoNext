@@ -8,12 +8,17 @@ from app.core.models import AnalysisJob
 
 
 class EvaluationGuardTests(unittest.TestCase):
-    def test_legacy_scores_are_sanitized_before_exposure_or_persistence(self):
+    def test_legacy_scores_and_scoring_warnings_are_sanitized(self):
         job = AnalysisJob(
             id="job-legacy",
             status="COMPLETED",
             category="U15",
             role="Midfielder",
+            warnings=[
+                "INCOMPLETE_RADAR",
+                "MISSING_OVERALL_SCORE",
+                "MISSING_CLIPS",
+            ],
             result={
                 "overall_score": 88.0,
                 "role_score": 88.0,
@@ -38,8 +43,53 @@ class EvaluationGuardTests(unittest.TestCase):
         self.assertEqual(job.result["evaluation_status"], "TRACKING_ONLY")
         self.assertAlmostEqual(job.result["tracking_quality_index"], 17.6, places=1)
         self.assertNotIn("distance_covered_m", job.result["evidence_metrics"])
+        self.assertEqual(job.status, "PARTIAL")
+        self.assertIn("MISSING_CLIPS", job.warnings)
+        self.assertNotIn("INCOMPLETE_RADAR", job.warnings)
+        self.assertNotIn("MISSING_OVERALL_SCORE", job.warnings)
+        self.assertIn("TRACKING_EVIDENCE_INSUFFICIENT", job.warnings)
+        self.assertIn("CROSS_SHOT_IDENTITY_UNVALIDATED", job.warnings)
+        self.assertIn("PLAYER_EVALUATION_WITHHELD", job.warnings)
 
-    def test_future_validated_player_score_is_preserved(self):
+    def test_real_full_match_payload_is_corrected_on_read(self):
+        job = AnalysisJob(
+            id="job-full-match",
+            status="PARTIAL",
+            category="U17",
+            role="Midfielder",
+            warnings=["INCOMPLETE_RADAR"],
+            result={
+                "tracking": {
+                    "coverage_pct_total": 0.49,
+                    "coverage_pct": 0.49,
+                    "bboxes_count": 29,
+                    "segments_total": 108,
+                    "segments_with_player": 7,
+                    "largest_gap_sec": 2031.94,
+                },
+                "evidence_metrics": {
+                    "candidate_metrics": {"stabilityScore": 0.0},
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        signals = job.result["tracking_signals"]
+        self.assertAlmostEqual(signals["coverage_pct"], 0.49)
+        self.assertAlmostEqual(signals["coverage_ratio"], 0.0049)
+        self.assertAlmostEqual(job.result["tracking_quality_index"], 9.9, places=1)
+        self.assertEqual(
+            job.warnings,
+            [
+                "TRACKING_EVIDENCE_INSUFFICIENT",
+                "CROSS_SHOT_IDENTITY_UNVALIDATED",
+                "LONG_TRACKING_GAPS",
+                "PLAYER_EVALUATION_WITHHELD",
+            ],
+        )
+
+    def test_future_validated_player_score_and_warnings_are_preserved(self):
         validated = {
             "player_evaluation_available": True,
             "overall_score": 81.0,
@@ -54,12 +104,15 @@ class EvaluationGuardTests(unittest.TestCase):
             status="COMPLETED",
             category="Senior",
             role="Midfielder",
+            warnings=["MODEL_VALIDATED"],
             result=dict(validated),
         )
 
         sanitize_analysis_job(job)
 
         self.assertEqual(job.result, validated)
+        self.assertEqual(job.warnings, ["MODEL_VALIDATED"])
+        self.assertEqual(job.status, "COMPLETED")
 
 
 if __name__ == "__main__":
