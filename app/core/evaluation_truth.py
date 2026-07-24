@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional
 
-EVALUATION_SCHEMA_VERSION = "evaluation-truth-v1"
-TRACKING_QUALITY_VERSION = "tracking-quality-v1"
+EVALUATION_SCHEMA_VERSION = "evaluation-truth-v2"
+TRACKING_QUALITY_VERSION = "tracking-quality-v2"
 
 _TRACKING_SAMPLE_TARGET = 60.0
 _LOW_COVERAGE_PCT = 45.0
@@ -39,7 +39,23 @@ def _clamp(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
     return max(minimum, min(maximum, value))
 
 
-def _as_percent(value: Any) -> Optional[float]:
+def _percentage_points(value: Any) -> Optional[float]:
+    """Read an explicitly percentage-valued field without guessing its unit."""
+
+    parsed = _safe_float(value)
+    return _clamp(parsed) if parsed is not None else None
+
+
+def _ratio_to_percent(value: Any) -> Optional[float]:
+    """Convert an explicitly ratio-valued field from 0..1 to percentage points."""
+
+    parsed = _safe_float(value)
+    return _clamp(parsed * 100.0) if parsed is not None else None
+
+
+def _ratio_or_percent(value: Any) -> Optional[float]:
+    """Compatibility conversion for legacy fields whose unit was not explicit."""
+
     parsed = _safe_float(value)
     if parsed is None:
         return None
@@ -58,6 +74,40 @@ def _first_number(*values: Any) -> Optional[float]:
 
 def _first_present(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
+
+
+def _tracking_coverage_percent(
+    tracking: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> float:
+    """Resolve coverage without inferring units from the numeric magnitude.
+
+    Tracking ``*_pct`` fields are percentage points. Candidate coverage fields are
+    historical ratios. New producers should emit both ``coverage_ratio`` and
+    ``coverage_pct`` so the contract remains unambiguous.
+    """
+
+    explicit_ratio = _first_present(
+        tracking.get("coverage_ratio_total"),
+        tracking.get("coverage_ratio"),
+    )
+    ratio_pct = _ratio_to_percent(explicit_ratio)
+    if ratio_pct is not None:
+        return ratio_pct
+
+    explicit_points = _first_present(
+        tracking.get("coverage_pct_total"),
+        tracking.get("coverage_pct"),
+    )
+    points = _percentage_points(explicit_points)
+    if points is not None:
+        return points
+
+    candidate_ratio = _first_present(
+        candidate.get("coverage_ratio"),
+        candidate.get("coveragePct"),
+        candidate.get("coverage_pct"),
+    )
+    return _ratio_to_percent(candidate_ratio) or 0.0
 
 
 def _collect_tracking_bboxes(tracking: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -196,17 +246,9 @@ def build_tracking_evaluation(
     tracking_source = _as_mapping(tracking)
     image_motion = compute_image_motion_metrics(tracking_source)
 
-    coverage_pct = _as_percent(
-        _first_present(
-            tracking_source.get("coverage_pct_total"),
-            tracking_source.get("coverage_pct"),
-            candidate.get("coveragePct"),
-            candidate.get("coverage_pct"),
-        )
-    )
-    coverage_pct = coverage_pct if coverage_pct is not None else 0.0
+    coverage_pct = _tracking_coverage_percent(tracking_source, candidate)
 
-    continuity_pct = _as_percent(
+    continuity_pct = _ratio_or_percent(
         _first_present(
             candidate.get("stabilityScore"),
             candidate.get("stability_score"),
@@ -328,6 +370,7 @@ def build_tracking_evaluation(
         "tracking_quality_index": tracking_quality_index,
         "tracking_confidence": tracking_confidence,
         "signals": {
+            "coverage_ratio": round(coverage_pct / 100.0, 6),
             "coverage_pct": round(coverage_pct, 2),
             "tracklet_continuity_pct": round(continuity_pct, 2),
             "tracklet_continuity_source": continuity_source,
@@ -357,6 +400,7 @@ def build_tracking_evaluation(
             "version": TRACKING_QUALITY_VERSION,
             "validated_player_score": False,
             "metric_space": "image_plane_normalized",
+            "coverage_unit": "percentage_points",
         },
     }
 
