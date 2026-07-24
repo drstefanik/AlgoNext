@@ -19,10 +19,10 @@ from app.core.runtime_health import (
 )
 from app.reid.runtime import install_windowed_reid
 
+logger = logging.getLogger(__name__)
+
 install_evaluation_guard()
 install_windowed_reid()
-
-logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
@@ -57,11 +57,21 @@ celery.conf.update(
     worker_prefetch_multiplier=1,
 )
 
+# pipeline.py imports ``celery`` from this module. At this point the application
+# object already exists, so importing and governing the task module is safe and
+# deterministic. Installing only from ``worker_ready`` proved too late on a real
+# job: the legacy full-video feature scan and non-monotonic 50% progress path were
+# still executed. Keep the signal call below as an idempotent safety net, but do
+# not accept tasks before the policy is present.
+PIPELINE_POLICY_INSTALLED_EAGERLY = install_worker_pipeline_policy()
+logger.info(
+    "Tracking-only pipeline policy installed eagerly=%s",
+    PIPELINE_POLICY_INSTALLED_EAGERLY,
+)
+
 
 @worker_ready.connect
 def _on_worker_ready(sender=None, **_kwargs):
-    # The task modules have been imported by this point. Installing the policy here
-    # avoids a circular import when the API imports pipeline.py for shared helpers.
     install_worker_pipeline_policy()
     recover_interrupted_jobs()
     worker_name = getattr(sender, "hostname", None)
