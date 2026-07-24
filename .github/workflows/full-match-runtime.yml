@@ -7,6 +7,7 @@ on:
       - "app/reid/runtime.py"
       - "tests/test_reid_runtime.py"
       - "docker-compose.yml"
+      - "Dockerfile"
       - ".github/workflows/full-match-runtime.yml"
   push:
     branches: [main]
@@ -15,6 +16,7 @@ on:
       - "app/reid/runtime.py"
       - "tests/test_reid_runtime.py"
       - "docker-compose.yml"
+      - "Dockerfile"
       - ".github/workflows/full-match-runtime.yml"
 
 permissions:
