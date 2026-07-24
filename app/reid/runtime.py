@@ -81,9 +81,12 @@ def install_windowed_reid(
     if implementation is None and reid_enabled():
         from app.reid import windowed_tracking
         from app.reid.benchmark_evidence import install_candidate_evidence
+        from app.reid.team_color_guard import guard_windowed_reid
 
         install_candidate_evidence(windowed_tracking)
-        implementation = windowed_tracking.track_player_windowed_reid
+        implementation = guard_windowed_reid(
+            windowed_tracking.track_player_windowed_reid
+        )
 
     original = current
     timeout_error = getattr(tracking_module, "TrackingTimeoutError", None)
