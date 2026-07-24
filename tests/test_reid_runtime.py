@@ -8,14 +8,43 @@ from app.reid.runtime import install_windowed_reid
 
 
 class ReIDRuntimeTests(unittest.TestCase):
-    def test_disabled_flag_does_not_patch_tracker(self):
-        def original():
-            return "legacy"
+    def test_disabled_flag_still_installs_cpu_budget_wrapper(self):
+        captured = {}
+
+        def original(*args, **kwargs):
+            captured.update(kwargs)
+            return {"mode": "legacy"}
 
         module = SimpleNamespace(track_player_windowed=original)
-        with patch.dict(os.environ, {"PLAYER_REID_ENABLED": "0"}, clear=False):
+        environment = {
+            "PLAYER_REID_ENABLED": "0",
+            "FULL_MATCH_TARGET_SAMPLES": "6000",
+            "FULL_MATCH_MIN_FPS": "1",
+            "FULL_MATCH_MAX_FPS": "2",
+            "FULL_MATCH_WINDOW_SEC": "60",
+            "FULL_MATCH_OVERLAP_SEC": "5",
+            "FULL_MATCH_DETECTOR_MODEL": "yolo11n.pt",
+        }
+        with patch.dict(os.environ, environment, clear=True):
             self.assertFalse(install_windowed_reid(module, lambda: "reid"))
-        self.assertIs(module.track_player_windowed, original)
+            self.assertIsNot(module.track_player_windowed, original)
+            output = module.track_player_windowed(
+                "job-disabled",
+                "/tmp/input.mp4",
+                {"t": 10.0},
+                [],
+                video_duration_sec=6000.0,
+                fps=5,
+                window_sec=45.0,
+                overlap_sec=10.0,
+            )
+
+        self.assertEqual(captured["fps"], 1)
+        self.assertEqual(captured["window_sec"], 60.0)
+        self.assertEqual(captured["overlap_sec"], 5.0)
+        self.assertEqual(captured["detector_model"], "yolo11n.pt")
+        self.assertEqual(output["reid_summary"]["status"], "DISABLED")
+        self.assertEqual(output["runtime_profile"]["fps"], 1)
 
     def test_enabled_flag_installs_wrapper_and_passes_fallback(self):
         calls = []
@@ -55,10 +84,7 @@ class ReIDRuntimeTests(unittest.TestCase):
             install_windowed_reid(module, implementation)
             output = module.track_player_windowed(9)
         self.assertEqual(output["mode"], "legacy")
-        self.assertEqual(
-            output["reid_summary"]["status"],
-            "FALLBACK_LEGACY",
-        )
+        self.assertEqual(output["reid_summary"]["status"], "FALLBACK_LEGACY")
 
     def test_runtime_failure_can_fail_closed(self):
         def original():
@@ -120,6 +146,37 @@ class ReIDRuntimeTests(unittest.TestCase):
         self.assertEqual(output["partial_reason"], "TRACKING_TIMEOUT")
         self.assertEqual(output["reid_summary"]["status"], "PARTIAL_TIMEOUT")
         self.assertEqual(output["runtime_profile"]["fps"], 1)
+        mark_partial.assert_called_once()
+
+    def test_disabled_legacy_timeout_is_also_partial(self):
+        class TrackingTimeoutError(RuntimeError):
+            pass
+
+        def original(*args, **kwargs):
+            raise TrackingTimeoutError("timeout")
+
+        module = SimpleNamespace(
+            track_player_windowed=original,
+            TrackingTimeoutError=TrackingTimeoutError,
+        )
+        with patch.dict(os.environ, {"PLAYER_REID_ENABLED": "0"}, clear=False), patch(
+            "app.reid.runtime.mark_partial_timeout"
+        ) as mark_partial:
+            install_windowed_reid(module)
+            output = module.track_player_windowed(
+                "job-disabled-timeout",
+                "/tmp/input.mp4",
+                {"t": 10.0},
+                [],
+                video_duration_sec=6000.0,
+                fps=5,
+            )
+        self.assertTrue(output["partial"])
+        self.assertEqual(output["identity_mode"], "disabled")
+        self.assertEqual(output["reid_summary"]["status"], "DISABLED")
+        self.assertIn(
+            "TRACKING_BUDGET_EXHAUSTED", output["reid_summary"]["reason_codes"]
+        )
         mark_partial.assert_called_once()
 
     def test_long_full_match_uses_cpu_budget_profile(self):
