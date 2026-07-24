@@ -22,8 +22,42 @@ class EvaluationTruthTests(unittest.TestCase):
         self.assertFalse(evaluation["player_evaluation_available"])
         self.assertEqual(evaluation["tracking_confidence"], "low")
         self.assertAlmostEqual(evaluation["tracking_quality_index"], 17.6, places=1)
+        self.assertAlmostEqual(evaluation["signals"]["coverage_pct"], 12.5)
+        self.assertAlmostEqual(evaluation["signals"]["coverage_ratio"], 0.125)
         self.assertIn("LOW_TRACKING_COVERAGE", evaluation["reason_codes"])
         self.assertIn("PLAYER_SCORING_NOT_VALIDATED", evaluation["reason_codes"])
+
+    def test_tracking_percentage_points_below_one_are_not_inflated(self):
+        evaluation = build_tracking_evaluation(
+            candidate_metrics={"stabilityScore": 0.0},
+            tracking={
+                "coverage_pct_total": 0.49,
+                "coverage_pct": 0.49,
+                "bboxes_count": 29,
+                "segments_total": 108,
+                "segments_with_player": 7,
+                "largest_gap_sec": 2031.94,
+            },
+        )
+
+        self.assertAlmostEqual(evaluation["signals"]["coverage_pct"], 0.49)
+        self.assertAlmostEqual(evaluation["signals"]["coverage_ratio"], 0.0049)
+        self.assertAlmostEqual(evaluation["tracking_quality_index"], 9.9, places=1)
+        self.assertIn("LOW_TRACKING_COVERAGE", evaluation["reason_codes"])
+        self.assertIn("LONG_TRACKING_GAPS", evaluation["reason_codes"])
+
+    def test_explicit_tracking_ratio_takes_precedence_over_legacy_percent_field(self):
+        evaluation = build_tracking_evaluation(
+            tracking={
+                "coverage_ratio": 0.0049,
+                "coverage_pct": 49.0,
+                "bboxes_count": 60,
+                "stability_score": 0.8,
+            }
+        )
+
+        self.assertAlmostEqual(evaluation["signals"]["coverage_pct"], 0.49)
+        self.assertAlmostEqual(evaluation["signals"]["coverage_ratio"], 0.0049)
 
     def test_no_evidence_means_zero_quality_not_free_continuity_points(self):
         evaluation = build_tracking_evaluation()
