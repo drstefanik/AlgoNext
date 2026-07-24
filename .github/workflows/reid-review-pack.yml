@@ -21,6 +21,11 @@ on:
           - "1"
           - "2"
           - "3"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/reid-review-pack.yml"
 
 permissions:
   contents: read
@@ -29,6 +34,10 @@ jobs:
   review-pack:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      REVIEW_JOB_ID: ${{ inputs.job_id || 'd70e0adb-e326-4ce0-b18e-8c49d4d0fccc' }}
+      REVIEW_API_BASE: ${{ inputs.api_base || 'https://algonext-frontend.vercel.app/api/backend' }}
+      REVIEW_SAMPLES_PER_WINDOW: ${{ inputs.samples_per_window || '2' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -49,10 +58,10 @@ jobs:
       - name: Download job artifacts and build annotation pack
         run: >-
           python scripts/prepare_reid_job_benchmark.py
-          --api-base "${{ inputs.api_base }}"
-          --job-id "${{ inputs.job_id }}"
+          --api-base "$REVIEW_API_BASE"
+          --job-id "$REVIEW_JOB_ID"
           --output-dir /tmp/reid-benchmark
-          --samples-per-window "${{ inputs.samples_per_window }}"
+          --samples-per-window "$REVIEW_SAMPLES_PER_WINDOW"
           --request-timeout 600
 
       - name: Validate generated pack
@@ -70,7 +79,7 @@ jobs:
       - name: Upload review pack
         uses: actions/upload-artifact@v4
         with:
-          name: reid-review-${{ inputs.job_id }}
+          name: reid-review-${{ env.REVIEW_JOB_ID }}
           path: |
             /tmp/reid-benchmark/job-manifest.json
             /tmp/reid-benchmark/tracking.json
