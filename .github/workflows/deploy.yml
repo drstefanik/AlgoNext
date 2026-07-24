@@ -36,6 +36,10 @@ jobs:
             echo "== git clean =="
             git clean -fd
 
+            export APP_GIT_SHA="$(git rev-parse HEAD)"
+            export APP_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "== revision $APP_GIT_SHA built at $APP_BUILD_TIME =="
+
             echo "== docker compose pull =="
             docker compose pull || true
 
@@ -48,7 +52,6 @@ jobs:
             ) &
             HB_PID=$!
 
-            # se build fallisce, fermiamo heartbeat e usciamo con errore
             if ! docker compose build; then
               kill $HB_PID || true
               wait $HB_PID 2>/dev/null || true
@@ -67,6 +70,59 @@ jobs:
 
             echo "== up api + worker =="
             docker compose up -d --force-recreate api worker
+
+            echo "== wait for API + worker readiness =="
+            READY=0
+            for attempt in $(seq 1 60); do
+              if docker compose exec -T api python - <<'PY'
+            import json
+            import sys
+            import urllib.request
+
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=3) as response:
+                    payload = json.load(response)
+                if payload.get("ok") is True and payload.get("status") == "ready":
+                    print(json.dumps(payload, sort_keys=True))
+                    sys.exit(0)
+            except Exception as exc:
+                print(f"not ready: {exc}")
+            sys.exit(1)
+            PY
+              then
+                READY=1
+                break
+              fi
+              echo "[readiness] attempt $attempt/60"
+              sleep 3
+            done
+
+            if [ "$READY" != "1" ]; then
+              echo "== readiness failed =="
+              docker compose ps
+              docker compose logs --tail=200 api worker
+              exit 1
+            fi
+
+            echo "== verify deployed revisions =="
+            docker compose exec -T api python - "$APP_GIT_SHA" <<'PY'
+            import json
+            import sys
+            import urllib.request
+
+            expected = sys.argv[1]
+            with urllib.request.urlopen("http://127.0.0.1:8000/runtime", timeout=5) as response:
+                envelope = json.load(response)
+            payload = envelope.get("data") or {}
+            api_revision = payload.get("revision")
+            worker = payload.get("worker") or {}
+            worker_revision = worker.get("revision")
+            if api_revision != expected or worker_revision != expected:
+                raise SystemExit(
+                    f"revision mismatch expected={expected} api={api_revision} worker={worker_revision}"
+                )
+            print(f"deployed revision verified: {expected}")
+            PY
 
             echo "== DEPLOY END $(date -u) =="
             docker compose ps

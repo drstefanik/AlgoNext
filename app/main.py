@@ -19,12 +19,16 @@ from app.core.db import Base, SessionLocal, engine, DATABASE_URL
 from app.core.evaluation_guard import install_evaluation_guard
 from app.core.evaluation_http_guard import EvaluationReportGuardMiddleware
 from app.core.http_errors import normalize_http_exception_detail
+from app.core.runtime_health import build_metadata, inspect_runtime
 from app.api import router as api_router
+from app.runtime_api import router as runtime_router
 
 load_env()
 install_evaluation_guard()
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
+APP_METADATA = build_metadata("algonext-api")
+APP_GIT_SHA = str(APP_METADATA["revision"])
 DOCS_URL = None if APP_ENV == "production" else "/docs"
 REDOC_URL = None if APP_ENV == "production" else "/redoc"
 OPENAPI_URL = None if APP_ENV == "production" else "/openapi.json"
@@ -42,6 +46,53 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class WorkerGateMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path.rstrip("/")
+        worker_bound_suffixes = (
+            "/enqueue",
+            "/retry",
+            "/confirm-selection",
+            "/analyze-player",
+            "/report",
+        )
+        worker_bound_action = request.method.upper() == "POST" and (
+            path == "/jobs"
+            or (path.startswith("/jobs/") and path.endswith(worker_bound_suffixes))
+        )
+        if not worker_bound_action:
+            return await call_next(request)
+
+        runtime = inspect_runtime()
+        if runtime.get("ready") is True:
+            return await call_next(request)
+
+        request_id = getattr(request.state, "request_id", None)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": {
+                    "code": "WORKER_NOT_READY",
+                    "message": "The analysis worker is not ready for a new run.",
+                    "details": {
+                        "dependencies": runtime.get("dependencies"),
+                        "worker": runtime.get("worker"),
+                        "worker_age_seconds": runtime.get("worker_age_seconds"),
+                        "worker_revision_matches_api": runtime.get(
+                            "worker_revision_matches_api"
+                        ),
+                    },
+                },
+                "meta": {
+                    "request_id": request_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "revision": APP_GIT_SHA,
+                },
+            },
+        )
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-Id") or str(uuid4())
@@ -49,6 +100,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         start_time = time.monotonic()
         response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
+        response.headers["X-AlgoNext-Revision"] = APP_GIT_SHA
         duration_ms = (time.monotonic() - start_time) * 1000
         logger.info(
             "API_REQUEST",
@@ -58,6 +110,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 "status_code": response.status_code,
                 "duration_ms": round(duration_ms, 2),
                 "request_id": request_id,
+                "revision": APP_GIT_SHA,
             },
         )
         return response
@@ -73,6 +126,7 @@ app = FastAPI(
 # Added before the request/security wrappers so guarded responses still receive
 # request IDs and the standard security headers.
 app.add_middleware(EvaluationReportGuardMiddleware)
+app.add_middleware(WorkerGateMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
@@ -114,6 +168,7 @@ def _meta_payload(request: Request) -> dict:
     return {
         "request_id": request_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "revision": APP_GIT_SHA,
     }
 
 
@@ -198,6 +253,7 @@ def mask_database_url(url: str) -> str:
 @app.on_event("startup")
 def fail_fast_db_check():
     logger.info("DATABASE_URL: %s", mask_database_url(DATABASE_URL))
+    logger.info("APP_GIT_SHA: %s", APP_GIT_SHA)
     logger.info(
         "S3 config: S3_ENDPOINT_URL=%s S3_PUBLIC_ENDPOINT_URL=%s S3_BUCKET=%s",
         os.environ.get("S3_ENDPOINT_URL"),
@@ -217,39 +273,43 @@ def fail_fast_db_check():
 def health():
     return {
         "ok": True,
-        "service": "algonext-api",
+        **APP_METADATA,
         "status": "live",
+        "environment": APP_ENV,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/ready", include_in_schema=False)
 def ready():
+    dependencies: dict[str, object] = {}
     session = SessionLocal()
     try:
         session.execute(text("SELECT 1"))
+        dependencies["database"] = "ready"
     except Exception:
         logger.exception("Readiness check failed: database unavailable.")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "ok": False,
-                "service": "algonext-api",
-                "status": "not_ready",
-                "dependencies": {"database": "unavailable"},
-                "ts": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        dependencies["database"] = "unavailable"
     finally:
         session.close()
 
-    return {
-        "ok": True,
-        "service": "algonext-api",
-        "status": "ready",
-        "dependencies": {"database": "ready"},
+    runtime = inspect_runtime()
+    dependencies.update(runtime.get("dependencies") or {})
+    is_ready = dependencies.get("database") == "ready" and bool(runtime.get("ready"))
+    payload = {
+        "ok": is_ready,
+        **APP_METADATA,
+        "status": "ready" if is_ready else "not_ready",
+        "dependencies": dependencies,
+        "worker": runtime.get("worker"),
+        "worker_age_seconds": runtime.get("worker_age_seconds"),
+        "worker_revision_matches_api": runtime.get("worker_revision_matches_api"),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    if runtime.get("error"):
+        payload["runtime_error"] = runtime["error"]
+    return payload if is_ready else JSONResponse(status_code=503, content=payload)
 
 
 app.include_router(api_router)
+app.include_router(runtime_router)

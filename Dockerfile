@@ -1,5 +1,8 @@
 FROM python:3.11-slim AS base
 
+ARG APP_GIT_SHA=unknown
+ARG APP_BUILD_TIME=unknown
+
 # System deps:
 # - ffmpeg (video)
 # - build toolchain + BLAS/LAPACK (for building lapx wheels on slim)
@@ -18,7 +21,9 @@ ENV ULTRALYTICS_AUTOINSTALL=0 \
     ULTRALYTICS_CHECKS=0 \
     YOLO_AUTOINSTALL=0 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    APP_GIT_SHA=${APP_GIT_SHA} \
+    APP_BUILD_TIME=${APP_BUILD_TIME}
 
 COPY requirements.txt .
 
@@ -41,6 +46,5 @@ COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY app ./app
 
-# Prefetch both detectors used by the runtime so production never depends on a
-# network download after the worker has started.
+# Prefetch both detector profiles so runtime never depends on external downloads.
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt'); YOLO('yolo11n.pt')"

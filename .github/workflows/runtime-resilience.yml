@@ -1,0 +1,97 @@
+name: Runtime resilience
+
+on:
+  pull_request:
+    paths:
+      - "app/core/runtime_health.py"
+      - "app/core/job_recovery.py"
+      - "app/runtime_api.py"
+      - "app/main.py"
+      - "app/workers/celery_app.py"
+      - "app/reid/runtime.py"
+      - "app/reid/progress_reporting.py"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "tests/test_runtime_*.py"
+      - "tests/test_job_recovery.py"
+      - "tests/test_reid_progress_reporting.py"
+      - "tests/test_reid_runtime.py"
+      - ".github/workflows/deploy.yml"
+      - ".github/workflows/runtime-resilience.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/core/runtime_health.py"
+      - "app/core/job_recovery.py"
+      - "app/runtime_api.py"
+      - "app/main.py"
+      - "app/workers/celery_app.py"
+      - "app/reid/runtime.py"
+      - "app/reid/progress_reporting.py"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "tests/test_runtime_*.py"
+      - "tests/test_job_recovery.py"
+      - "tests/test_reid_progress_reporting.py"
+      - "tests/test_reid_runtime.py"
+      - ".github/workflows/deploy.yml"
+      - ".github/workflows/runtime-resilience.yml"
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: "sqlite+pysqlite:///:memory:"
+  APP_GIT_SHA: test-sha
+  APP_BUILD_TIME: "2026-07-24T00:00:00Z"
+
+jobs:
+  runtime-resilience:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lightweight runtime dependencies
+        run: >-
+          python -m pip install
+          fastapi==0.115.0
+          SQLAlchemy==2.0.32
+          redis==5.0.8
+          celery==5.4.0
+
+      - name: Compile runtime modules and tests
+        run: >-
+          python -m py_compile
+          app/core/runtime_health.py
+          app/core/job_recovery.py
+          app/runtime_api.py
+          app/main.py
+          app/workers/celery_app.py
+          app/reid/runtime.py
+          app/reid/progress_reporting.py
+          tests/test_runtime_health.py
+          tests/test_runtime_api.py
+          tests/test_job_recovery.py
+          tests/test_reid_progress_reporting.py
+          tests/test_reid_runtime.py
+
+      - name: Run runtime, retry and progress tests
+        run: >-
+          python -m unittest
+          tests/test_runtime_health.py
+          tests/test_runtime_api.py
+          tests/test_job_recovery.py
+          tests/test_reid_progress_reporting.py
+          tests/test_reid_runtime.py
+
+      - name: Validate Compose configuration
+        run: |
+          touch .env
+          APP_GIT_SHA=test-sha APP_BUILD_TIME=2026-07-24T00:00:00Z docker compose config >/dev/null
