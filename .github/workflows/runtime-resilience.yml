@@ -16,6 +16,7 @@ on:
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
       - "tests/test_pipeline_policy.py"
+      - "tests/test_worker_policy_bootstrap.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -36,6 +37,7 @@ on:
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
       - "tests/test_pipeline_policy.py"
+      - "tests/test_worker_policy_bootstrap.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -85,6 +87,7 @@ jobs:
           tests/test_runtime_api.py
           tests/test_job_recovery.py
           tests/test_pipeline_policy.py
+          tests/test_worker_policy_bootstrap.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 
@@ -95,6 +98,7 @@ jobs:
           tests/test_runtime_api.py
           tests/test_job_recovery.py
           tests/test_pipeline_policy.py
+          tests/test_worker_policy_bootstrap.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 
