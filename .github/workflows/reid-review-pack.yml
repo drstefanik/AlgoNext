@@ -1,0 +1,80 @@
+name: Build ReID review pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Completed AlgoNext job ID
+        required: true
+        type: string
+      api_base:
+        description: Public AlgoNext API base, without /jobs
+        required: true
+        default: https://algonext-frontend.vercel.app/api/backend
+        type: string
+      samples_per_window:
+        description: Frames extracted for each tracking window
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+
+permissions:
+  contents: read
+
+jobs:
+  review-pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure FFmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Download job artifacts and build annotation pack
+        run: >-
+          python scripts/prepare_reid_job_benchmark.py
+          --api-base "${{ inputs.api_base }}"
+          --job-id "${{ inputs.job_id }}"
+          --output-dir /tmp/reid-benchmark
+          --samples-per-window "${{ inputs.samples_per_window }}"
+          --request-timeout 600
+
+      - name: Validate generated pack
+        run: |
+          test -f /tmp/reid-benchmark/job-manifest.json
+          test -f /tmp/reid-benchmark/tracking.json
+          test -f /tmp/reid-benchmark/review-pack/index.html
+          test -f /tmp/reid-benchmark/review-pack/reid-window-annotations.json
+          test -f /tmp/reid-benchmark/review-pack/frame-annotations.json
+          frame_count="$(find /tmp/reid-benchmark/review-pack/frames -type f -name '*.jpg' | wc -l | tr -d ' ')"
+          test "$frame_count" -gt 0
+          echo "Extracted review frames: $frame_count"
+          rm -f /tmp/reid-benchmark/input.mp4
+
+      - name: Upload review pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: reid-review-${{ inputs.job_id }}
+          path: |
+            /tmp/reid-benchmark/job-manifest.json
+            /tmp/reid-benchmark/tracking.json
+            /tmp/reid-benchmark/review-pack/**
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
