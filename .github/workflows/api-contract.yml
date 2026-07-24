@@ -16,6 +16,11 @@ on:
       - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
+      - "scripts/evaluate_reid_windows.py"
+      - "scripts/evaluate_reid_benchmark.py"
+      - "scripts/prepare_reid_annotation.py"
+      - "scripts/prepare_reid_review_pack.py"
+      - "scripts/prepare_reid_job_benchmark.py"
       - "scripts/solve_pitch_calibration.py"
       - "scripts/apply_pitch_calibration.py"
       - "tests/test_http_error_contract.py"
@@ -28,7 +33,9 @@ on:
       - "tests/test_pitch_calibration*.py"
       - "tests/test_calibrated_kinematics*.py"
       - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/reid_benchmark/**"
       - "tests/fixtures/pitch_calibration/**"
+      - "docs/reid_benchmark.md"
       - "docs/pitch_calibration.md"
       - "docs/schemas/pitch-calibration-*.schema.json"
       - ".github/workflows/api-contract.yml"
@@ -49,6 +56,11 @@ on:
       - "docker-compose.yml"
       - "scripts/evaluate_tracking.py"
       - "scripts/convert_tracking_output.py"
+      - "scripts/evaluate_reid_windows.py"
+      - "scripts/evaluate_reid_benchmark.py"
+      - "scripts/prepare_reid_annotation.py"
+      - "scripts/prepare_reid_review_pack.py"
+      - "scripts/prepare_reid_job_benchmark.py"
       - "scripts/solve_pitch_calibration.py"
       - "scripts/apply_pitch_calibration.py"
       - "tests/test_http_error_contract.py"
@@ -61,7 +73,9 @@ on:
       - "tests/test_pitch_calibration*.py"
       - "tests/test_calibrated_kinematics*.py"
       - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/reid_benchmark/**"
       - "tests/fixtures/pitch_calibration/**"
+      - "docs/reid_benchmark.md"
       - "docs/pitch_calibration.md"
       - "docs/schemas/pitch-calibration-*.schema.json"
       - ".github/workflows/api-contract.yml"
@@ -70,7 +84,7 @@ permissions:
   contents: read
 
 env:
-  DATABASE_URL: sqlite+pysqlite:///:memory:
+  DATABASE_URL: "sqlite+pysqlite:///:memory:"
 
 jobs:
   contract:
@@ -113,7 +127,7 @@ jobs:
 
   tracking-benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -130,23 +144,62 @@ jobs:
           app/benchmark/schema.py
           app/benchmark/tracking_metrics.py
           app/benchmark/adapters.py
+          app/benchmark/reid_schema.py
+          app/benchmark/reid_adapters.py
+          app/benchmark/reid_metrics.py
+          app/benchmark/reid_review.py
+          app/benchmark/reid_job.py
+          app/benchmark/reid_suite.py
           scripts/evaluate_tracking.py
           scripts/convert_tracking_output.py
+          scripts/evaluate_reid_windows.py
+          scripts/evaluate_reid_benchmark.py
+          scripts/prepare_reid_annotation.py
+          scripts/prepare_reid_review_pack.py
+          scripts/prepare_reid_job_benchmark.py
           tests/test_tracking_benchmark.py
           tests/test_tracking_adapter.py
+          tests/test_reid_benchmark.py
+          tests/test_reid_adapter.py
+          tests/test_reid_review.py
+          tests/test_reid_job.py
+          tests/test_reid_suite.py
 
-      - name: Run tracking metric and adapter tests
+      - name: Run tracking and ReID benchmark tests
         run: >-
           python -m unittest
           tests/test_tracking_benchmark.py
           tests/test_tracking_adapter.py
+          tests/test_reid_benchmark.py
+          tests/test_reid_adapter.py
+          tests/test_reid_review.py
+          tests/test_reid_job.py
+          tests/test_reid_suite.py
 
-      - name: Run benchmark CLI quality-gate smoke test
+      - name: Run tracking metric quality-gate smoke test
         run: >-
           python scripts/evaluate_tracking.py
           --annotations tests/fixtures/tracking_benchmark/annotations
           --predictions tests/fixtures/tracking_benchmark/predictions
           --json-out /tmp/tracking-benchmark.json
+          --fail-on-gate
+
+      - name: Build ReID annotation template smoke test
+        run: >-
+          python scripts/prepare_reid_annotation.py
+          --tracking tests/fixtures/reid_benchmark/tracking.json
+          --video-id fixture-reid
+          --identity selected-player
+          --output /tmp/reid-window-template.json
+
+      - name: Run combined ReID benchmark quality-gate smoke test
+        run: >-
+          python scripts/evaluate_reid_benchmark.py
+          --tracking tests/fixtures/reid_benchmark/tracking.json
+          --frame-annotations tests/fixtures/reid_benchmark/frame-annotations.json
+          --window-annotations tests/fixtures/reid_benchmark/window-annotations.json
+          --minimum-scorable-windows 3
+          --json-out /tmp/reid-benchmark.json
           --fail-on-gate
 
   player-reid:
@@ -173,12 +226,14 @@ jobs:
           app/reid/__init__.py
           app/reid/appearance.py
           app/reid/association.py
+          app/reid/benchmark_evidence.py
           app/reid/window_logic.py
           app/reid/full_match_runtime.py
           app/reid/runtime.py
           app/reid/windowed_tracking.py
           tests/test_reid_appearance.py
           tests/test_reid_association.py
+          tests/test_reid_benchmark_evidence.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
           tests/test_reid_windowed_tracking.py
@@ -188,6 +243,7 @@ jobs:
           python -m unittest
           tests/test_reid_appearance.py
           tests/test_reid_association.py
+          tests/test_reid_benchmark_evidence.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
           tests/test_reid_windowed_tracking.py

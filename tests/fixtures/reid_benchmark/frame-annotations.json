@@ -1,0 +1,34 @@
+{
+  "schema_version": "tracking-annotation-v1",
+  "video_id": "fixture-reid",
+  "fps": 1,
+  "frames": [
+    {
+      "frame_index": 2,
+      "time_sec": 2.0,
+      "objects": [
+        {
+          "identity": "selected-player",
+          "ignore": false,
+          "bbox": {"x": 0.10, "y": 0.20, "w": 0.10, "h": 0.20}
+        }
+      ]
+    },
+    {
+      "frame_index": 12,
+      "time_sec": 12.0,
+      "objects": [
+        {
+          "identity": "selected-player",
+          "ignore": false,
+          "bbox": {"x": 0.20, "y": 0.20, "w": 0.10, "h": 0.20}
+        }
+      ]
+    },
+    {
+      "frame_index": 25,
+      "time_sec": 25.0,
+      "objects": []
+    }
+  ]
+}

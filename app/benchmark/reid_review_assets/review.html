@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlgoNext ReID review — __ALGONEXT_TITLE__</title>
+<style>
+__ALGONEXT_STYLE__
+</style>
+</head>
+<body>
+<header>
+  <h1>Benchmark ReID — <span id="video-title"></span></h1>
+  <p>Verifica l'identità finestra per finestra e disegna il box del target sui frame campionati. I frame incerti restano fuori da IDF1.</p>
+  <div class="toolbar">
+    <button class="primary" id="export-windows">Esporta annotazioni finestre</button>
+    <button class="secondary" id="export-frames">Esporta annotazioni frame / IDF1</button>
+    <button id="jump-next">Vai alla prossima finestra incompleta</button>
+    <button id="clear-local">Azzera salvataggio locale</button>
+    <span class="meta" id="progress"></span>
+  </div>
+</header>
+<main id="app"></main>
+<script id="benchmark-data" type="application/json">__ALGONEXT_DATA__</script>
+<script>
+__ALGONEXT_SCRIPT__
+</script>
+</body>
+</html>

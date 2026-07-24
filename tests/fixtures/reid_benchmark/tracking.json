@@ -1,0 +1,96 @@
+{
+  "mode": "full_match_windowed",
+  "identity_mode": "appearance_reid_v1",
+  "fps": 1,
+  "segments": [
+    {
+      "window_start": 0.0,
+      "window_end": 10.0,
+      "direction": "anchor",
+      "selected_track_id": 1,
+      "identity_id": "selected-player",
+      "identity_status": "ACCEPTED",
+      "bboxes": [
+        {"t": 2.0, "x": 0.10, "y": 0.20, "w": 0.10, "h": 0.20, "conf": 0.95}
+      ],
+      "reid": {
+        "status": "ACCEPTED",
+        "identity_id": "selected-player",
+        "selected_candidate_id": "1",
+        "best_score": 1.0,
+        "margin": 1.0,
+        "reason_codes": ["MANUAL_ANCHOR"],
+        "candidates": [
+          {
+            "candidate_id": "1",
+            "combined_score": 1.0,
+            "appearance_similarity": 1.0,
+            "evidence": [
+              {
+                "time_sec": 2.0,
+                "frame_index": 2,
+                "bbox": {"x": 0.10, "y": 0.20, "w": 0.10, "h": 0.20},
+                "confidence": 0.95
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "window_start": 10.0,
+      "window_end": 20.0,
+      "direction": "forward",
+      "selected_track_id": 2,
+      "identity_id": "selected-player",
+      "identity_status": "ACCEPTED",
+      "bboxes": [
+        {"t": 12.0, "x": 0.20, "y": 0.20, "w": 0.10, "h": 0.20, "conf": 0.90}
+      ],
+      "reid": {
+        "status": "ACCEPTED",
+        "identity_id": "selected-player",
+        "selected_candidate_id": "2",
+        "best_score": 0.91,
+        "margin": 0.12,
+        "reason_codes": ["ASSOCIATION_ACCEPTED"],
+        "candidates": [
+          {
+            "candidate_id": "2",
+            "combined_score": 0.91,
+            "appearance_similarity": 0.94,
+            "evidence": [
+              {
+                "time_sec": 12.0,
+                "frame_index": 12,
+                "bbox": {"x": 0.20, "y": 0.20, "w": 0.10, "h": 0.20},
+                "confidence": 0.90
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "window_start": 20.0,
+      "window_end": 30.0,
+      "direction": "forward",
+      "selected_track_id": null,
+      "identity_id": null,
+      "identity_status": "ABSTAINED",
+      "bboxes": [],
+      "reid": {
+        "status": "ABSTAINED",
+        "identity_id": "selected-player",
+        "selected_candidate_id": null,
+        "best_score": 0.72,
+        "margin": 0.02,
+        "reason_codes": ["AMBIGUOUS_CANDIDATE_MARGIN"],
+        "candidates": [
+          {"candidate_id": "3", "combined_score": 0.72},
+          {"candidate_id": "4", "combined_score": 0.70}
+        ]
+      }
+    }
+  ]
+}
