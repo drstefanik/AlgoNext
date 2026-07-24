@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from importlib import import_module
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -222,3 +223,16 @@ def install_pipeline_policy(pipeline_module: Any) -> bool:
         "Installed tracking-only pipeline policy: monotonic progress and scene scoring disabled"
     )
     return True
+
+
+def install_worker_pipeline_policy(
+    module_loader: Callable[[str], Any] = import_module,
+) -> bool:
+    """Import and patch the task module only after Celery has finished loading it.
+
+    Keeping the import inside this function prevents the API process from entering a
+    circular import when it imports ``app.workers.pipeline`` for shared S3 helpers.
+    """
+
+    pipeline_module = module_loader("app.workers.pipeline")
+    return install_pipeline_policy(pipeline_module)
