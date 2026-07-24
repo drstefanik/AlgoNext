@@ -1,0 +1,38 @@
+{
+  "schema_version": "reid-window-annotation-v1",
+  "video_id": "fixture-reid",
+  "identity": "selected-player",
+  "fps": 1,
+  "windows": [
+    {
+      "window_index": 0,
+      "window_start": 0.0,
+      "window_end": 10.0,
+      "target_visibility": "VISIBLE",
+      "candidate_state": "PRESENT",
+      "target_candidate_id": "1",
+      "selected_track_is_target": true,
+      "evidence_frames": []
+    },
+    {
+      "window_index": 1,
+      "window_start": 10.0,
+      "window_end": 20.0,
+      "target_visibility": "VISIBLE",
+      "candidate_state": "PRESENT",
+      "target_candidate_id": "2",
+      "selected_track_is_target": true,
+      "evidence_frames": []
+    },
+    {
+      "window_index": 2,
+      "window_start": 20.0,
+      "window_end": 30.0,
+      "target_visibility": "NOT_VISIBLE",
+      "candidate_state": null,
+      "target_candidate_id": null,
+      "selected_track_is_target": null,
+      "evidence_frames": []
+    }
+  ]
+}
