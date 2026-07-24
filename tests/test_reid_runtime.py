@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.reid.full_match_runtime import select_full_match_profile
 from app.reid.runtime import install_windowed_reid
 
 
@@ -79,17 +80,17 @@ class ReIDRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 module.track_player_windowed()
 
-    def test_tracking_timeout_never_restarts_legacy_tracker(self):
+    def test_tracking_timeout_returns_partial_without_restarting_legacy(self):
         class TrackingTimeoutError(RuntimeError):
             pass
 
         calls = []
 
-        def original():
+        def original(*args, **kwargs):
             calls.append("legacy")
             return {"mode": "legacy"}
 
-        def implementation(*, fallback):
+        def implementation(*args, fallback, **kwargs):
             raise TrackingTimeoutError("timeout")
 
         module = SimpleNamespace(
@@ -103,11 +104,106 @@ class ReIDRuntimeTests(unittest.TestCase):
                 "PLAYER_REID_FAIL_OPEN": "1",
             },
             clear=False,
-        ):
+        ), patch("app.reid.runtime.mark_partial_timeout") as mark_partial:
             install_windowed_reid(module, implementation)
-            with self.assertRaises(TrackingTimeoutError):
-                module.track_player_windowed()
+            output = module.track_player_windowed(
+                "job-1",
+                "/tmp/input.mp4",
+                {"t": 10.0},
+                [],
+                video_duration_sec=6000.0,
+                fps=5,
+            )
+
         self.assertEqual(calls, [])
+        self.assertTrue(output["partial"])
+        self.assertEqual(output["partial_reason"], "TRACKING_TIMEOUT")
+        self.assertEqual(output["reid_summary"]["status"], "PARTIAL_TIMEOUT")
+        self.assertEqual(output["runtime_profile"]["fps"], 1)
+        mark_partial.assert_called_once()
+
+    def test_long_full_match_uses_cpu_budget_profile(self):
+        captured = {}
+
+        def original(*args, **kwargs):
+            return {"mode": "legacy"}
+
+        def implementation(*args, fallback, **kwargs):
+            captured.update(kwargs)
+            return {"mode": "reid"}
+
+        module = SimpleNamespace(track_player_windowed=original)
+        environment = {
+            "PLAYER_REID_ENABLED": "1",
+            "FULL_MATCH_TARGET_SAMPLES": "6000",
+            "FULL_MATCH_MIN_FPS": "1",
+            "FULL_MATCH_MAX_FPS": "2",
+            "FULL_MATCH_WINDOW_SEC": "60",
+            "FULL_MATCH_OVERLAP_SEC": "5",
+            "FULL_MATCH_DETECTOR_MODEL": "yolo11n.pt",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            install_windowed_reid(module, implementation)
+            output = module.track_player_windowed(
+                "job-2",
+                "/tmp/input.mp4",
+                {"t": 10.0},
+                [],
+                video_duration_sec=6000.0,
+                fps=5,
+                window_sec=45.0,
+                overlap_sec=10.0,
+            )
+
+        self.assertEqual(captured["fps"], 1)
+        self.assertEqual(captured["window_sec"], 60.0)
+        self.assertEqual(captured["overlap_sec"], 5.0)
+        self.assertEqual(captured["detector_model"], "yolo11n.pt")
+        self.assertEqual(output["runtime_profile"]["fps"], 1)
+        self.assertLess(output["runtime_profile"]["estimated_samples"], 7000)
+
+    def test_short_video_preserves_requested_quality_profile(self):
+        with patch.dict(os.environ, {}, clear=True):
+            profile = select_full_match_profile(
+                video_duration_sec=600.0,
+                requested_fps=5,
+                requested_window_sec=45.0,
+                requested_overlap_sec=10.0,
+                requested_detector_model="yolo11s.pt",
+            )
+
+        self.assertEqual(profile.fps, 5)
+        self.assertEqual(profile.window_sec, 45.0)
+        self.assertEqual(profile.overlap_sec, 10.0)
+        self.assertEqual(profile.detector_model, "yolo11s.pt")
+
+    def test_progress_adapter_maps_window_stage_to_visible_range(self):
+        progress_calls = []
+
+        def original_tracker():
+            return {"mode": "legacy"}
+
+        def implementation(*, fallback):
+            return {"mode": "reid"}
+
+        def update_progress(job_id, pct, message):
+            progress_calls.append((job_id, pct, message))
+
+        module = SimpleNamespace(
+            track_player_windowed=original_tracker,
+            _update_tracking_progress=update_progress,
+        )
+        with patch.dict(os.environ, {"PLAYER_REID_ENABLED": "1"}, clear=False):
+            install_windowed_reid(module, implementation)
+            module._update_tracking_progress(
+                "job-3",
+                25,
+                "Tracking player with experimental ReID",
+            )
+
+        self.assertEqual(progress_calls[0][0], "job-3")
+        self.assertEqual(progress_calls[0][1], 53)
+        self.assertIn("50% finestre", progress_calls[0][2])
 
 
 if __name__ == "__main__":

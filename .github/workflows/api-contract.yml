@@ -174,6 +174,7 @@ jobs:
           app/reid/appearance.py
           app/reid/association.py
           app/reid/window_logic.py
+          app/reid/full_match_runtime.py
           app/reid/runtime.py
           app/reid/windowed_tracking.py
           tests/test_reid_appearance.py

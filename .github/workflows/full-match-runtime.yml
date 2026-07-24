@@ -1,0 +1,54 @@
+name: Full-match runtime guard
+
+on:
+  pull_request:
+    paths:
+      - "app/reid/full_match_runtime.py"
+      - "app/reid/runtime.py"
+      - "tests/test_reid_runtime.py"
+      - "docker-compose.yml"
+      - "Dockerfile"
+      - ".github/workflows/full-match-runtime.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/reid/full_match_runtime.py"
+      - "app/reid/runtime.py"
+      - "tests/test_reid_runtime.py"
+      - "docker-compose.yml"
+      - "Dockerfile"
+      - ".github/workflows/full-match-runtime.yml"
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: sqlite+pysqlite:///:memory:
+
+jobs:
+  full-match-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile runtime policy and tests
+        run: >-
+          python -m py_compile
+          app/reid/full_match_runtime.py
+          app/reid/runtime.py
+          tests/test_reid_runtime.py
+
+      - name: Run runtime policy tests
+        run: python -m unittest tests/test_reid_runtime.py
+
+      - name: Validate Compose configuration
+        run: |
+          touch .env
+          docker compose config >/dev/null
