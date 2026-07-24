@@ -1,0 +1,130 @@
+name: Tracking benchmark
+
+on:
+  pull_request:
+    paths:
+      - "app/benchmark/**"
+      - "scripts/evaluate_tracking.py"
+      - "scripts/convert_tracking_output.py"
+      - "scripts/evaluate_reid_windows.py"
+      - "scripts/evaluate_reid_benchmark.py"
+      - "scripts/prepare_reid_annotation.py"
+      - "scripts/prepare_reid_review_pack.py"
+      - "scripts/prepare_reid_job_benchmark.py"
+      - "tests/test_tracking_benchmark.py"
+      - "tests/test_tracking_adapter.py"
+      - "tests/test_reid_benchmark.py"
+      - "tests/test_reid_adapter.py"
+      - "tests/test_reid_review.py"
+      - "tests/test_reid_job.py"
+      - "tests/test_reid_suite.py"
+      - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/reid_benchmark/**"
+      - "docs/tracking_benchmark.md"
+      - "docs/reid_benchmark.md"
+      - ".github/workflows/tracking-benchmark.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/benchmark/**"
+      - "scripts/evaluate_tracking.py"
+      - "scripts/convert_tracking_output.py"
+      - "scripts/evaluate_reid_windows.py"
+      - "scripts/evaluate_reid_benchmark.py"
+      - "scripts/prepare_reid_annotation.py"
+      - "scripts/prepare_reid_review_pack.py"
+      - "scripts/prepare_reid_job_benchmark.py"
+      - "tests/test_tracking_benchmark.py"
+      - "tests/test_tracking_adapter.py"
+      - "tests/test_reid_benchmark.py"
+      - "tests/test_reid_adapter.py"
+      - "tests/test_reid_review.py"
+      - "tests/test_reid_job.py"
+      - "tests/test_reid_suite.py"
+      - "tests/fixtures/tracking_benchmark/**"
+      - "tests/fixtures/reid_benchmark/**"
+      - "docs/tracking_benchmark.md"
+      - "docs/reid_benchmark.md"
+      - ".github/workflows/tracking-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile benchmark modules and CLIs
+        run: >-
+          python -m py_compile
+          app/benchmark/__init__.py
+          app/benchmark/schema.py
+          app/benchmark/tracking_metrics.py
+          app/benchmark/adapters.py
+          app/benchmark/reid_schema.py
+          app/benchmark/reid_adapters.py
+          app/benchmark/reid_metrics.py
+          app/benchmark/reid_review.py
+          app/benchmark/reid_job.py
+          app/benchmark/reid_suite.py
+          scripts/evaluate_tracking.py
+          scripts/convert_tracking_output.py
+          scripts/evaluate_reid_windows.py
+          scripts/evaluate_reid_benchmark.py
+          scripts/prepare_reid_annotation.py
+          scripts/prepare_reid_review_pack.py
+          scripts/prepare_reid_job_benchmark.py
+          tests/test_tracking_benchmark.py
+          tests/test_tracking_adapter.py
+          tests/test_reid_benchmark.py
+          tests/test_reid_adapter.py
+          tests/test_reid_review.py
+          tests/test_reid_job.py
+          tests/test_reid_suite.py
+
+      - name: Run tracking and ReID benchmark tests
+        run: >-
+          python -m unittest
+          tests/test_tracking_benchmark.py
+          tests/test_tracking_adapter.py
+          tests/test_reid_benchmark.py
+          tests/test_reid_adapter.py
+          tests/test_reid_review.py
+          tests/test_reid_job.py
+          tests/test_reid_suite.py
+
+      - name: Run tracking metric quality-gate smoke test
+        run: >-
+          python scripts/evaluate_tracking.py
+          --annotations tests/fixtures/tracking_benchmark/annotations
+          --predictions tests/fixtures/tracking_benchmark/predictions
+          --json-out /tmp/tracking-benchmark.json
+          --fail-on-gate
+
+      - name: Build ReID annotation template smoke test
+        run: >-
+          python scripts/prepare_reid_annotation.py
+          --tracking tests/fixtures/reid_benchmark/tracking.json
+          --video-id fixture-reid
+          --identity selected-player
+          --output /tmp/reid-window-template.json
+
+      - name: Run combined ReID benchmark quality-gate smoke test
+        run: >-
+          python scripts/evaluate_reid_benchmark.py
+          --tracking tests/fixtures/reid_benchmark/tracking.json
+          --frame-annotations tests/fixtures/reid_benchmark/frame-annotations.json
+          --window-annotations tests/fixtures/reid_benchmark/window-annotations.json
+          --minimum-scorable-windows 3
+          --json-out /tmp/reid-benchmark.json
+          --fail-on-gate
