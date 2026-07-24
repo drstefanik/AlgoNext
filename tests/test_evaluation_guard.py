@@ -78,6 +78,10 @@ class EvaluationGuardTests(unittest.TestCase):
         signals = job.result["tracking_signals"]
         self.assertAlmostEqual(signals["coverage_pct"], 0.49)
         self.assertAlmostEqual(signals["coverage_ratio"], 0.0049)
+        self.assertAlmostEqual(job.result["tracking"]["coverage_ratio"], 0.0049)
+        self.assertAlmostEqual(
+            job.result["tracking"]["coverage_ratio_total"], 0.0049
+        )
         self.assertAlmostEqual(job.result["tracking_quality_index"], 9.9, places=1)
         self.assertEqual(
             job.warnings,
