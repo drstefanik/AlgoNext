@@ -48,9 +48,51 @@ def _candidate_metrics(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return candidate if isinstance(candidate, Mapping) else None
 
 
-def _tracking_payload(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
+def _safe_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return parsed
+
+
+def _tracking_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
     tracking = result.get("tracking")
-    return tracking if isinstance(tracking, Mapping) else None
+    if not isinstance(tracking, Mapping):
+        return None
+
+    normalized = dict(tracking)
+    coverage_pct_total = _safe_float(normalized.get("coverage_pct_total"))
+    coverage_pct = _safe_float(normalized.get("coverage_pct"))
+    coverage_ratio_total = _safe_float(normalized.get("coverage_ratio_total"))
+    coverage_ratio = _safe_float(normalized.get("coverage_ratio"))
+
+    if coverage_ratio_total is None and coverage_pct_total is not None:
+        normalized["coverage_ratio_total"] = max(
+            0.0, min(1.0, coverage_pct_total / 100.0)
+        )
+    if coverage_ratio is None and coverage_pct is not None:
+        normalized["coverage_ratio"] = max(0.0, min(1.0, coverage_pct / 100.0))
+    if coverage_pct_total is None and coverage_ratio_total is not None:
+        normalized["coverage_pct_total"] = max(
+            0.0, min(100.0, coverage_ratio_total * 100.0)
+        )
+    if coverage_pct is None and coverage_ratio is not None:
+        normalized["coverage_pct"] = max(0.0, min(100.0, coverage_ratio * 100.0))
+
+    if "coverage_ratio" not in normalized and "coverage_ratio_total" in normalized:
+        normalized["coverage_ratio"] = normalized["coverage_ratio_total"]
+    if "coverage_ratio_total" not in normalized and "coverage_ratio" in normalized:
+        normalized["coverage_ratio_total"] = normalized["coverage_ratio"]
+    if "coverage_pct" not in normalized and "coverage_pct_total" in normalized:
+        normalized["coverage_pct"] = normalized["coverage_pct_total"]
+    if "coverage_pct_total" not in normalized and "coverage_pct" in normalized:
+        normalized["coverage_pct_total"] = normalized["coverage_pct"]
+    return normalized
 
 
 def _tracking_only_warnings(
@@ -98,16 +140,19 @@ def sanitize_analysis_job(job: AnalysisJob) -> None:
     if _is_validated_player_evaluation(result):
         return
 
+    tracking = _tracking_payload(result)
     sanitized_result = apply_evaluation_truth_gate(
         result,
         candidate_metrics=_candidate_metrics(result),
-        tracking=_tracking_payload(result),
+        tracking=tracking,
         evidence_metrics=(
             result.get("evidence_metrics")
             if isinstance(result.get("evidence_metrics"), Mapping)
             else None
         ),
     )
+    if tracking is not None:
+        sanitized_result["tracking"] = tracking
     job.result = sanitized_result
     job.warnings = _tracking_only_warnings(sanitized_result, job.warnings)
 
