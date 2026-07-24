@@ -5,6 +5,8 @@ import math
 from importlib import import_module
 from typing import Any, Callable
 
+from app.core.evaluation_truth import compute_image_motion_metrics
+
 logger = logging.getLogger(__name__)
 
 ANALYSIS_STATUSES = {"QUEUED", "RUNNING", "PROCESSING", "PARTIAL"}
@@ -34,6 +36,22 @@ PHASES = {
     "FINALIZING": "FINALIZE",
     "DONE": "DONE",
     "FAILED": "FAILED",
+}
+
+_SCORE_FIELDS = {
+    "match_rating_10",
+    "matchRating10",
+    "impact_100",
+    "impact100",
+    "impact_adj",
+    "impact_components",
+    "highlight_adj",
+    "baseline_rating",
+    "role_group",
+    "overall_score",
+    "overallScore",
+    "role_score",
+    "roleScore",
 }
 
 
@@ -130,8 +148,6 @@ def _tracking_only_features(meta: Any) -> dict[str, Any]:
         "duration_seconds": duration,
         "frame_count": max(0, frame_count),
         "fps": round(float(fps or 0.0), 3),
-        "scene_change_count": None,
-        "scene_change_rate": None,
         "feature_mode": "tracking_only",
         "validated": False,
         "reason_codes": [
@@ -141,8 +157,34 @@ def _tracking_only_features(meta: Any) -> dict[str, Any]:
     }
 
 
+def _tracking_only_evidence(tracking_output: Any) -> dict[str, Any]:
+    tracking = tracking_output if isinstance(tracking_output, dict) else {}
+    return {
+        "metric_space": "image_plane_normalized",
+        "validated": False,
+        "image_motion": compute_image_motion_metrics(tracking),
+        "reason_codes": [
+            "CAMERA_MOTION_NOT_COMPENSATED",
+            "PITCH_NOT_CALIBRATED",
+            "ATHLETIC_METRICS_WITHHELD",
+        ],
+    }
+
+
+def _tracking_only_explanation(has_tracking: bool) -> str:
+    if has_tracking:
+        return (
+            "Diagnostica di computer vision basata sul tracking. Non sono disponibili "
+            "eventi palla, calibrazione atletica o un punteggio tecnico-tattico validato."
+        )
+    return (
+        "Evidenza di tracking insufficiente. Il sistema si astiene dalla valutazione "
+        "del giocatore."
+    )
+
+
 def install_pipeline_policy(pipeline_module: Any) -> bool:
-    """Install truthful, monotonic and inexpensive post-tracking behavior."""
+    """Install truthful, monotonic and inexpensive tracking-only behavior."""
 
     current_progress = getattr(pipeline_module, "set_progress", None)
     if not callable(current_progress):
@@ -197,6 +239,108 @@ def install_pipeline_policy(pipeline_module: Any) -> bool:
     setattr(abstain_from_player_skills, "__algonext_original__", original_skills)
     pipeline_module.compute_skill_scores = abstain_from_player_skills
 
+    original_candidate_update = getattr(
+        pipeline_module, "_update_candidate_score_fields", None
+    )
+
+    def store_candidate_evidence_only(
+        job: Any,
+        _candidate_overall: Any,
+        _candidate_radar: Any,
+        evidence_metrics: Any,
+        _explain_text: str,
+    ) -> None:
+        existing = getattr(job, "result", None)
+        updated = dict(existing) if isinstance(existing, dict) else {}
+        merged_evidence = dict(updated.get("evidence_metrics") or {})
+        if isinstance(evidence_metrics, dict):
+            merged_evidence.update(evidence_metrics)
+        updated["evidence_metrics"] = merged_evidence
+        for key in _SCORE_FIELDS:
+            updated[key] = None
+        updated["radar"] = {}
+        updated["breakdown"] = {}
+        updated["evaluation_status"] = "TRACKING_ONLY"
+        updated["player_evaluation_available"] = False
+        updated["legacy_scores_suppressed"] = True
+        updated["explain"] = _tracking_only_explanation(False)
+        job.result = updated
+
+    setattr(store_candidate_evidence_only, "__algonext_pipeline_policy__", True)
+    setattr(
+        store_candidate_evidence_only,
+        "__algonext_original__",
+        original_candidate_update,
+    )
+    pipeline_module._update_candidate_score_fields = store_candidate_evidence_only
+
+    original_evidence = getattr(pipeline_module, "_compute_evidence_metrics", None)
+
+    def compute_tracking_only_evidence(tracking_output: Any) -> dict[str, Any]:
+        return _tracking_only_evidence(tracking_output)
+
+    setattr(compute_tracking_only_evidence, "__algonext_pipeline_policy__", True)
+    setattr(compute_tracking_only_evidence, "__algonext_original__", original_evidence)
+    pipeline_module._compute_evidence_metrics = compute_tracking_only_evidence
+
+    original_evaluation = getattr(pipeline_module, "compute_evaluation", None)
+
+    def abstain_from_player_evaluation(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "overall_score": None,
+            "role_score": None,
+            "weight_sum": 0.0,
+            "radar": {},
+            "evaluation_status": "TRACKING_ONLY",
+            "player_evaluation_available": False,
+        }
+
+    setattr(abstain_from_player_evaluation, "__algonext_pipeline_policy__", True)
+    setattr(abstain_from_player_evaluation, "__algonext_original__", original_evaluation)
+    pipeline_module.compute_evaluation = abstain_from_player_evaluation
+
+    original_match_rating = getattr(pipeline_module, "compute_match_rating", None)
+
+    def abstain_from_match_rating(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "match_rating_10": None,
+            "impact_100": None,
+            "impact_adj": None,
+            "impact_components": None,
+            "highlight_adj": None,
+            "baseline": None,
+            "role_group": None,
+            "explain": _tracking_only_explanation(True),
+        }
+
+    setattr(abstain_from_match_rating, "__algonext_pipeline_policy__", True)
+    setattr(abstain_from_match_rating, "__algonext_original__", original_match_rating)
+    pipeline_module.compute_match_rating = abstain_from_match_rating
+
+    original_required_keys = getattr(pipeline_module, "keys_required_for_role", None)
+
+    def no_player_score_dimensions(_role: Any) -> list[str]:
+        return []
+
+    setattr(no_player_score_dimensions, "__algonext_pipeline_policy__", True)
+    setattr(no_player_score_dimensions, "__algonext_original__", original_required_keys)
+    pipeline_module.keys_required_for_role = no_player_score_dimensions
+
+    original_performance_score = getattr(
+        pipeline_module, "_compute_performance_score", None
+    )
+
+    def abstain_from_performance_score(_evidence: Any) -> tuple[float, dict[str, float]]:
+        return 0.0, {}
+
+    setattr(abstain_from_performance_score, "__algonext_pipeline_policy__", True)
+    setattr(
+        abstain_from_performance_score,
+        "__algonext_original__",
+        original_performance_score,
+    )
+    pipeline_module._compute_performance_score = abstain_from_performance_score
+
     original_explain = getattr(pipeline_module, "_build_explain_text", None)
 
     def truthful_explain(
@@ -205,22 +349,14 @@ def install_pipeline_policy(pipeline_module: Any) -> bool:
         _evidence_metrics: dict[str, Any],
         tracking_output: dict[str, Any] | None,
     ) -> str:
-        if tracking_output:
-            return (
-                "Diagnostica di computer vision basata sul tracking. Non sono disponibili "
-                "eventi palla, calibrazione atletica o un punteggio tecnico-tattico validato."
-            )
-        return (
-            "Evidenza di tracking insufficiente. Il sistema si astiene dalla valutazione "
-            "del giocatore."
-        )
+        return _tracking_only_explanation(bool(tracking_output))
 
     setattr(truthful_explain, "__algonext_pipeline_policy__", True)
     setattr(truthful_explain, "__algonext_original__", original_explain)
     pipeline_module._build_explain_text = truthful_explain
 
     logger.info(
-        "Installed tracking-only pipeline policy: monotonic progress and scene scoring disabled"
+        "Installed source-level tracking-only policy: player scores and physical metrics disabled"
     )
     return True
 
