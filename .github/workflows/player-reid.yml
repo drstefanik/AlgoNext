@@ -1,0 +1,82 @@
+name: Player ReID
+
+on:
+  pull_request:
+    paths:
+      - "app/reid/**"
+      - "docker-compose.yml"
+      - "tests/test_reid_appearance.py"
+      - "tests/test_reid_association.py"
+      - "tests/test_reid_benchmark_evidence.py"
+      - "tests/test_reid_window_logic.py"
+      - "tests/test_reid_runtime.py"
+      - "tests/test_reid_windowed_tracking.py"
+      - ".github/workflows/player-reid.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/reid/**"
+      - "docker-compose.yml"
+      - "tests/test_reid_appearance.py"
+      - "tests/test_reid_association.py"
+      - "tests/test_reid_benchmark_evidence.py"
+      - "tests/test_reid_window_logic.py"
+      - "tests/test_reid_runtime.py"
+      - "tests/test_reid_windowed_tracking.py"
+      - ".github/workflows/player-reid.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ReID test dependencies
+        run: >-
+          python -m pip install
+          numpy==1.26.4
+          opencv-python-headless==4.10.0.84
+
+      - name: Compile ReID modules and tests
+        run: >-
+          python -m py_compile
+          app/reid/__init__.py
+          app/reid/appearance.py
+          app/reid/association.py
+          app/reid/benchmark_evidence.py
+          app/reid/window_logic.py
+          app/reid/full_match_runtime.py
+          app/reid/runtime.py
+          app/reid/windowed_tracking.py
+          tests/test_reid_appearance.py
+          tests/test_reid_association.py
+          tests/test_reid_benchmark_evidence.py
+          tests/test_reid_window_logic.py
+          tests/test_reid_runtime.py
+          tests/test_reid_windowed_tracking.py
+
+      - name: Run ReID foundation and activation tests
+        run: >-
+          python -m unittest
+          tests/test_reid_appearance.py
+          tests/test_reid_association.py
+          tests/test_reid_benchmark_evidence.py
+          tests/test_reid_window_logic.py
+          tests/test_reid_runtime.py
+          tests/test_reid_windowed_tracking.py
+
+      - name: Validate Compose kill-switch configuration
+        run: |
+          touch .env
+          APP_GIT_SHA=test-sha APP_BUILD_TIME=2026-07-24T00:00:00Z docker compose config >/dev/null
