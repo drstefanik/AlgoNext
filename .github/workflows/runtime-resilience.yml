@@ -5,6 +5,7 @@ on:
     paths:
       - "app/core/runtime_health.py"
       - "app/core/job_recovery.py"
+      - "app/core/pipeline_policy.py"
       - "app/runtime_api.py"
       - "app/main.py"
       - "app/workers/celery_app.py"
@@ -14,6 +15,7 @@ on:
       - "docker-compose.yml"
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
+      - "tests/test_pipeline_policy.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -23,6 +25,7 @@ on:
     paths:
       - "app/core/runtime_health.py"
       - "app/core/job_recovery.py"
+      - "app/core/pipeline_policy.py"
       - "app/runtime_api.py"
       - "app/main.py"
       - "app/workers/celery_app.py"
@@ -32,6 +35,7 @@ on:
       - "docker-compose.yml"
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
+      - "tests/test_pipeline_policy.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -71,6 +75,7 @@ jobs:
           python -m py_compile
           app/core/runtime_health.py
           app/core/job_recovery.py
+          app/core/pipeline_policy.py
           app/runtime_api.py
           app/main.py
           app/workers/celery_app.py
@@ -79,6 +84,7 @@ jobs:
           tests/test_runtime_health.py
           tests/test_runtime_api.py
           tests/test_job_recovery.py
+          tests/test_pipeline_policy.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 
@@ -88,6 +94,7 @@ jobs:
           tests/test_runtime_health.py
           tests/test_runtime_api.py
           tests/test_job_recovery.py
+          tests/test_pipeline_policy.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 
