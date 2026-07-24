@@ -89,8 +89,7 @@ jobs:
           test -f /tmp/reid-benchmark/job-manifest.json
           test -f /tmp/reid-benchmark/tracking.json
           test -f /tmp/reid-benchmark/review-pack/index.html
-          test -f /tmp/reid-benchmark/review-pack/reid-window-annotations.json
-          test -f /tmp/reid-benchmark/review-pack/frame-annotations.json
+          test -f /tmp/reid-benchmark/review-pack/reid-window-annotation.template.json
           frame_count="$(find /tmp/reid-benchmark/review-pack/frames -type f -name '*.jpg' | wc -l | tr -d ' ')"
           test "$frame_count" -gt 0
           echo "Extracted review frames: $frame_count"
