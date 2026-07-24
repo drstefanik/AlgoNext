@@ -17,16 +17,19 @@ class PipelinePolicyTests(unittest.TestCase):
                 "updated_at": "now",
             }
 
-        def expensive_extract(*_args, **_kwargs):
-            raise AssertionError("full-video feature scan must not run")
-
-        def invalid_skills(*_args, **_kwargs):
-            raise AssertionError("scene-derived skills must not run")
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("legacy scoring path must not run")
 
         return SimpleNamespace(
             set_progress=set_progress,
-            extract_video_features=expensive_extract,
-            compute_skill_scores=invalid_skills,
+            extract_video_features=forbidden,
+            compute_skill_scores=forbidden,
+            _update_candidate_score_fields=forbidden,
+            _compute_evidence_metrics=forbidden,
+            compute_evaluation=forbidden,
+            compute_match_rating=forbidden,
+            keys_required_for_role=forbidden,
+            _compute_performance_score=forbidden,
             _build_explain_text=lambda *_args: "legacy",
             SKILLS_ORDER=["Finishing", "Heading"],
         )
@@ -93,7 +96,8 @@ class PipelinePolicyTests(unittest.TestCase):
         self.assertFalse(features["validated"])
         self.assertEqual(features["frame_count"], 3012)
         self.assertEqual(features["fps"], 25.0)
-        self.assertIsNone(features["scene_change_count"])
+        self.assertNotIn("scene_change_count", features)
+        self.assertNotIn("scene_change_rate", features)
         self.assertIn(
             "SCENE_BASED_PLAYER_FEATURES_DISABLED", features["reason_codes"]
         )
@@ -105,6 +109,66 @@ class PipelinePolicyTests(unittest.TestCase):
         self.assertEqual(computed, {})
         self.assertEqual(missing, ["Finishing", "Heading"])
         self.assertIn("si astiene", pipeline._build_explain_text("x", {}, {}, None))
+
+    def test_candidate_stage_persists_evidence_without_scores(self):
+        pipeline = self.pipeline()
+        install_pipeline_policy(pipeline)
+        job = SimpleNamespace(result={"candidates": {"candidates": []}})
+
+        pipeline._update_candidate_score_fields(
+            job,
+            82.0,
+            {"visibility": 80.0},
+            {"candidate_metrics": {"coveragePct": 0.125}},
+            "legacy score explanation",
+        )
+
+        self.assertIsNone(job.result["overall_score"])
+        self.assertIsNone(job.result["role_score"])
+        self.assertEqual(job.result["radar"], {})
+        self.assertEqual(job.result["breakdown"], {})
+        self.assertEqual(job.result["evaluation_status"], "TRACKING_ONLY")
+        self.assertFalse(job.result["player_evaluation_available"])
+        self.assertTrue(job.result["legacy_scores_suppressed"])
+        self.assertEqual(
+            job.result["evidence_metrics"]["candidate_metrics"]["coveragePct"],
+            0.125,
+        )
+
+    def test_physical_metrics_and_player_scores_are_never_generated(self):
+        pipeline = self.pipeline()
+        install_pipeline_policy(pipeline)
+        tracking = {
+            "bboxes": [
+                {"t": 0.0, "x": 0.1, "y": 0.2, "w": 0.1, "h": 0.2},
+                {"t": 1.0, "x": 0.2, "y": 0.2, "w": 0.1, "h": 0.2},
+            ]
+        }
+
+        evidence = pipeline._compute_evidence_metrics(tracking)
+        self.assertEqual(evidence["metric_space"], "image_plane_normalized")
+        self.assertFalse(evidence["validated"])
+        self.assertEqual(evidence["image_motion"]["observed_samples"], 2)
+        for forbidden_key in (
+            "distance_covered_m",
+            "avg_speed_kmh",
+            "top_speed_kmh",
+            "top_speed_kmh_clamped",
+            "sprints_count",
+        ):
+            self.assertNotIn(forbidden_key, evidence)
+
+        evaluation = pipeline.compute_evaluation("Midfielder", {}, tracking, evidence)
+        self.assertIsNone(evaluation["overall_score"])
+        self.assertIsNone(evaluation["role_score"])
+        self.assertEqual(evaluation["radar"], {})
+        self.assertFalse(evaluation["player_evaluation_available"])
+
+        rating = pipeline.compute_match_rating(SimpleNamespace())
+        self.assertIsNone(rating["match_rating_10"])
+        self.assertIsNone(rating["impact_100"])
+        self.assertEqual(pipeline.keys_required_for_role("Midfielder"), [])
+        self.assertEqual(pipeline._compute_performance_score(evidence), (0.0, {}))
 
     def test_install_is_idempotent(self):
         pipeline = self.pipeline()
