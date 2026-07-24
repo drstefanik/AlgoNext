@@ -11,6 +11,7 @@ load_env()
 
 from app.core.evaluation_guard import install_evaluation_guard
 from app.core.job_recovery import recover_interrupted_jobs
+from app.core.pipeline_policy import install_pipeline_policy
 from app.core.runtime_health import (
     APP_GIT_SHA,
     start_worker_heartbeat,
@@ -55,6 +56,12 @@ celery.conf.update(
     broker_connection_retry_on_startup=True,
     worker_prefetch_multiplier=1,
 )
+
+# Import after the Celery application exists: pipeline.py references this module's
+# `celery` object while registering tasks.
+from app.workers import pipeline as pipeline_module
+
+install_pipeline_policy(pipeline_module)
 
 
 @worker_ready.connect
