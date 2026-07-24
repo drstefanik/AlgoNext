@@ -12,6 +12,23 @@ import redis
 
 logger = logging.getLogger(__name__)
 
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
 APP_GIT_SHA = (os.getenv("APP_GIT_SHA") or "unknown").strip() or "unknown"
 APP_BUILD_TIME = (os.getenv("APP_BUILD_TIME") or "unknown").strip() or "unknown"
 REDIS_URL = (
@@ -22,16 +39,16 @@ REDIS_URL = (
 WORKER_HEARTBEAT_KEY = (
     os.getenv("WORKER_HEARTBEAT_KEY") or "algonext:worker:heartbeat:v1"
 ).strip()
-WORKER_HEARTBEAT_INTERVAL_SECONDS = max(
-    2.0, float(os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "15") or 15)
+WORKER_HEARTBEAT_INTERVAL_SECONDS = _env_float(
+    "WORKER_HEARTBEAT_INTERVAL_SECONDS", 15.0, 2.0
 )
 WORKER_HEARTBEAT_TTL_SECONDS = max(
     int(WORKER_HEARTBEAT_INTERVAL_SECONDS * 3),
-    int(os.getenv("WORKER_HEARTBEAT_TTL_SECONDS", "90") or 90),
+    _env_int("WORKER_HEARTBEAT_TTL_SECONDS", 90, 10),
 )
 WORKER_HEARTBEAT_MAX_AGE_SECONDS = max(
     WORKER_HEARTBEAT_INTERVAL_SECONDS * 2,
-    float(os.getenv("WORKER_HEARTBEAT_MAX_AGE_SECONDS", "60") or 60),
+    _env_float("WORKER_HEARTBEAT_MAX_AGE_SECONDS", 60.0, 5.0),
 )
 CHECK_WORKER_READINESS = (
     (os.getenv("CHECK_WORKER_READINESS") or "1").strip().lower()
@@ -138,9 +155,9 @@ def stop_worker_heartbeat() -> None:
     if thread and thread.is_alive():
         thread.join(timeout=min(2.0, WORKER_HEARTBEAT_INTERVAL_SECONDS))
     try:
-        write_worker_heartbeat(state="stopping")
+        _redis_client().delete(WORKER_HEARTBEAT_KEY)
     except Exception:
-        logger.debug("Unable to publish final worker heartbeat", exc_info=True)
+        logger.debug("Unable to clear final worker heartbeat", exc_info=True)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
