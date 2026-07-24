@@ -41,5 +41,6 @@ COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY app ./app
 
-# Prefetch model at build time so runtime doesn't attempt downloads
-RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt')"
+# Prefetch both detectors used by the runtime so production never depends on a
+# network download after the worker has started.
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt'); YOLO('yolo11n.pt')"
