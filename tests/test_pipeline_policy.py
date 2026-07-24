@@ -1,7 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from app.core.pipeline_policy import install_pipeline_policy
+from app.core.pipeline_policy import (
+    install_pipeline_policy,
+    install_worker_pipeline_policy,
+)
 
 
 class PipelinePolicyTests(unittest.TestCase):
@@ -107,6 +110,21 @@ class PipelinePolicyTests(unittest.TestCase):
         pipeline = self.pipeline()
         self.assertTrue(install_pipeline_policy(pipeline))
         self.assertFalse(install_pipeline_policy(pipeline))
+
+    def test_worker_loader_imports_pipeline_only_when_called(self):
+        pipeline = self.pipeline()
+        imported = []
+
+        def loader(module_name):
+            imported.append(module_name)
+            return pipeline
+
+        self.assertEqual(imported, [])
+        self.assertTrue(install_worker_pipeline_policy(loader))
+        self.assertEqual(imported, ["app.workers.pipeline"])
+        self.assertTrue(
+            getattr(pipeline.set_progress, "__algonext_pipeline_policy__", False)
+        )
 
 
 if __name__ == "__main__":
