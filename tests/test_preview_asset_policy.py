@@ -9,6 +9,25 @@ from app.core.preview_asset_policy import (
 )
 
 
+class ExistingObjectClient:
+    def head_object(self, *, Bucket, Key):
+        return {"Bucket": Bucket, "Key": Key}
+
+
+class MissingObjectError(RuntimeError):
+    def __init__(self):
+        super().__init__("not found")
+        self.response = {
+            "Error": {"Code": "NoSuchKey"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        }
+
+
+class MissingObjectClient:
+    def head_object(self, *, Bucket, Key):
+        raise MissingObjectError()
+
+
 class PreviewAssetPolicyTests(unittest.TestCase):
     def pipeline(self, jobs, uploads, commits):
         def legacy_generator(**_kwargs):
@@ -117,6 +136,105 @@ class PreviewAssetPolicyTests(unittest.TestCase):
             job.result["preview_asset_integrity"]["selection_frames_immutable"]
         )
         self.assertEqual(commits, ["commit"])
+
+    def test_analysis_refresh_cannot_overwrite_selection_object_or_metadata(self):
+        job_id = "job-456"
+        key = f"jobs/{job_id}/frames/frame_0001.jpg"
+        selection_frames = [
+            {
+                "time_sec": 179.751,
+                "bucket": "fnh",
+                "key": key,
+                "width": 1920,
+                "height": 1080,
+                "tracks": [{"track_id": 52}],
+            }
+        ]
+        attempted_refresh = [
+            {
+                "time_sec": 59.751,
+                "bucket": "fnh",
+                "key": key,
+                "width": 1920,
+                "height": 1080,
+            }
+        ]
+        job = SimpleNamespace(preview_frames=list(selection_frames), result={})
+        jobs = {job_id: job}
+        uploads = []
+        commits = []
+        pipeline = self.pipeline(jobs, uploads, commits)
+        install_preview_asset_policy(pipeline)
+
+        pipeline.upload_file(
+            ExistingObjectClient(),
+            "fnh",
+            Path("/tmp/replacement.jpg"),
+            key,
+            "image/jpeg",
+        )
+        self.assertEqual(uploads, [])
+
+        pipeline.update_job(
+            jobs,
+            job_id,
+            lambda current_job: setattr(
+                current_job,
+                "preview_frames",
+                attempted_refresh,
+            ),
+        )
+
+        self.assertEqual(job.preview_frames, selection_frames)
+        self.assertTrue(
+            job.result["preview_asset_integrity"]["selection_refresh_suppressed"]
+        )
+        self.assertEqual(commits, ["commit"])
+
+    def test_first_selection_frame_upload_is_allowed(self):
+        job_id = "job-new"
+        key = f"jobs/{job_id}/frames/frame_0001.jpg"
+        uploads = []
+        pipeline = self.pipeline({}, uploads, [])
+        install_preview_asset_policy(pipeline)
+
+        pipeline.upload_file(
+            MissingObjectClient(),
+            "fnh",
+            Path("/tmp/frame.jpg"),
+            key,
+            "image/jpeg",
+        )
+
+        self.assertEqual([item["key"] for item in uploads], [key])
+
+    def test_selection_track_enrichment_is_preserved(self):
+        job_id = "job-tracks"
+        key = f"jobs/{job_id}/frames/frame_0001.jpg"
+        job = SimpleNamespace(
+            preview_frames=[{"time_sec": 10.0, "key": key, "tracks": []}],
+            result={},
+        )
+        jobs = {job_id: job}
+        commits = []
+        pipeline = self.pipeline(jobs, [], commits)
+        install_preview_asset_policy(pipeline)
+
+        enriched = [
+            {
+                "time_sec": 10.0,
+                "key": key,
+                "tracks": [{"track_id": 9}],
+            }
+        ]
+        pipeline.update_job(
+            jobs,
+            job_id,
+            lambda current_job: setattr(current_job, "preview_frames", enriched),
+        )
+
+        self.assertEqual(job.preview_frames[0]["tracks"], [{"track_id": 9}])
+        self.assertEqual(commits, [])
 
     def test_unrelated_updates_are_not_intercepted(self):
         job = SimpleNamespace(preview_frames=[], result={}, status="RUNNING")
