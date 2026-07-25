@@ -2,9 +2,11 @@ import unittest
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.player_profile_api import PlayerProfilePayload, save_player_profile
+from app.schemas import JobCreate
 
 
 @dataclass
@@ -36,7 +38,7 @@ class PlayerProfileApiTests(unittest.TestCase):
         self.job = DummyJob(
             id="job-profile-1",
             target={
-                "player": {"team_name": "Da associare"},
+                "player": {"team_name": None},
                 "selections": [],
             },
             player_ref={"track_id": 9, "selection_source": "preview_frame_pick"},
@@ -44,6 +46,18 @@ class PlayerProfileApiTests(unittest.TestCase):
         )
         self.session = DummySession(self.job)
         self.request = Request({"type": "http", "headers": []})
+
+    def test_job_creation_does_not_require_player_profile(self):
+        payload = JobCreate(
+            video_key="uploads/match.mp4",
+            role="Midfielder",
+            category="U17",
+            full_match_mode=True,
+        )
+
+        self.assertIsNone(payload.team_name)
+        self.assertIsNone(payload.player_name)
+        self.assertIsNone(payload.shirt_number)
 
     def test_profile_is_attached_to_the_visually_selected_player(self):
         payload = PlayerProfilePayload(
@@ -71,6 +85,25 @@ class PlayerProfileApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.job.player_ref["profile"], self.job.target["player"])
+
+    def test_profile_is_rejected_before_visual_selection(self):
+        self.job.player_ref = {}
+        payload = PlayerProfilePayload(teamName="AS Roma", shirtNumber=8)
+
+        with self.assertRaises(HTTPException) as raised:
+            save_player_profile(
+                self.job.id,
+                payload,
+                self.request,
+                self.session,
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "PLAYER_SELECTION_REQUIRED",
+        )
+        self.assertFalse(self.session.committed)
 
     def test_partial_update_preserves_existing_player_data(self):
         self.job.target["player"] = {
