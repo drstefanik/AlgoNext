@@ -49,6 +49,22 @@ def _meta(request: Request) -> dict:
     }
 
 
+def _has_visual_selection(player_ref: object) -> bool:
+    if not isinstance(player_ref, dict):
+        return False
+    if player_ref.get("track_id") is None:
+        return False
+    if player_ref.get("selection_source") or player_ref.get("best_preview_frame_key"):
+        return True
+    bbox = player_ref.get("bbox")
+    if isinstance(bbox, dict) and {"x", "y", "w", "h"}.issubset(bbox):
+        return True
+    if {"x", "y", "w", "h"}.issubset(player_ref):
+        return True
+    sample_frames = player_ref.get("sample_frames")
+    return isinstance(sample_frames, list) and len(sample_frames) > 0
+
+
 @router.post("/jobs/{job_id}/player-profile")
 def save_player_profile(
     job_id: str,
@@ -66,11 +82,14 @@ def save_player_profile(
     if not job:
         raise HTTPException(
             status_code=404,
+            detail={"code": "JOB_NOT_FOUND", "message": "Job not found"},
+        )
+    if not _has_visual_selection(job.player_ref):
+        raise HTTPException(
+            status_code=409,
             detail={
-                "error": {
-                    "code": "JOB_NOT_FOUND",
-                    "message": "Job not found",
-                }
+                "code": "PLAYER_SELECTION_REQUIRED",
+                "message": "Select a player visually before saving player details.",
             },
         )
 
@@ -83,10 +102,9 @@ def save_player_profile(
     target["player"] = player
     job.target = target
 
-    if isinstance(job.player_ref, dict) and job.player_ref:
-        player_ref = dict(job.player_ref)
-        player_ref["profile"] = dict(player)
-        job.player_ref = player_ref
+    player_ref = dict(job.player_ref)
+    player_ref["profile"] = dict(player)
+    job.player_ref = player_ref
 
     job.updated_at = datetime.now(timezone.utc)
     db.commit()
