@@ -3,7 +3,7 @@ import os
 
 import torch
 from celery import Celery
-from celery.signals import worker_ready, worker_shutdown
+from celery.signals import worker_init, worker_ready, worker_shutdown
 
 from app.core.env import load_env
 
@@ -19,10 +19,10 @@ from app.core.runtime_health import (
 )
 from app.reid.runtime import install_windowed_reid
 
+logger = logging.getLogger(__name__)
+
 install_evaluation_guard()
 install_windowed_reid()
-
-logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
@@ -58,11 +58,32 @@ celery.conf.update(
 )
 
 
+@worker_init.connect
+def _on_worker_init(**_kwargs):
+    """Install the policy after celery_app is fully imported, before work starts.
+
+    Importing and patching ``app.workers.pipeline`` at module import time creates a
+    circular import when the API imports pipeline helpers. ``worker_init`` runs in
+    the worker process after this module is complete and before the worker begins
+    consuming tasks, so the policy is present without breaking API imports.
+    """
+
+    installed = install_worker_pipeline_policy()
+    logger.info(
+        "Tracking-only pipeline policy installed at worker init=%s",
+        installed,
+    )
+
+
 @worker_ready.connect
 def _on_worker_ready(sender=None, **_kwargs):
-    # The task modules have been imported by this point. Installing the policy here
-    # avoids a circular import when the API imports pipeline.py for shared helpers.
-    install_worker_pipeline_policy()
+    # Idempotent safety net in case a custom worker boot sequence skipped the
+    # worker_init hook. The policy must already be active in the normal path.
+    installed = install_worker_pipeline_policy()
+    logger.info(
+        "Tracking-only pipeline policy ready safety-net installed=%s",
+        installed,
+    )
     recover_interrupted_jobs()
     worker_name = getattr(sender, "hostname", None)
     start_worker_heartbeat(str(worker_name) if worker_name else None)
