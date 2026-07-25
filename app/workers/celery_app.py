@@ -12,6 +12,7 @@ load_env()
 from app.core.evaluation_guard import install_evaluation_guard
 from app.core.job_recovery import recover_interrupted_jobs
 from app.core.pipeline_policy import install_worker_pipeline_policy
+from app.core.preview_asset_policy import install_worker_preview_asset_policy
 from app.core.runtime_health import (
     APP_GIT_SHA,
     start_worker_heartbeat,
@@ -60,29 +61,27 @@ celery.conf.update(
 
 @worker_init.connect
 def _on_worker_init(**_kwargs):
-    """Install the policy after celery_app is fully imported, before work starts.
+    """Install worker policies after celery_app is imported and before work starts."""
 
-    Importing and patching ``app.workers.pipeline`` at module import time creates a
-    circular import when the API imports pipeline helpers. ``worker_init`` runs in
-    the worker process after this module is complete and before the worker begins
-    consuming tasks, so the policy is present without breaking API imports.
-    """
-
-    installed = install_worker_pipeline_policy()
+    tracking_policy_installed = install_worker_pipeline_policy()
+    preview_asset_policy_installed = install_worker_preview_asset_policy()
     logger.info(
-        "Tracking-only pipeline policy installed at worker init=%s",
-        installed,
+        "Worker policies installed at init: tracking_only=%s immutable_previews=%s",
+        tracking_policy_installed,
+        preview_asset_policy_installed,
     )
 
 
 @worker_ready.connect
 def _on_worker_ready(sender=None, **_kwargs):
     # Idempotent safety net in case a custom worker boot sequence skipped the
-    # worker_init hook. The policy must already be active in the normal path.
-    installed = install_worker_pipeline_policy()
+    # worker_init hook. Both policies must already be active in the normal path.
+    tracking_policy_installed = install_worker_pipeline_policy()
+    preview_asset_policy_installed = install_worker_preview_asset_policy()
     logger.info(
-        "Tracking-only pipeline policy ready safety-net installed=%s",
-        installed,
+        "Worker policy safety net: tracking_only=%s immutable_previews=%s",
+        tracking_policy_installed,
+        preview_asset_policy_installed,
     )
     recover_interrupted_jobs()
     worker_name = getattr(sender, "hostname", None)
