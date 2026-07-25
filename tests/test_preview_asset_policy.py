@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,13 +39,21 @@ class PreviewAssetPolicyTests(unittest.TestCase):
             if job is None:
                 return False
             updater(job)
+            commits.append(
+                {
+                    "preview_frames": copy.deepcopy(
+                        list(getattr(job, "preview_frames", None) or [])
+                    ),
+                    "result": copy.deepcopy(getattr(job, "result", None) or {}),
+                }
+            )
             return True
 
         def reload_job(db, job_id):
             return db.get(job_id)
 
         def safe_commit(_db):
-            commits.append("commit")
+            raise AssertionError("preview policy must not perform a second commit")
 
         def run(command):
             output = Path(command[-1])
@@ -125,6 +134,7 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(job.preview_frames, selection_frames)
+        self.assertEqual(commits[0]["preview_frames"], selection_frames)
         self.assertEqual(
             job.result["tracking_review_frames"][0]["key"], generated[0]["key"]
         )
@@ -135,7 +145,7 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         self.assertTrue(
             job.result["preview_asset_integrity"]["selection_frames_immutable"]
         )
-        self.assertEqual(commits, ["commit"])
+        self.assertEqual(len(commits), 1)
 
     def test_analysis_refresh_cannot_overwrite_selection_object_or_metadata(self):
         job_id = "job-456"
@@ -186,10 +196,11 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(job.preview_frames, selection_frames)
+        self.assertEqual(commits[0]["preview_frames"], selection_frames)
         self.assertTrue(
             job.result["preview_asset_integrity"]["selection_refresh_suppressed"]
         )
-        self.assertEqual(commits, ["commit"])
+        self.assertEqual(len(commits), 1)
 
     def test_first_selection_frame_upload_is_allowed(self):
         job_id = "job-new"
@@ -234,12 +245,13 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(job.preview_frames[0]["tracks"], [{"track_id": 9}])
-        self.assertEqual(commits, [])
+        self.assertEqual(len(commits), 1)
 
     def test_unrelated_updates_are_not_intercepted(self):
         job = SimpleNamespace(preview_frames=[], result={}, status="RUNNING")
         jobs = {"job": job}
-        pipeline = self.pipeline(jobs, [], [])
+        commits = []
+        pipeline = self.pipeline(jobs, [], commits)
         install_preview_asset_policy(pipeline)
 
         pipeline.update_job(
@@ -251,6 +263,7 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         self.assertEqual(job.status, "PARTIAL")
         self.assertEqual(job.preview_frames, [])
         self.assertNotIn("tracking_review_frames", job.result)
+        self.assertEqual(len(commits), 1)
 
     def test_install_is_idempotent(self):
         pipeline = self.pipeline({}, [], [])
