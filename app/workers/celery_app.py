@@ -3,7 +3,7 @@ import os
 
 import torch
 from celery import Celery
-from celery.signals import worker_ready, worker_shutdown
+from celery.signals import worker_init, worker_ready, worker_shutdown
 
 from app.core.env import load_env
 
@@ -57,22 +57,33 @@ celery.conf.update(
     worker_prefetch_multiplier=1,
 )
 
-# pipeline.py imports ``celery`` from this module. At this point the application
-# object already exists, so importing and governing the task module is safe and
-# deterministic. Installing only from ``worker_ready`` proved too late on a real
-# job: the legacy full-video feature scan and non-monotonic 50% progress path were
-# still executed. Keep the signal call below as an idempotent safety net, but do
-# not accept tasks before the policy is present.
-PIPELINE_POLICY_INSTALLED_EAGERLY = install_worker_pipeline_policy()
-logger.info(
-    "Tracking-only pipeline policy installed eagerly=%s",
-    PIPELINE_POLICY_INSTALLED_EAGERLY,
-)
+
+@worker_init.connect
+def _on_worker_init(**_kwargs):
+    """Install the policy after celery_app is fully imported, before work starts.
+
+    Importing and patching ``app.workers.pipeline`` at module import time creates a
+    circular import when the API imports pipeline helpers. ``worker_init`` runs in
+    the worker process after this module is complete and before the worker begins
+    consuming tasks, so the policy is present without breaking API imports.
+    """
+
+    installed = install_worker_pipeline_policy()
+    logger.info(
+        "Tracking-only pipeline policy installed at worker init=%s",
+        installed,
+    )
 
 
 @worker_ready.connect
 def _on_worker_ready(sender=None, **_kwargs):
-    install_worker_pipeline_policy()
+    # Idempotent safety net in case a custom worker boot sequence skipped the
+    # worker_init hook. The policy must already be active in the normal path.
+    installed = install_worker_pipeline_policy()
+    logger.info(
+        "Tracking-only pipeline policy ready safety-net installed=%s",
+        installed,
+    )
     recover_interrupted_jobs()
     worker_name = getattr(sender, "hostname", None)
     start_worker_heartbeat(str(worker_name) if worker_name else None)
