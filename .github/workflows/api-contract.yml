@@ -8,12 +8,14 @@ on:
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
       - "app/main.py"
+      - "app/player_profile_api.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
+      - "tests/test_player_profile_api.py"
       - ".github/workflows/api-contract.yml"
   push:
     branches:
@@ -24,12 +26,14 @@ on:
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
       - "app/main.py"
+      - "app/player_profile_api.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
+      - "tests/test_player_profile_api.py"
       - ".github/workflows/api-contract.yml"
 
 permissions:
@@ -62,12 +66,14 @@ jobs:
           app/core/evaluation_guard.py
           app/core/evaluation_http_guard.py
           app/main.py
+          app/player_profile_api.py
           app/workers/celery_app.py
           app/workers/ai_report.py
           tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
+          tests/test_player_profile_api.py
 
       - name: Run API and evaluation truth contract tests
         run: >-
@@ -76,3 +82,4 @@ jobs:
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
+          tests/test_player_profile_api.py
