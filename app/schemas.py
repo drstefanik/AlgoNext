@@ -9,7 +9,7 @@ class JobCreate(BaseModel):
     video_key: Optional[str] = None
     role: str
     category: str
-    team_name: str = Field(min_length=1)
+    team_name: Optional[str] = None
     player_name: Optional[str] = None
     shirt_number: Optional[int] = Field(default=None, ge=0, le=99)
     full_match_mode: Optional[bool] = None
