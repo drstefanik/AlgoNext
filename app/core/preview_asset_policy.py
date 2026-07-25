@@ -9,7 +9,6 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 _SELECTION_FRAME_MARKER = "/frames/frame_"
-_TRACKING_FRAME_MARKER = "/tracking_frames/tracking_frame_"
 _NOT_FOUND_CODES = {
     "404",
     "NoSuchBucket",
@@ -70,9 +69,15 @@ def _object_exists(s3_client: Any, bucket: str, key: str) -> bool:
         response = getattr(exc, "response", None)
         error = response.get("Error", {}) if isinstance(response, dict) else {}
         code = str(error.get("Code", ""))
-        status = str(
-            (response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode", "")
-        ) if isinstance(response, dict) else ""
+        status = (
+            str(
+                (response.get("ResponseMetadata", {}) or {}).get(
+                    "HTTPStatusCode", ""
+                )
+            )
+            if isinstance(response, dict)
+            else ""
+        )
         if code in _NOT_FOUND_CODES or status == "404":
             return False
         raise
@@ -241,79 +246,81 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
         immutable_selection = copy.deepcopy(
             list(getattr(before, "preview_frames", None) or []) if before else []
         )
-
-        outcome = current_update_job(db, job_id, updater)
-        after = pipeline_module.reload_job(db, job_id)
-        if after is None:
-            return outcome
-
-        current_frames = copy.deepcopy(list(getattr(after, "preview_frames", None) or []))
         with pending_lock:
             pending = copy.deepcopy(pending_tracking_frames.get(job_id) or [])
 
-        result = getattr(after, "result", None)
-        updated_result = dict(result) if isinstance(result, dict) else {}
-        changed = False
+        state = {"tracking_intercepted": False}
 
-        if pending and _asset_keys(current_frames) == _asset_keys(pending):
-            tracking_assets = _tracking_asset_payload(pending)
-            updated_result["tracking_review_frames"] = tracking_assets
-            assets = dict(updated_result.get("assets") or {})
-            assets["tracking_review_frames"] = tracking_assets
-            updated_result["assets"] = assets
-            after.preview_frames = immutable_selection
-            changed = True
-            with pending_lock:
-                pending_tracking_frames.pop(job_id, None)
-            logger.info(
-                "Preserved %d selection frame(s) and stored %d tracking review frame(s) job_id=%s",
-                len(immutable_selection),
-                len(tracking_assets),
-                job_id,
+        def governed_updater(job: Any) -> None:
+            updater(job)
+            current_frames = copy.deepcopy(
+                list(getattr(job, "preview_frames", None) or [])
             )
-        elif (
-            immutable_selection
-            and _all_selection_frames(immutable_selection)
-            and _all_selection_frames(current_frames)
-        ):
-            before_signature = _frame_signature(immutable_selection)
-            after_signature = _frame_signature(current_frames)
-            if before_signature != after_signature:
-                after.preview_frames = immutable_selection
+            result = getattr(job, "result", None)
+            updated_result = dict(result) if isinstance(result, dict) else {}
+            changed = False
+
+            if pending and _asset_keys(current_frames) == _asset_keys(pending):
+                tracking_assets = _tracking_asset_payload(pending)
+                updated_result["tracking_review_frames"] = tracking_assets
+                assets = dict(updated_result.get("assets") or {})
+                assets["tracking_review_frames"] = tracking_assets
+                updated_result["assets"] = assets
+                job.preview_frames = immutable_selection
                 changed = True
-                logger.warning(
-                    "Suppressed replacement of immutable selection frames job_id=%s",
+                state["tracking_intercepted"] = True
+                logger.info(
+                    "Preserved %d selection frame(s) and stored %d tracking review frame(s) job_id=%s",
+                    len(immutable_selection),
+                    len(tracking_assets),
                     job_id,
                 )
-            else:
-                merged_frames = _merge_selection_tracks(
-                    immutable_selection,
-                    current_frames,
-                )
-                if merged_frames != current_frames:
-                    after.preview_frames = merged_frames
-                    changed = True
-
-        if changed:
-            integrity = dict(updated_result.get("preview_asset_integrity") or {})
-            integrity.update(
-                {
-                    "selection_frames_immutable": True,
-                    "selection_namespace": f"jobs/{job_id}/frames/",
-                    "tracking_review_namespace": f"jobs/{job_id}/tracking_frames/",
-                }
-            )
-            if (
+            elif (
                 immutable_selection
-                and _frame_signature(immutable_selection)
-                != _frame_signature(current_frames)
+                and _all_selection_frames(immutable_selection)
                 and _all_selection_frames(current_frames)
             ):
-                integrity["selection_refresh_suppressed"] = True
-            updated_result["preview_asset_integrity"] = integrity
-            after.result = updated_result
-            pipeline_module.safe_commit(db)
+                before_signature = _frame_signature(immutable_selection)
+                after_signature = _frame_signature(current_frames)
+                if before_signature != after_signature:
+                    job.preview_frames = immutable_selection
+                    changed = True
+                    logger.warning(
+                        "Suppressed replacement of immutable selection frames job_id=%s",
+                        job_id,
+                    )
+                else:
+                    merged_frames = _merge_selection_tracks(
+                        immutable_selection,
+                        current_frames,
+                    )
+                    if merged_frames != current_frames:
+                        job.preview_frames = merged_frames
+                        changed = True
 
+            if changed:
+                integrity = dict(updated_result.get("preview_asset_integrity") or {})
+                integrity.update(
+                    {
+                        "selection_frames_immutable": True,
+                        "selection_namespace": f"jobs/{job_id}/frames/",
+                        "tracking_review_namespace": f"jobs/{job_id}/tracking_frames/",
+                    }
+                )
+                if (
+                    immutable_selection
+                    and _frame_signature(immutable_selection)
+                    != _frame_signature(current_frames)
+                    and _all_selection_frames(current_frames)
+                ):
+                    integrity["selection_refresh_suppressed"] = True
+                updated_result["preview_asset_integrity"] = integrity
+                job.result = updated_result
+
+        outcome = current_update_job(db, job_id, governed_updater)
+        if outcome and state["tracking_intercepted"]:
+            with pending_lock:
+                pending_tracking_frames.pop(job_id, None)
         return outcome
 
     setattr(upload_immutable_asset, "__algonext_preview_asset_policy__", True)
