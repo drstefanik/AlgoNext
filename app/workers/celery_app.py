@@ -61,7 +61,7 @@ celery.conf.update(
 
 @worker_init.connect
 def _on_worker_init(**_kwargs):
-    """Install worker policies after celery_app is imported and before work starts."""
+    """Install policies after import and before the worker begins consuming tasks."""
 
     tracking_policy_installed = install_worker_pipeline_policy()
     preview_asset_policy_installed = install_worker_preview_asset_policy()
