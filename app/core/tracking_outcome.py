@@ -81,6 +81,33 @@ def apply_tracking_outcome(
         windows_total > 0 and windows_processed >= windows_total
     )
     anchors_matched = int(tracking_payload.get("anchors_matched") or 0)
+    pre_guard_anchor_diagnostics = (
+        tracking_payload.get("pre_guard_anchor_diagnostics")
+        if isinstance(
+            tracking_payload.get("pre_guard_anchor_diagnostics"),
+            dict,
+        )
+        and tracking_payload["pre_guard_anchor_diagnostics"].get(
+            "diagnostic_only"
+        )
+        is True
+        and tracking_payload["pre_guard_anchor_diagnostics"].get("validated")
+        is False
+        else {}
+    )
+    try:
+        anchors_matched_before_guard = max(
+            0,
+            int(
+                pre_guard_anchor_diagnostics.get(
+                    "anchors_matched_before_guard",
+                    0,
+                )
+                or 0
+            ),
+        )
+    except (TypeError, ValueError):
+        anchors_matched_before_guard = 0
     tracking_failed = tracking_payload.get("tracking_success") is False
     tracking_incomplete = bool(tracking_payload.get("partial") is True)
     analysis_outcome = {
@@ -112,6 +139,7 @@ def apply_tracking_outcome(
         "windows_total": windows_total,
         "anchors_total": int(tracking_payload.get("anchors_total") or 0),
         "anchors_matched": anchors_matched,
+        "anchors_matched_before_guard": anchors_matched_before_guard,
         "reason_codes": reason_codes,
         "action_required": tracking_payload.get("action_required"),
         "analysis_attempt_id": analysis_attempt_id or None,
@@ -138,7 +166,9 @@ def apply_tracking_outcome(
     ]
 
     if action_required == "RESELECT_PLAYER":
-        reference_was_matched = anchors_matched > 0
+        reference_was_matched = (
+            anchors_matched > 0 or anchors_matched_before_guard > 0
+        )
         if reference_was_matched:
             warnings.extend(
                 code for code in reason_codes if code != "PLAYER_ANCHOR_NOT_FOUND"

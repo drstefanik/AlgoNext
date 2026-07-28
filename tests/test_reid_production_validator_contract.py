@@ -686,6 +686,43 @@ class ReIDProductionValidatorContractTests(unittest.TestCase):
         ):
             validate(payload)
 
+    def test_failed_tracking_reports_causal_status_before_target_confirmation(self):
+        payload = genuine_payload()
+        job = payload["job"]["data"]
+        tracking = job["result"]["tracking"]
+        job["status"] = "WAITING_FOR_PLAYER"
+        job["target"]["confirmed"] = False
+        job["failure_reason"] = "ANCHOR_ONLY"
+        tracking.update(
+            {
+                "tracking_success": False,
+                "tracking_status": "ANCHOR_ONLY",
+                "action_required": "RESELECT_PLAYER",
+                "anchors_total": 0,
+                "anchors_matched": 0,
+                "pre_guard_anchor_diagnostics": {
+                    "diagnostic_only": True,
+                    "validated": False,
+                    "anchors_total": 2,
+                    "anchors_matched_before_guard": 999,
+                    "anchor_matches": [
+                        {"matched_before_guard": True},
+                        {"matched_before_guard": True},
+                    ],
+                },
+            }
+        )
+        tracking["reid_summary"]["reason_codes"] = [
+            "AUTONOMOUS_REID_NOT_PROVEN",
+        ]
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "Tracking terminal failure:.*ANCHOR_ONLY.*"
+            "pre_guard_anchors_matched=2.*AUTONOMOUS_REID_NOT_PROVEN",
+        ):
+            validate(payload)
+
     def test_distinct_identity_per_window_fails(self):
         payload = genuine_payload()
         segments = payload["job"]["data"]["result"]["tracking"]["segments"]

@@ -209,6 +209,93 @@ class EvaluationGuardTests(unittest.TestCase):
                 self.assertIn(tracking_status, job.warnings)
                 self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
 
+    def test_sanitized_matched_anchor_rejection_uses_diagnostics_only_for_warning(self):
+        job = AnalysisJob(
+            id="job-sanitized-anchor-only",
+            status="WAITING_FOR_PLAYER",
+            category="U17",
+            role="Midfielder",
+            warnings=["PLAYER_ANCHOR_NOT_FOUND"],
+            result={
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_ONLY",
+                    "action_required": "RESELECT_PLAYER",
+                    "bboxes_count": 0,
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "anchors_total": 0,
+                    "anchors_matched": 0,
+                    "pre_guard_anchor_diagnostics": {
+                        "diagnostic_only": True,
+                        "validated": False,
+                        "anchors_total": 2,
+                        "anchors_matched_before_guard": 999,
+                        "anchor_matches": [
+                            {
+                                "anchor_id": 1,
+                                "matched_before_guard": True,
+                            },
+                            {
+                                "anchor_id": 2,
+                                "matched_before_guard": True,
+                            },
+                        ],
+                    },
+                    "reid_summary": {
+                        "status": "ANCHOR_ONLY",
+                        "reason_codes": ["AUTONOMOUS_REID_NOT_PROVEN"],
+                    },
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        self.assertFalse(job.result["tracking"]["tracking_success"])
+        self.assertEqual(job.result["tracking"]["anchors_matched"], 0)
+        self.assertNotIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+        self.assertIn("AUTONOMOUS_REID_NOT_PROVEN", job.warnings)
+        self.assertIn("ANCHOR_ONLY", job.warnings)
+        self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
+    def test_unmarked_pre_guard_diagnostics_cannot_change_warning_classification(self):
+        for mutation in (
+            {"diagnostic_only": False, "validated": False},
+            {"diagnostic_only": True, "validated": True},
+        ):
+            with self.subTest(mutation=mutation):
+                diagnostics = {
+                    **mutation,
+                    "anchors_total": 1,
+                    "anchors_matched_before_guard": 1,
+                    "anchor_matches": [{"matched_before_guard": True}],
+                }
+                job = AnalysisJob(
+                    id="job-untrusted-anchor-diagnostics",
+                    status="WAITING_FOR_PLAYER",
+                    category="U17",
+                    role="Midfielder",
+                    result={
+                        "tracking": {
+                            "tracking_success": False,
+                            "tracking_status": "ANCHOR_ONLY",
+                            "action_required": "RESELECT_PLAYER",
+                            "anchors_total": 0,
+                            "anchors_matched": 0,
+                            "pre_guard_anchor_diagnostics": diagnostics,
+                            "reid_summary": {
+                                "reason_codes": ["AUTONOMOUS_REID_NOT_PROVEN"],
+                            },
+                        }
+                    },
+                )
+
+                sanitize_analysis_job(job)
+
+                self.assertIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+                self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
     def test_acquisition_error_keeps_retry_semantics(self):
         job = AnalysisJob(
             id="job-anchor-infra-error",
