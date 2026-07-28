@@ -46,7 +46,7 @@ from app.workers.tracking import (
     track_player,
     track_player_windowed,
 )
-from app.workers.multi_anchor import compute_tracking_window
+from app.workers.multi_anchor import compute_tracking_window, normalize_anchors
 
 logger = logging.getLogger(__name__)
 
@@ -1264,6 +1264,30 @@ def _is_full_match_mode(job: AnalysisJob) -> bool:
     if isinstance(job.target, dict):
         target_flag = bool(job.target.get("full_match_mode"))
     return env_enabled or target_flag
+
+
+def _requires_candidate_tracking(
+    result: Dict[str, Any] | None,
+    target: Dict[str, Any] | None,
+    *,
+    full_match_mode: bool,
+    player_ref: Dict[str, Any] | None,
+) -> bool:
+    current_result = result if isinstance(result, dict) else {}
+    if current_result.get("candidates"):
+        return False
+
+    current_target = target if isinstance(target, dict) else {}
+    selections = normalize_anchors(current_target.get("selections"))
+    normalized_player_ref = normalize_anchors([player_ref], max_items=1)
+    if (
+        full_match_mode
+        and current_target.get("confirmed") is True
+        and selections
+        and normalized_player_ref
+    ):
+        return False
+    return True
 
 
 def probe_frame_count(path: Path) -> int:
@@ -3096,8 +3120,13 @@ def run_analysis(
         job = reload_job(db, job_id)
         if not job:
             return
-        existing_candidates = (job.result or {}).get("candidates")
-        if not existing_candidates:
+        target = job.target or {}
+        if _requires_candidate_tracking(
+            job.result,
+            target,
+            full_match_mode=full_match_mode,
+            player_ref=job.player_ref or job.anchor or {},
+        ):
             update_current_attempt(
                 db,
                 job_id,
@@ -3121,6 +3150,14 @@ def run_analysis(
                         "candidates": candidates_output,
                     },
                 ),
+            )
+        else:
+            logger.info(
+                "run_analysis skipping candidate tracking for confirmed target "
+                "job_id=%s attempt=%s selections=%d",
+                job_id,
+                analysis_attempt_id,
+                len(selections),
             )
 
         # Block analysis until player_ref is present (but keep assets/frames stored)

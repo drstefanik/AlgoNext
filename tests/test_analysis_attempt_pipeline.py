@@ -6,6 +6,8 @@ import threading
 import unittest
 from pathlib import Path
 
+from app.workers.multi_anchor import normalize_anchors
+
 
 class AnalysisAttemptPipelineTests(unittest.TestCase):
     @staticmethod
@@ -34,6 +36,7 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
         )
         namespace = {
             "StaleAnalysisAttemptError": RuntimeError,
+            "normalize_anchors": normalize_anchors,
             "utc_now_iso": lambda: "2026-07-28T00:00:00+00:00",
         }
         exec(
@@ -195,6 +198,156 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
         self.assertEqual(job.progress["analysis_attempt_id"], attempt_id)
         self.assertEqual(job.progress["step"], "DONE")
         self.assertEqual(job.progress["pct"], 100)
+
+    def test_confirmed_selection_skips_redundant_candidate_tracking(self):
+        requires_candidate_tracking = self._load_helper("_requires_candidate_tracking")
+        selection = {
+            "time_sec": 719.003,
+            "bbox": {"x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+        }
+
+        self.assertFalse(
+            requires_candidate_tracking(
+                {},
+                {"confirmed": True, "selections": [selection]},
+                full_match_mode=True,
+                player_ref=selection,
+            )
+        )
+        self.assertFalse(
+            requires_candidate_tracking(
+                {"candidates": {"candidates": [{"track_id": 7}]}},
+                {},
+                full_match_mode=False,
+                player_ref=None,
+            )
+        )
+        self.assertTrue(
+            requires_candidate_tracking(
+                {},
+                {"confirmed": True, "selections": []},
+                full_match_mode=True,
+                player_ref=selection,
+            )
+        )
+        self.assertTrue(
+            requires_candidate_tracking(
+                {},
+                {"confirmed": True, "selections": [selection]},
+                full_match_mode=False,
+                player_ref=selection,
+            )
+        )
+        self.assertTrue(
+            requires_candidate_tracking(
+                {},
+                {"confirmed": True, "selections": [selection]},
+                full_match_mode=True,
+                player_ref=None,
+            )
+        )
+        self.assertTrue(
+            requires_candidate_tracking(
+                {},
+                {},
+                full_match_mode=False,
+                player_ref=None,
+            )
+        )
+
+        malformed_targets = (
+            {"confirmed": "false", "selections": [selection]},
+            {"confirmed": True, "selections": [{}]},
+            {"confirmed": True, "selections": ["junk"]},
+            {
+                "confirmed": True,
+                "selections": [
+                    {
+                        "time_sec": float("nan"),
+                        "bbox": {"x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+                    }
+                ],
+            },
+            {
+                "confirmed": True,
+                "selections": [
+                    {
+                        "time_sec": 719.003,
+                        "bbox": {"x": 0.58, "y": 0.46, "w": 0.0, "h": 0.54},
+                    }
+                ],
+            },
+        )
+        for malformed_target in malformed_targets:
+            with self.subTest(target=malformed_target):
+                self.assertTrue(
+                    requires_candidate_tracking(
+                        {},
+                        malformed_target,
+                        full_match_mode=True,
+                        player_ref=selection,
+                    )
+                )
+
+        malformed_player_refs = (
+            {},
+            {"t": "not-a-number", "x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+            {"t": float("inf"), "x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+            {"t": 719.003, "x": 0.58, "y": 0.46, "w": 0.0, "h": 0.54},
+        )
+        for malformed_player_ref in malformed_player_refs:
+            with self.subTest(player_ref=malformed_player_ref):
+                self.assertTrue(
+                    requires_candidate_tracking(
+                        {},
+                        {"confirmed": True, "selections": [selection]},
+                        full_match_mode=True,
+                        player_ref=malformed_player_ref,
+                    )
+                )
+
+    def test_run_analysis_uses_confirmed_selection_candidate_policy(self):
+        _, tree = self._pipeline_tree()
+        task = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_analysis"
+        )
+        policy_guards = [
+            node
+            for node in ast.walk(task)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "_requires_candidate_tracking"
+                for child in ast.walk(node.test)
+            )
+        ]
+        self.assertEqual(len(policy_guards), 1)
+
+        guarded_tracking_calls = [
+            node
+            for node in ast.walk(
+                ast.Module(body=policy_guards[0].body, type_ignores=[])
+            )
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "track_all_players"
+        ]
+        all_tracking_calls = [
+            node
+            for node in ast.walk(task)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "track_all_players"
+        ]
+
+        self.assertEqual(len(guarded_tracking_calls), 1)
+        self.assertEqual(
+            {node.lineno for node in all_tracking_calls},
+            {node.lineno for node in guarded_tracking_calls},
+        )
 
     def test_task_attempt_gate_precedes_every_job_update(self):
         _, tree = self._pipeline_tree()

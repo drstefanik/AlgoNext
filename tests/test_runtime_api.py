@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -191,6 +192,176 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertTrue(payload["data"]["already_active"])
         self.assertEqual(job.status, "RUNNING")
         inspect.assert_not_called()
+
+    def test_force_alone_does_not_supersede_an_active_job(self):
+        job = self.job(
+            status="RUNNING",
+            target={
+                "confirmed": True,
+                "analysis_attempt_id": "attempt-a",
+            },
+        )
+        with patch.object(runtime_api, "inspect_runtime") as inspect:
+            payload = runtime_api.retry_job(
+                "job-1",
+                self.request(),
+                payload={
+                    "force": True,
+                    "expected_analysis_attempt_id": "attempt-a",
+                },
+                db=DummyDB(job),
+            )
+        self.assertTrue(payload["data"]["already_active"])
+        self.assertEqual(job.target["analysis_attempt_id"], "attempt-a")
+        inspect.assert_not_called()
+
+    def test_string_flags_do_not_supersede_an_active_job(self):
+        job = self.job(
+            status="RUNNING",
+            target={
+                "confirmed": True,
+                "analysis_attempt_id": "attempt-a",
+            },
+        )
+        with patch.object(runtime_api, "inspect_runtime") as inspect:
+            payload = runtime_api.retry_job(
+                "job-1",
+                self.request(),
+                payload={
+                    "force": "false",
+                    "supersede_active": "false",
+                    "expected_analysis_attempt_id": "attempt-a",
+                },
+                db=DummyDB(job),
+            )
+        self.assertTrue(payload["data"]["already_active"])
+        self.assertEqual(job.target["analysis_attempt_id"], "attempt-a")
+        inspect.assert_not_called()
+
+    def test_legacy_active_job_cannot_be_superseded_without_nonce(self):
+        job = self.job(
+            status="RUNNING",
+            target={"confirmed": True},
+            progress={
+                "step": "TRACKING",
+                "updated_at": "2026-07-28T20:00:00+00:00",
+            },
+            updated_at=datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc),
+        )
+        with patch.object(runtime_api, "inspect_runtime") as inspect:
+            with self.assertRaises(HTTPException) as context:
+                runtime_api.retry_job(
+                    "job-1",
+                    self.request(),
+                    payload={
+                        "force": True,
+                        "supersede_active": True,
+                    },
+                    db=DummyDB(job),
+                )
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(
+            context.exception.detail["code"],
+            "ACTIVE_RETRY_ATTEMPT_REQUIRED",
+        )
+        self.assertEqual(job.status, "RUNNING")
+        inspect.assert_not_called()
+
+    def test_active_retry_stale_threshold_cannot_drop_below_fifteen_minutes(self):
+        with patch.dict(
+            "os.environ",
+            {"ACTIVE_RETRY_STALE_AFTER_SECONDS": "60"},
+            clear=False,
+        ):
+            self.assertEqual(
+                runtime_api._active_retry_stale_after_seconds(),
+                900.0,
+            )
+
+    def test_recent_active_job_cannot_be_superseded(self):
+        now = datetime(2026, 7, 28, 21, 45, tzinfo=timezone.utc)
+        job = self.job(
+            status="RUNNING",
+            target={
+                "confirmed": True,
+                "analysis_attempt_id": "attempt-a",
+            },
+            progress={
+                "step": "TRACKING",
+                "updated_at": (now - timedelta(seconds=30)).isoformat(),
+            },
+            updated_at=now - timedelta(seconds=30),
+        )
+        with patch.object(runtime_api, "_now", return_value=now), patch.object(
+            runtime_api, "inspect_runtime"
+        ) as inspect:
+            with self.assertRaises(HTTPException) as context:
+                runtime_api.retry_job(
+                    "job-1",
+                    self.request(),
+                    payload={
+                        "force": True,
+                        "supersede_active": True,
+                        "expected_analysis_attempt_id": "attempt-a",
+                    },
+                    db=DummyDB(job),
+                )
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertEqual(
+            context.exception.detail["code"],
+            "ACTIVE_RETRY_NOT_STALE",
+        )
+        self.assertEqual(job.status, "RUNNING")
+        self.assertEqual(job.target["analysis_attempt_id"], "attempt-a")
+        inspect.assert_not_called()
+
+    def test_stale_active_job_can_be_superseded_with_current_nonce(self):
+        now = datetime(2026, 7, 28, 21, 45, tzinfo=timezone.utc)
+        job = self.job(
+            status="RUNNING",
+            target={
+                "confirmed": True,
+                "full_match_mode": True,
+                "analysis_attempt_id": "attempt-a",
+            },
+            progress={
+                "step": "TRACKING_CANDIDATES",
+                "updated_at": (now - timedelta(minutes=30)).isoformat(),
+                "analysis_attempt_id": "attempt-a",
+            },
+            updated_at=now - timedelta(minutes=30),
+        )
+        db = DummyDB(job)
+        recorder = DelayRecorder()
+        pipeline = types.ModuleType("app.workers.pipeline")
+        pipeline.run_analysis = recorder
+        with patch.dict(sys.modules, {"app.workers.pipeline": pipeline}), patch.object(
+            runtime_api, "_now", return_value=now
+        ), patch.object(
+            runtime_api,
+            "inspect_runtime",
+            return_value=self.runtime_ready(),
+        ):
+            payload = runtime_api.retry_job(
+                "job-1",
+                self.request(),
+                payload={
+                    "force": True,
+                    "supersede_active": True,
+                    "expected_analysis_attempt_id": "attempt-a",
+                },
+                db=db,
+            )
+
+        attempt_b = payload["data"]["analysis_attempt_id"]
+        self.assertNotEqual(attempt_b, "attempt-a")
+        self.assertEqual(job.status, "QUEUED")
+        self.assertEqual(job.target["analysis_attempt_id"], attempt_b)
+        self.assertEqual(
+            job.result["retry_history"][-1]["previous_status"],
+            "RUNNING",
+        )
+        self.assertEqual(recorder.calls, [("job-1", attempt_b)])
 
     def test_stale_retry_cannot_rotate_newer_terminal_attempt(self):
         for force in (False, True):

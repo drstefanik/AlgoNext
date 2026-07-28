@@ -901,6 +901,26 @@ class ReIDProductionValidatorContractTests(unittest.TestCase):
             "\\\n              /tmp/selection-response.json",
             workflow,
         )
+        retry_marker = '"$API_BASE/jobs/$JOB_ID/retry"'
+        retry_index = workflow.index(retry_marker)
+        retry_curl_index = workflow.rfind("curl ", 0, retry_index)
+        retry_block = workflow[retry_curl_index:retry_index]
+        self.assertIn(
+            '-H "X-Analysis-Attempt-Id: $fixture_attempt_id"',
+            retry_block,
+        )
+        self.assertIn("--data @/tmp/supersede-active.json", retry_block)
+        self.assertNotIn("--retry", retry_block)
+        self.assertIn("force: true", workflow)
+        self.assertIn("supersede_active: true", workflow)
+        self.assertIn(
+            "Active regression fixture target is not confirmed",
+            workflow,
+        )
+        self.assertIn(
+            "Active regression fixture player_ref changed",
+            workflow,
+        )
 
 
 if __name__ == "__main__":
