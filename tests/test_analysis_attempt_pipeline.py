@@ -1,5 +1,6 @@
 import ast
 import copy
+import math
 import os
 import re
 import threading
@@ -111,6 +112,8 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
         loaded = {
             "AnalysisJob": object,
             "StaleAnalysisAttemptError": RuntimeError,
+            "math": math,
+            "normalize_anchors": normalize_anchors,
             "os": os,
             "re": re,
         }
@@ -200,18 +203,50 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
         self.assertEqual(job.progress["pct"], 100)
 
     def test_confirmed_selection_skips_redundant_candidate_tracking(self):
-        requires_candidate_tracking = self._load_helper("_requires_candidate_tracking")
-        selection = {
+        helpers = self._load_helpers(
+            {
+                "_confirmed_full_match_selections",
+                "_requires_candidate_tracking",
+            }
+        )
+        requires_candidate_tracking = helpers["_requires_candidate_tracking"]
+        job_id = "job-confirmed"
+        first_selection = {
             "time_sec": 719.003,
             "bbox": {"x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+            "frame_key": f"jobs/{job_id}/frames/frame_0001.jpg",
+        }
+        second_selection = {
+            "time_sec": 2157.009,
+            "bbox": {"x": 0.27, "y": 0.28, "w": 0.03, "h": 0.15},
+            "frame_key": f"jobs/{job_id}/frames/frame_0002.jpg",
+        }
+        target = {
+            "confirmed": True,
+            "full_match_mode": True,
+            "selections": [first_selection, second_selection],
         }
 
         self.assertFalse(
             requires_candidate_tracking(
                 {},
-                {"confirmed": True, "selections": [selection]},
+                target,
                 full_match_mode=True,
-                player_ref=selection,
+                player_ref=first_selection,
+                duration=5931.775,
+            )
+        )
+        self.assertFalse(
+            requires_candidate_tracking(
+                {},
+                {
+                    key: value
+                    for key, value in target.items()
+                    if key != "full_match_mode"
+                },
+                full_match_mode=True,
+                player_ref=first_selection,
+                duration=5931.775,
             )
         )
         self.assertFalse(
@@ -222,92 +257,336 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
                 player_ref=None,
             )
         )
-        self.assertTrue(
-            requires_candidate_tracking(
-                {},
-                {"confirmed": True, "selections": []},
-                full_match_mode=True,
-                player_ref=selection,
-            )
+        rejected_cases = (
+            (target, False, first_selection, 5931.775),
+            ({**target, "selections": []}, True, first_selection, 5931.775),
+            ({**target, "selections": [{}]}, True, first_selection, 5931.775),
+            ({**target, "confirmed": "true"}, True, first_selection, 5931.775),
+            (target, True, None, 5931.775),
+            (
+                target,
+                True,
+                {
+                    "time_sec": 720.0,
+                    "bbox": first_selection["bbox"],
+                    "frame_key": first_selection["frame_key"],
+                },
+                5931.775,
+            ),
+            (target, True, first_selection, 1000.0),
         )
-        self.assertTrue(
-            requires_candidate_tracking(
-                {},
-                {"confirmed": True, "selections": [selection]},
-                full_match_mode=False,
-                player_ref=selection,
-            )
-        )
-        self.assertTrue(
-            requires_candidate_tracking(
-                {},
-                {"confirmed": True, "selections": [selection]},
-                full_match_mode=True,
-                player_ref=None,
-            )
-        )
-        self.assertTrue(
-            requires_candidate_tracking(
-                {},
-                {},
-                full_match_mode=False,
-                player_ref=None,
-            )
-        )
-
-        malformed_targets = (
-            {"confirmed": "false", "selections": [selection]},
-            {"confirmed": True, "selections": [{}]},
-            {"confirmed": True, "selections": ["junk"]},
-            {
-                "confirmed": True,
-                "selections": [
-                    {
-                        "time_sec": float("nan"),
-                        "bbox": {"x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
-                    }
-                ],
-            },
-            {
-                "confirmed": True,
-                "selections": [
-                    {
-                        "time_sec": 719.003,
-                        "bbox": {"x": 0.58, "y": 0.46, "w": 0.0, "h": 0.54},
-                    }
-                ],
-            },
-        )
-        for malformed_target in malformed_targets:
-            with self.subTest(target=malformed_target):
+        for current_target, mode, player_ref, duration in rejected_cases:
+            with self.subTest(
+                target=current_target,
+                mode=mode,
+                player_ref=player_ref,
+                duration=duration,
+            ):
                 self.assertTrue(
                     requires_candidate_tracking(
                         {},
-                        malformed_target,
-                        full_match_mode=True,
-                        player_ref=selection,
+                        current_target,
+                        full_match_mode=mode,
+                        player_ref=player_ref,
+                        duration=duration,
                     )
                 )
 
-        malformed_player_refs = (
-            {},
-            {"t": "not-a-number", "x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
-            {"t": float("inf"), "x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
-            {"t": 719.003, "x": 0.58, "y": 0.46, "w": 0.0, "h": 0.54},
+    def test_confirmed_preview_reuse_requires_canonical_persisted_assets(self):
+        class FakeClientError(RuntimeError):
+            def __init__(self, code, *, status_code=None):
+                super().__init__(code)
+                self.response = {
+                    "Error": {"Code": code},
+                    "ResponseMetadata": {"HTTPStatusCode": status_code},
+                }
+
+        helpers = self._load_helpers(
+            {
+                "_confirmed_full_match_selections",
+                "_reusable_confirmed_full_match_preview_keys",
+                "_preview_objects_exist",
+            },
+            namespace={"ClientError": FakeClientError},
         )
-        for malformed_player_ref in malformed_player_refs:
-            with self.subTest(player_ref=malformed_player_ref):
-                self.assertTrue(
-                    requires_candidate_tracking(
-                        {},
-                        {"confirmed": True, "selections": [selection]},
+        reusable_keys = helpers["_reusable_confirmed_full_match_preview_keys"]
+        objects_exist = helpers["_preview_objects_exist"]
+        job_id = "job-confirmed"
+        bucket = "fnh"
+        first_key = f"jobs/{job_id}/frames/frame_0001.jpg"
+        second_key = f"jobs/{job_id}/frames/frame_0002.jpg"
+        first_selection = {
+            "time_sec": 719.003,
+            "bbox": {"x": 0.58, "y": 0.46, "w": 0.12, "h": 0.54},
+            "frame_key": first_key,
+        }
+        second_selection = {
+            "time_sec": 2157.009,
+            "bbox": {"x": 0.27, "y": 0.28, "w": 0.03, "h": 0.15},
+            "frame_key": second_key,
+        }
+        target = {
+            "confirmed": True,
+            "full_match_mode": True,
+            "selections": [first_selection, second_selection],
+        }
+        preview_frames = [
+            {
+                "time_sec": 719.003,
+                "bucket": bucket,
+                "key": first_key,
+            },
+            {
+                "time_sec": 2157.009,
+                "bucket": bucket,
+                "key": second_key,
+            },
+        ]
+
+        self.assertEqual(
+            reusable_keys(
+                job_id,
+                target,
+                first_selection,
+                preview_frames,
+                full_match_mode=True,
+                s3_bucket=bucket,
+                duration=5931.775,
+            ),
+            [first_key, second_key],
+        )
+        self.assertEqual(
+            reusable_keys(
+                job_id,
+                {
+                    key: value
+                    for key, value in target.items()
+                    if key != "full_match_mode"
+                },
+                first_selection,
+                preview_frames,
+                full_match_mode=True,
+                s3_bucket=bucket,
+                duration=5931.775,
+            ),
+            [first_key, second_key],
+        )
+
+        invalid_cases = (
+            ({**target, "confirmed": "true"}, first_selection, preview_frames),
+            (
+                target,
+                first_selection,
+                [
+                    {
+                        **preview_frames[0],
+                        "key": f"jobs/other/frames/frame_0001.jpg",
+                    },
+                    preview_frames[1],
+                ],
+            ),
+            (
+                target,
+                first_selection,
+                [
+                    {
+                        **preview_frames[0],
+                        "key": f"jobs/{job_id}/review/frame_0001.jpg",
+                    },
+                    preview_frames[1],
+                ],
+            ),
+            (
+                target,
+                first_selection,
+                [{**preview_frames[0], "time_sec": 718.0}, preview_frames[1]],
+            ),
+            (
+                target,
+                first_selection,
+                [
+                    {**preview_frames[0], "time_sec": float("nan")},
+                    preview_frames[1],
+                ],
+            ),
+            (
+                target,
+                first_selection,
+                [
+                    {**preview_frames[0], "time_sec": float("inf")},
+                    preview_frames[1],
+                ],
+            ),
+            (
+                target,
+                first_selection,
+                [{**preview_frames[0], "bucket": "other"}, preview_frames[1]],
+            ),
+            (
+                target,
+                {
+                    **first_selection,
+                    "time_sec": 720.0,
+                },
+                preview_frames,
+            ),
+            (
+                target,
+                first_selection,
+                [*preview_frames, dict(preview_frames[0])],
+            ),
+        )
+        for current_target, player_ref, frames in invalid_cases:
+            with self.subTest(
+                target=current_target,
+                player_ref=player_ref,
+                frames=frames,
+            ):
+                self.assertEqual(
+                    reusable_keys(
+                        job_id,
+                        current_target,
+                        player_ref,
+                        frames,
                         full_match_mode=True,
-                        player_ref=malformed_player_ref,
-                    )
+                        s3_bucket=bucket,
+                        duration=5931.775,
+                    ),
+                    [],
                 )
+
+        self.assertEqual(
+            reusable_keys(
+                job_id,
+                target,
+                first_selection,
+                preview_frames,
+                full_match_mode=True,
+                s3_bucket=bucket,
+                duration=1000.0,
+            ),
+            [],
+        )
+
+        class Store:
+            def __init__(self, lengths, error_code=None, status_code=None):
+                self.lengths = lengths
+                self.error_code = error_code
+                self.status_code = status_code
+
+            def head_object(self, *, Bucket, Key):
+                self.assert_bucket = Bucket
+                if self.error_code:
+                    raise FakeClientError(
+                        self.error_code,
+                        status_code=self.status_code,
+                    )
+                if Key not in self.lengths:
+                    raise FakeClientError("NoSuchKey")
+                return {"ContentLength": self.lengths[Key]}
+
+        self.assertTrue(
+            objects_exist(
+                Store({first_key: 128, second_key: 256}),
+                bucket,
+                [first_key, second_key],
+            )
+        )
+        self.assertFalse(
+            objects_exist(
+                Store({first_key: 128, second_key: 0}),
+                bucket,
+                [first_key, second_key],
+            )
+        )
+        self.assertFalse(objects_exist(Store({}), bucket, [first_key, second_key]))
+        self.assertFalse(
+            objects_exist(
+                Store({}, error_code="NoSuchObject"),
+                bucket,
+                [first_key, second_key],
+            )
+        )
+        self.assertFalse(
+            objects_exist(
+                Store({}, error_code="Unknown", status_code=404),
+                bucket,
+                [first_key, second_key],
+            )
+        )
+        with self.assertRaises(FakeClientError):
+            objects_exist(
+                Store({}, error_code="AccessDenied"),
+                bucket,
+                [first_key, second_key],
+            )
+
+    def test_missing_selection_preview_requires_reselection(self):
+        applied = []
+
+        def apply_outcome(job, payload):
+            applied.append(copy.deepcopy(payload))
+            job.warnings = ["PLAYER_RESELECTION_REQUIRED"]
+            return True
+
+        def set_test_progress(job, step, pct, message):
+            job.progress = {"step": step, "pct": pct, "message": message}
+
+        helper = self._load_helpers(
+            {"_require_selection_preview_reselection"},
+            namespace={
+                "_apply_tracking_outcome": apply_outcome,
+                "set_progress": set_test_progress,
+            },
+        )["_require_selection_preview_reselection"]
+        job = type(
+            "Job",
+            (),
+            {
+                "target": {
+                    "analysis_attempt_id": "attempt-a",
+                    "selections": [{}, {}],
+                },
+                "warnings": [],
+            },
+        )()
+
+        helper(job)
+
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0]["analysis_attempt_id"], "attempt-a")
+        self.assertEqual(applied[0]["anchors_total"], 2)
+        self.assertEqual(
+            applied[0]["tracking_status"],
+            "SELECTION_PREVIEW_UNAVAILABLE",
+        )
+        self.assertEqual(applied[0]["action_required"], "RESELECT_PLAYER")
+        self.assertIn("PLAYER_SELECTION_PREVIEW_UNAVAILABLE", job.warnings)
+        self.assertEqual(job.progress["step"], "WAITING_FOR_PLAYER")
 
     def test_run_analysis_uses_confirmed_selection_candidate_policy(self):
         _, tree = self._pipeline_tree()
+        candidate_policy = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_requires_candidate_tracking"
+        )
+        candidate_policy_calls = {
+            child.func.id
+            for child in ast.walk(candidate_policy)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        self.assertIn(
+            "_confirmed_full_match_selections",
+            candidate_policy_calls,
+        )
+        self.assertNotIn(
+            "_reusable_confirmed_full_match_preview_keys",
+            candidate_policy_calls,
+        )
+        self.assertNotIn("_preview_objects_exist", candidate_policy_calls)
+
         task = next(
             node
             for node in tree.body
@@ -348,6 +627,69 @@ class AnalysisAttemptPipelineTests(unittest.TestCase):
             {node.lineno for node in all_tracking_calls},
             {node.lineno for node in guarded_tracking_calls},
         )
+
+        preview_reuse_guards = [
+            node
+            for node in ast.walk(task)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "reuse_persisted_previews"
+        ]
+        self.assertEqual(len(preview_reuse_guards), 1)
+        regeneration_branch = ast.Module(
+            body=preview_reuse_guards[0].orelse,
+            type_ignores=[],
+        )
+        guarded_timestamp_calls = [
+            node
+            for node in ast.walk(regeneration_branch)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_build_preview_timestamps"
+        ]
+        all_timestamp_calls = [
+            node
+            for node in ast.walk(task)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_build_preview_timestamps"
+        ]
+        guarded_preview_writes = [
+            node
+            for node in ast.walk(regeneration_branch)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "preview_frames"
+        ]
+        self.assertEqual(len(guarded_timestamp_calls), 1)
+        self.assertEqual(
+            {node.lineno for node in all_timestamp_calls},
+            {node.lineno for node in guarded_timestamp_calls},
+        )
+        self.assertEqual(len(guarded_preview_writes), 1)
+
+        reselection_guards = [
+            node
+            for node in ast.walk(task)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(statement, ast.Expr)
+                and any(
+                    isinstance(child, ast.Name)
+                    and child.id == "_require_selection_preview_reselection"
+                    for child in ast.walk(statement)
+                )
+                for statement in node.body
+            )
+        ]
+        self.assertEqual(len(reselection_guards), 2)
+        for guard in reselection_guards:
+            self.assertTrue(
+                any(isinstance(child, ast.Return) for child in ast.walk(guard))
+            )
 
     def test_task_attempt_gate_precedes_every_job_update(self):
         _, tree = self._pipeline_tree()
