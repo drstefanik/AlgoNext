@@ -181,15 +181,15 @@ services:
       RECOVER_INTERRUPTED_JOBS_ON_WORKER_START: "1"
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-1}"
 
-      # CPU budget for full-match tracking. Long matches are sampled at roughly
-      # one frame per second with the nano detector instead of the historic
-      # fixed 5 FPS / small-model profile that exceeded the one-hour timeout.
-      FULL_MATCH_TARGET_SAMPLES: "${FULL_MATCH_TARGET_SAMPLES:-6000}"
+      # CPU budget for full-match tracking. Long matches default to a bounded
+      # two-frame-per-second small-model profile instead of the historic fixed
+      # 5 FPS profile that exceeded the one-hour timeout.
+      FULL_MATCH_TARGET_SAMPLES: "${FULL_MATCH_TARGET_SAMPLES:-12000}"
       FULL_MATCH_MIN_FPS: "${FULL_MATCH_MIN_FPS:-1}"
       FULL_MATCH_MAX_FPS: "${FULL_MATCH_MAX_FPS:-2}"
       FULL_MATCH_WINDOW_SEC: "${FULL_MATCH_WINDOW_SEC:-60}"
       FULL_MATCH_OVERLAP_SEC: "${FULL_MATCH_OVERLAP_SEC:-5}"
-      FULL_MATCH_DETECTOR_MODEL: "${FULL_MATCH_DETECTOR_MODEL:-yolo11n.pt}"
+      FULL_MATCH_DETECTOR_MODEL: "${FULL_MATCH_DETECTOR_MODEL:-yolo11s.pt}"
       PLAYER_REID_ANCHOR_FPS: "${PLAYER_REID_ANCHOR_FPS:-5}"
       PLAYER_REID_ANCHOR_DETECTOR_MODEL: "${PLAYER_REID_ANCHOR_DETECTOR_MODEL:-yolo11s.pt}"
       PLAYER_REID_MAX_CANDIDATES: "${PLAYER_REID_MAX_CANDIDATES:-4}"

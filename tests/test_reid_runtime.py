@@ -205,7 +205,7 @@ class ReIDRuntimeTests(unittest.TestCase):
         self.assertTrue(output["partial"])
         self.assertEqual(output["partial_reason"], "TRACKING_TIMEOUT")
         self.assertEqual(output["reid_summary"]["status"], "PARTIAL_TIMEOUT")
-        self.assertEqual(output["runtime_profile"]["fps"], 1)
+        self.assertEqual(output["runtime_profile"]["fps"], 2)
         mark_partial.assert_called_once()
 
     def test_disabled_legacy_timeout_is_also_partial(self):
@@ -278,6 +278,66 @@ class ReIDRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["detector_model"], "yolo11n.pt")
         self.assertEqual(output["runtime_profile"]["fps"], 1)
         self.assertLess(output["runtime_profile"]["estimated_samples"], 7000)
+
+    def test_long_match_defaults_use_two_fps_small_model_profile(self):
+        with patch.dict(os.environ, {}, clear=True):
+            profile = select_full_match_profile(
+                video_duration_sec=5931.775,
+                requested_fps=5,
+                requested_window_sec=45.0,
+                requested_overlap_sec=10.0,
+                requested_detector_model="yolo11s.pt",
+            )
+
+        self.assertEqual(profile.fps, 2)
+        self.assertEqual(profile.window_sec, 60.0)
+        self.assertEqual(profile.overlap_sec, 5.0)
+        self.assertEqual(profile.detector_model, "yolo11s.pt")
+        self.assertEqual(profile.target_samples, 12000)
+        self.assertEqual(profile.estimated_samples, 12943)
+
+    def test_long_match_explicit_quality_budget_overrides_remain_stable(self):
+        environment = {
+            "FULL_MATCH_TARGET_SAMPLES": "6000",
+            "FULL_MATCH_MIN_FPS": "1",
+            "FULL_MATCH_MAX_FPS": "2",
+            "FULL_MATCH_WINDOW_SEC": "60",
+            "FULL_MATCH_OVERLAP_SEC": "5",
+            "FULL_MATCH_DETECTOR_MODEL": "yolo11n.pt",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            profile = select_full_match_profile(
+                video_duration_sec=5931.775,
+                requested_fps=5,
+                requested_window_sec=45.0,
+                requested_overlap_sec=10.0,
+                requested_detector_model="yolo11s.pt",
+            )
+
+        self.assertEqual(profile.fps, 1)
+        self.assertEqual(profile.window_sec, 60.0)
+        self.assertEqual(profile.overlap_sec, 5.0)
+        self.assertEqual(profile.detector_model, "yolo11n.pt")
+        self.assertEqual(profile.target_samples, 6000)
+        self.assertEqual(profile.estimated_samples, 6472)
+
+    def test_forced_fps_override_remains_bounded_by_configured_max(self):
+        environment = {
+            "FULL_MATCH_TARGET_SAMPLES": "50000",
+            "FULL_MATCH_MIN_FPS": "1",
+            "FULL_MATCH_MAX_FPS": "2",
+            "FULL_MATCH_TRACKING_FPS": "9",
+            "FULL_MATCH_DETECTOR_MODEL": "custom-detector.pt",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            profile = select_full_match_profile(
+                video_duration_sec=5931.775,
+                requested_fps=10,
+            )
+
+        self.assertEqual(profile.fps, 2)
+        self.assertEqual(profile.detector_model, "custom-detector.pt")
+        self.assertEqual(profile.target_samples, 50000)
 
     def test_short_video_preserves_requested_quality_profile(self):
         with patch.dict(os.environ, {}, clear=True):

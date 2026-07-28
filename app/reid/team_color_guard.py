@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import subprocess
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -42,7 +44,9 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def team_color_guard_enabled() -> bool:
-    value = (os.environ.get("PLAYER_REID_TEAM_COLOR_GUARD_ENABLED") or "1").strip().lower()
+    value = (
+        (os.environ.get("PLAYER_REID_TEAM_COLOR_GUARD_ENABLED") or "1").strip().lower()
+    )
     return value not in {"0", "false", "no", "off"}
 
 
@@ -97,7 +101,7 @@ def _crop(frame: np.ndarray, bbox: Mapping[str, Any]) -> np.ndarray | None:
     y2 = int(round((normalized["y"] + normalized["h"]) * height))
     if x2 - x1 < 4 or y2 - y1 < 8:
         return None
-    return frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)].copy()
+    return frame[max(0, y1) : min(height, y2), max(0, x1) : min(width, x2)].copy()
 
 
 def extract_kit_color_signature(crop: np.ndarray) -> KitColorSignature | None:
@@ -122,28 +126,39 @@ def extract_kit_color_signature(crop: np.ndarray) -> KitColorSignature | None:
     center_y = (rows - 1) / 2.0
     spatial_weight = np.exp(
         -(((xx - center_x) / max(1.0, cols * 0.42)) ** 2)
-        -(((yy - center_y) / max(1.0, rows * 0.55)) ** 2)
+        - (((yy - center_y) / max(1.0, rows * 0.55)) ** 2)
     ).astype(np.float32)
     chroma_weight = 0.55 + 0.45 * (saturation / 255.0)
     weights = spatial_weight * chroma_weight
 
     family_index = np.full(hue.shape, COLOR_FAMILIES.index("NEUTRAL"), dtype=np.int16)
     black = value < 62
-    white = (saturation < 46) & (value >= 155)
+    # Broadcast/video compression and stadium shadows often tint a white jersey
+    # cyan while keeping it distinctly brighter and less saturated than grass.
+    white = (saturation < 90) & (value >= 145)
     neutral = (saturation < 58) & ~black & ~white
     chromatic = ~(black | white | neutral)
 
     family_index[black] = COLOR_FAMILIES.index("BLACK")
     family_index[white] = COLOR_FAMILIES.index("WHITE")
     family_index[neutral] = COLOR_FAMILIES.index("NEUTRAL")
-    family_index[chromatic & ((hue < 27) | (hue >= 168))] = COLOR_FAMILIES.index("RED_WARM")
+    family_index[chromatic & ((hue < 27) | (hue >= 168))] = COLOR_FAMILIES.index(
+        "RED_WARM"
+    )
     family_index[chromatic & (hue >= 27) & (hue < 39)] = COLOR_FAMILIES.index("YELLOW")
     family_index[chromatic & (hue >= 39) & (hue < 86)] = COLOR_FAMILIES.index("GREEN")
-    family_index[chromatic & (hue >= 86) & (hue < 136)] = COLOR_FAMILIES.index("CYAN_BLUE")
-    family_index[chromatic & (hue >= 136) & (hue < 168)] = COLOR_FAMILIES.index("PURPLE")
+    family_index[chromatic & (hue >= 86) & (hue < 136)] = COLOR_FAMILIES.index(
+        "CYAN_BLUE"
+    )
+    family_index[chromatic & (hue >= 136) & (hue < 168)] = COLOR_FAMILIES.index(
+        "PURPLE"
+    )
 
     totals = np.array(
-        [float(weights[family_index == index].sum()) for index in range(len(COLOR_FAMILIES))],
+        [
+            float(weights[family_index == index].sum())
+            for index in range(len(COLOR_FAMILIES))
+        ],
         dtype=np.float64,
     )
     total = float(totals.sum())
@@ -152,7 +167,9 @@ def extract_kit_color_signature(crop: np.ndarray) -> KitColorSignature | None:
     distribution = totals / total
     dominant_index = int(np.argmax(distribution))
     dominant_share = float(distribution[dominant_index])
-    entropy = -float(np.sum(distribution * np.log(distribution + 1e-12))) / math.log(len(COLOR_FAMILIES))
+    entropy = -float(np.sum(distribution * np.log(distribution + 1e-12))) / math.log(
+        len(COLOR_FAMILIES)
+    )
     gray = cv2.cvtColor(torso, cv2.COLOR_BGR2GRAY)
     sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
     size_score = min(1.0, (width * height) / float(24 * 48))
@@ -210,21 +227,82 @@ def signatures_compatible(
 
 class _VideoReader:
     def __init__(self, path: str | Path):
-        self.cap = cv2.VideoCapture(str(path))
-        if not self.cap.isOpened():
-            self.cap.release()
-            raise RuntimeError(f"unable to open video for kit-colour guard: {path}")
+        self.path = str(path)
+        self._cache: OrderedDict[float, np.ndarray | None] = OrderedDict()
+        self._cache_size = _env_int("PLAYER_REID_FRAME_CACHE_SIZE", 8, 1, 64)
 
     def read(self, time_sec: float) -> np.ndarray | None:
-        self.cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(time_sec)) * 1000.0)
-        ok, frame = self.cap.read()
-        return frame if ok else None
+        timestamp = round(max(0.0, float(time_sec)), 6)
+        if timestamp in self._cache:
+            self._cache.move_to_end(timestamp)
+            return self._cache[timestamp]
+
+        timeout = _env_float("PLAYER_REID_FRAME_DECODE_TIMEOUT_SEC", 30.0, 1.0, 120.0)
+        try:
+            completed = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{timestamp:.6f}",
+                    "-accurate_seek",
+                    "-i",
+                    self.path,
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    "1",
+                    "-an",
+                    "-sn",
+                    "-dn",
+                    "-f",
+                    "image2pipe",
+                    "-c:v",
+                    "png",
+                    "pipe:1",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.warning(
+                "Exact ffmpeg frame extraction failed path=%s time_sec=%.6f",
+                self.path,
+                timestamp,
+                exc_info=True,
+            )
+            frame = None
+        else:
+            frame = None
+            if completed.returncode == 0 and completed.stdout:
+                encoded = np.frombuffer(completed.stdout, dtype=np.uint8)
+                frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if frame is None:
+                logger.warning(
+                    "Exact ffmpeg frame extraction returned no decodable frame "
+                    "path=%s time_sec=%.6f returncode=%s stderr=%s",
+                    self.path,
+                    timestamp,
+                    completed.returncode,
+                    completed.stderr.decode("utf-8", errors="replace")[-500:],
+                )
+        self._cache[timestamp] = frame
+        if len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return frame
 
     def close(self) -> None:
-        self.cap.release()
+        self._cache.clear()
 
 
-def _sample_evenly(items: Sequence[Mapping[str, Any]], count: int) -> list[Mapping[str, Any]]:
+def _sample_evenly(
+    items: Sequence[Mapping[str, Any]], count: int
+) -> list[Mapping[str, Any]]:
     if not items or count <= 0:
         return []
     if len(items) <= count:
@@ -335,13 +413,365 @@ def _anchor_geometry_evidence(
     }
 
 
+def _manual_anchor_candidates(
+    output: Mapping[str, Any],
+    acquisition: Mapping[str, Any],
+    player_ref: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    anchors_used = (
+        output.get("anchors_used")
+        if isinstance(output.get("anchors_used"), Mapping)
+        else {}
+    )
+    selections = [
+        dict(item)
+        for item in (anchors_used.get("selections") or [])
+        if isinstance(item, Mapping)
+    ]
+    raw_matches = output.get("anchor_matches")
+    if not isinstance(raw_matches, list):
+        reid_summary = (
+            output.get("reid_summary")
+            if isinstance(output.get("reid_summary"), Mapping)
+            else {}
+        )
+        raw_matches = reid_summary.get("anchor_matches")
+    matches = [dict(item) for item in (raw_matches or []) if isinstance(item, Mapping)]
+
+    if selections:
+        candidates: list[dict[str, Any]] = []
+        for offset, selection in enumerate(selections, start=1):
+            raw_anchor_id = selection.get("anchor_id", offset)
+            try:
+                anchor_id: Any = int(raw_anchor_id)
+            except (TypeError, ValueError):
+                anchor_id = raw_anchor_id
+
+            match = next(
+                (
+                    item
+                    for item in matches
+                    if str(item.get("anchor_id")) == str(anchor_id)
+                ),
+                None,
+            )
+            if match is None and selection.get("frame_key"):
+                match = next(
+                    (
+                        item
+                        for item in matches
+                        if item.get("frame_key") == selection.get("frame_key")
+                    ),
+                    None,
+                )
+            if match is None:
+                try:
+                    selection_time = float(
+                        selection.get("t", selection.get("best_time_sec"))
+                    )
+                except (TypeError, ValueError):
+                    selection_time = -1.0
+                if selection_time >= 0:
+                    match = next(
+                        (
+                            item
+                            for item in matches
+                            if item.get("time_sec") is not None
+                            and abs(float(item["time_sec"]) - selection_time) <= 0.001
+                        ),
+                        None,
+                    )
+
+            reference = dict(selection)
+            reference["anchor_id"] = anchor_id
+            if match is not None:
+                reference.setdefault("t", match.get("time_sec"))
+                reference.setdefault("frame_key", match.get("frame_key"))
+            candidates.append(
+                {
+                    "anchor_id": anchor_id,
+                    "reference": reference,
+                    "match": match,
+                    "match_status": (
+                        str(match.get("status") or "").upper()
+                        if match is not None
+                        else "NOT_REPORTED"
+                    ),
+                    "is_seed": str(anchor_id) == str(acquisition.get("seed_anchor_id")),
+                    "legacy": False,
+                }
+            )
+        return candidates
+
+    seed_anchor = acquisition.get("seed_anchor")
+    reference = (
+        dict(seed_anchor) if isinstance(seed_anchor, Mapping) else dict(player_ref)
+    )
+    return [
+        {
+            "anchor_id": acquisition.get("seed_anchor_id"),
+            "reference": reference,
+            "match": None,
+            "match_status": "LEGACY",
+            "is_seed": True,
+            "legacy": True,
+        }
+    ]
+
+
+def _anchor_segment_indices(
+    segments: Sequence[Mapping[str, Any]],
+    accepted_indices: Sequence[int],
+    candidate: Mapping[str, Any],
+) -> list[int]:
+    accepted = set(accepted_indices)
+    match = candidate.get("match")
+    if isinstance(match, Mapping):
+        try:
+            window_index = int(match.get("window_index"))
+        except (TypeError, ValueError):
+            window_index = -1
+        if window_index >= 0:
+            explicit = [
+                index
+                for index in accepted_indices
+                if str(segments[index].get("window_index")) == str(window_index)
+            ]
+            if explicit:
+                return explicit[:1]
+            # Windowed ReID emits segments in window-index order. Do not fall back
+            # to an overlapping window when the match names its exact window.
+            return [window_index] if window_index in accepted else []
+
+        try:
+            match_start = float(match.get("window_start"))
+            match_end = float(match.get("window_end"))
+        except (TypeError, ValueError):
+            match_start = match_end = -1.0
+        if match_start >= 0 and match_end >= match_start:
+            exact = [
+                index
+                for index in accepted_indices
+                if abs(float(segments[index].get("window_start") or 0.0) - match_start)
+                <= 0.001
+                and abs(float(segments[index].get("window_end") or 0.0) - match_end)
+                <= 0.001
+            ]
+            if exact:
+                return exact[:1]
+
+    reference = candidate.get("reference")
+    try:
+        anchor_time = float(reference.get("t", reference.get("best_time_sec")))
+    except (AttributeError, TypeError, ValueError):
+        anchor_time = -1.0
+
+    if candidate.get("legacy"):
+        directional = [
+            index
+            for index in accepted_indices
+            if str(segments[index].get("direction") or "").lower() == "anchor"
+        ]
+        if directional:
+            return directional[:1]
+
+    if anchor_time < 0:
+        return []
+    containing = [
+        index
+        for index in accepted_indices
+        if float(segments[index].get("window_start") or 0.0)
+        <= anchor_time
+        <= float(segments[index].get("window_end") or 0.0)
+    ]
+    return containing[:1]
+
+
+def _select_guard_anchor(
+    read_frame: Callable[[float], np.ndarray | None],
+    output: Mapping[str, Any],
+    acquisition: Mapping[str, Any],
+    player_ref: Mapping[str, Any],
+    segments: Sequence[Mapping[str, Any]],
+    accepted_indices: Sequence[int],
+) -> dict[str, Any]:
+    confidence_gate = _env_float(
+        "PLAYER_REID_TEAM_COLOR_MIN_CONFIDENCE", 0.42, 0.0, 1.0
+    )
+    candidates = _manual_anchor_candidates(output, acquisition, player_ref)
+    usable: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        reference = candidate["reference"]
+        matched = candidate["match_status"] in {"MATCHED", "LEGACY"}
+        segment_indices = (
+            _anchor_segment_indices(segments, accepted_indices, candidate)
+            if matched
+            else []
+        )
+        geometry = _anchor_geometry_evidence(
+            segments,
+            segment_indices,
+            reference,
+        )
+        signature = (
+            _anchor_signature(read_frame, reference)
+            if matched and geometry["passed"]
+            else None
+        )
+        reason_codes: list[str] = []
+        if not matched:
+            reason_codes.append("ANCHOR_NOT_MATCHED")
+        elif not geometry["passed"]:
+            reason_codes.extend(geometry["reason_codes"])
+        if matched and geometry["passed"] and signature is None:
+            reason_codes.append("ANCHOR_KIT_COLOR_UNAVAILABLE")
+        elif (
+            matched
+            and geometry["passed"]
+            and signature is not None
+            and signature.confidence < confidence_gate
+        ):
+            reason_codes.append("ANCHOR_KIT_COLOR_LOW_CONFIDENCE")
+
+        is_usable = bool(
+            matched
+            and geometry["passed"]
+            and signature is not None
+            and signature.confidence >= confidence_gate
+        )
+        evaluated = {
+            **candidate,
+            "segment_indices": segment_indices,
+            "geometry": geometry,
+            "signature": signature,
+            "usable": is_usable,
+            "reason_codes": list(dict.fromkeys(reason_codes)),
+        }
+        if is_usable:
+            usable.append(evaluated)
+        diagnostics.append(evaluated)
+
+    conflicts: list[dict[str, Any]] = []
+    for left_index, left in enumerate(usable):
+        for right in usable[left_index + 1 :]:
+            compatible = signatures_compatible(
+                left["signature"],
+                right["signature"],
+                minimum_confidence=confidence_gate,
+            )
+            if compatible is False:
+                conflicts.append(
+                    {
+                        "left_anchor_id": left["anchor_id"],
+                        "right_anchor_id": right["anchor_id"],
+                        "similarity": round(
+                            signature_similarity(left["signature"], right["signature"]),
+                            6,
+                        ),
+                    }
+                )
+
+    selected: dict[str, Any] | None = None
+    reason_codes: list[str] = []
+    prototype_status = "SELECTED"
+    if conflicts:
+        prototype_status = "CONFLICT"
+        reason_codes.append("ANCHOR_KIT_COLOR_CONFLICT")
+    elif usable:
+        selected = max(
+            usable,
+            key=lambda item: (
+                item["signature"].confidence,
+                item["signature"].quality,
+                bool(item["is_seed"]),
+            ),
+        )
+    else:
+        low_confidence = any(
+            "ANCHOR_KIT_COLOR_LOW_CONFIDENCE" in item["reason_codes"]
+            for item in diagnostics
+        )
+        unavailable = any(
+            "ANCHOR_KIT_COLOR_UNAVAILABLE" in item["reason_codes"]
+            for item in diagnostics
+        )
+        if low_confidence:
+            prototype_status = "LOW_CONFIDENCE"
+            reason_codes.append("ANCHOR_KIT_COLOR_LOW_CONFIDENCE")
+        elif unavailable:
+            prototype_status = "UNAVAILABLE"
+            reason_codes.append("ANCHOR_KIT_COLOR_UNAVAILABLE")
+        else:
+            prototype_status = "GEOMETRY_REJECTED"
+            for item in diagnostics:
+                reason_codes.extend(item["geometry"]["reason_codes"])
+            if not reason_codes:
+                reason_codes.append("ANCHOR_GEOMETRY_UNAVAILABLE")
+
+    diagnostic_payloads: list[dict[str, Any]] = []
+    for item in diagnostics:
+        state = (
+            "SELECTED"
+            if item is selected
+            else ("USABLE" if item["usable"] else "REJECTED")
+        )
+        diagnostic_payloads.append(
+            {
+                "anchor_id": item["anchor_id"],
+                "match_status": item["match_status"],
+                "state": state,
+                "is_seed": item["is_seed"],
+                "window_indices": item["segment_indices"],
+                "geometry": item["geometry"],
+                "signature": (
+                    item["signature"].to_payload()
+                    if item["signature"] is not None
+                    else None
+                ),
+                "reason_codes": item["reason_codes"],
+            }
+        )
+
+    return {
+        "selected": selected,
+        "candidates": diagnostics,
+        "candidate_diagnostics": diagnostic_payloads,
+        "prototype_status": prototype_status,
+        "conflicts": conflicts,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "confidence_gate": confidence_gate,
+    }
+
+
 def _segment_color_evidence(
     read_frame: Callable[[float], np.ndarray | None],
     segment: Mapping[str, Any],
     anchor: KitColorSignature,
+    *,
+    anchor_times: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     max_samples = _env_int("PLAYER_REID_TEAM_COLOR_SAMPLES_PER_SEGMENT", 5, 1, 12)
-    bboxes = [item for item in (segment.get("bboxes") or []) if isinstance(item, Mapping)]
+    bboxes = [
+        item for item in (segment.get("bboxes") or []) if isinstance(item, Mapping)
+    ]
+    maximum_anchor_delta = _env_float(
+        "PLAYER_REID_ANCHOR_MAX_TIME_DELTA_SEC", 1.25, 0.0, 5.0
+    )
+    if anchor_times:
+        local_bboxes: list[Mapping[str, Any]] = []
+        for bbox in bboxes:
+            try:
+                bbox_time = float(bbox.get("t"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                min(abs(bbox_time - anchor_time) for anchor_time in anchor_times)
+                <= maximum_anchor_delta
+            ):
+                local_bboxes.append(bbox)
+        bboxes = local_bboxes
     evidence: list[dict[str, Any]] = []
     compatible_count = 0
     incompatible_count = 0
@@ -395,6 +825,11 @@ def _segment_color_evidence(
     return {
         "version": GUARD_VERSION,
         "passed": passed,
+        "sampling_mode": ("ANCHOR_NEIGHBORHOOD" if anchor_times else "SEGMENT_EVEN"),
+        "anchor_times": (
+            [round(value, 6) for value in anchor_times] if anchor_times else []
+        ),
+        "maximum_anchor_delta_sec": (maximum_anchor_delta if anchor_times else None),
         "compatible_samples": compatible_count,
         "incompatible_samples": incompatible_count,
         "unknown_samples": unknown_count,
@@ -404,10 +839,14 @@ def _segment_color_evidence(
     }
 
 
-def _abstain_segment(segment: Mapping[str, Any], guard: Mapping[str, Any], reason: str) -> dict[str, Any]:
+def _abstain_segment(
+    segment: Mapping[str, Any], guard: Mapping[str, Any], reason: str
+) -> dict[str, Any]:
     updated = dict(segment)
     reid = dict(updated.get("reid") or {})
-    original_candidate = reid.get("selected_candidate_id") or updated.get("selected_track_id")
+    original_candidate = reid.get("selected_candidate_id") or updated.get(
+        "selected_track_id"
+    )
     reasons = list(dict.fromkeys([*(reid.get("reason_codes") or []), reason]))
     reid.update(
         {
@@ -432,7 +871,9 @@ def _abstain_segment(segment: Mapping[str, Any], guard: Mapping[str, Any], reaso
     return updated
 
 
-def _coverage_pct(segments: Sequence[Mapping[str, Any]], duration: float, fps: float) -> float:
+def _coverage_pct(
+    segments: Sequence[Mapping[str, Any]], duration: float, fps: float
+) -> float:
     if duration <= 0 or fps <= 0:
         return 0.0
     observed = {
@@ -483,16 +924,17 @@ def apply_team_color_guard(
             if isinstance(output.get("anchor_acquisition"), Mapping)
             else {}
         )
-        seed_anchor = acquisition.get("seed_anchor")
-        guard_anchor = (
-            seed_anchor if isinstance(seed_anchor, Mapping) else player_ref
-        )
-        anchor = _anchor_signature(frame_reader, guard_anchor)
-        segments = [dict(item) if isinstance(item, Mapping) else {} for item in raw_segments]
+        segments = [
+            dict(item) if isinstance(item, Mapping) else {} for item in raw_segments
+        ]
         accepted_indices: list[int] = []
         for index, segment in enumerate(segments):
-            reid = segment.get("reid") if isinstance(segment.get("reid"), Mapping) else {}
-            identity_status = str(reid.get("status") or segment.get("identity_status") or "").upper()
+            reid = (
+                segment.get("reid") if isinstance(segment.get("reid"), Mapping) else {}
+            )
+            identity_status = str(
+                reid.get("status") or segment.get("identity_status") or ""
+            ).upper()
             if (
                 bool(segment.get("bboxes"))
                 and segment.get("selected_track_id") is not None
@@ -500,50 +942,71 @@ def apply_team_color_guard(
             ):
                 accepted_indices.append(index)
 
-        try:
-            anchor_time = float(
-                guard_anchor.get("t", guard_anchor.get("best_time_sec"))
-            )
-        except (TypeError, ValueError):
-            anchor_time = -1.0
-        anchor_indices = [
-            index
-            for index in accepted_indices
-            if str(segments[index].get("direction") or "").lower() == "anchor"
-        ]
-        if not anchor_indices and anchor_time >= 0:
-            anchor_indices = [
-                index
-                for index in accepted_indices
-                if float(segments[index].get("window_start") or 0.0)
-                <= anchor_time
-                <= float(segments[index].get("window_end") or 0.0)
-            ][:1]
-
         decisions: list[dict[str, Any]] = []
-        anchor_failed = False
         reason_codes = ["TEAM_COLOR_GUARD_EXPERIMENTAL"]
-        anchor_geometry = _anchor_geometry_evidence(
+        selection = _select_guard_anchor(
+            frame_reader,
+            output,
+            acquisition,
+            player_ref,
             segments,
-            anchor_indices,
-            guard_anchor,
+            accepted_indices,
         )
-        if not anchor_geometry["passed"]:
-            anchor_failed = True
-            reason_codes.extend(anchor_geometry["reason_codes"])
+        selected_anchor = selection["selected"]
+        anchor_failed = selected_anchor is None
+        reason_codes.extend(selection["reason_codes"])
+        anchor = selected_anchor["signature"] if selected_anchor is not None else None
+        selected_anchor_indices = (
+            selected_anchor["segment_indices"] if selected_anchor is not None else []
+        )
+        anchor_geometry = (
+            selected_anchor["geometry"]
+            if selected_anchor is not None
+            else (
+                selection["candidates"][0]["geometry"]
+                if selection["candidates"]
+                else {
+                    "passed": False,
+                    "reason_codes": ["ANCHOR_GEOMETRY_UNAVAILABLE"],
+                    "nearest_time_sec": None,
+                    "time_delta_sec": None,
+                    "iou": 0.0,
+                }
+            )
+        )
 
-        if anchor is None:
-            anchor_failed = True
-            reason_codes.append("ANCHOR_KIT_COLOR_UNAVAILABLE")
-        else:
+        if anchor is not None:
+            anchor_times_by_segment: dict[int, list[float]] = {}
+            for candidate in selection["candidates"]:
+                if not candidate["usable"]:
+                    continue
+                try:
+                    candidate_time = float(
+                        candidate["reference"].get(
+                            "t", candidate["reference"].get("best_time_sec")
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+                for segment_index in candidate["segment_indices"]:
+                    anchor_times_by_segment.setdefault(segment_index, []).append(
+                        candidate_time
+                    )
+
             for index in accepted_indices:
-                segment_guard = _segment_color_evidence(frame_reader, segments[index], anchor)
+                anchor_times = anchor_times_by_segment.get(index)
+                segment_guard = _segment_color_evidence(
+                    frame_reader,
+                    segments[index],
+                    anchor,
+                    anchor_times=anchor_times,
+                )
                 decisions.append({"window_index": index, **segment_guard})
                 if not segment_guard["passed"]:
                     segments[index] = _abstain_segment(
                         segments[index], segment_guard, "KIT_COLOR_GUARD_REJECTED"
                     )
-                    if index in anchor_indices:
+                    if index in selected_anchor_indices:
                         anchor_failed = True
 
         if anchor_failed:
@@ -551,7 +1014,11 @@ def apply_team_color_guard(
             for index in accepted_indices:
                 if segments[index].get("bboxes"):
                     guard = next(
-                        (item for item in decisions if item.get("window_index") == index),
+                        (
+                            item
+                            for item in decisions
+                            if item.get("window_index") == index
+                        ),
                         {
                             "version": GUARD_VERSION,
                             "passed": False,
@@ -578,6 +1045,13 @@ def apply_team_color_guard(
             "validated": False,
             "anchor_signature": anchor.to_payload() if anchor is not None else None,
             "seed_anchor_id": acquisition.get("seed_anchor_id"),
+            "guard_anchor_id": (
+                selected_anchor["anchor_id"] if selected_anchor is not None else None
+            ),
+            "prototype_status": selection["prototype_status"],
+            "prototype_confidence_gate": selection["confidence_gate"],
+            "anchor_candidates": selection["candidate_diagnostics"],
+            "anchor_conflicts": selection["conflicts"],
             "anchor_geometry": anchor_geometry,
             "segments_checked": len(accepted_indices),
             "segments_rejected": max(0, len(accepted_indices) - segments_with_player),
@@ -585,7 +1059,9 @@ def apply_team_color_guard(
             "reason_codes": list(dict.fromkeys(reason_codes)),
             "decisions": decisions,
         }
-        summary["status"] = "ANCHOR_REJECTED" if anchor_failed else "EXPERIMENTAL_GUARDED"
+        summary["status"] = (
+            "ANCHOR_REJECTED" if anchor_failed else "EXPERIMENTAL_GUARDED"
+        )
         summary["validated"] = False
         summary["reason_codes"] = list(
             dict.fromkeys([*(summary.get("reason_codes") or []), *reason_codes])
@@ -599,22 +1075,16 @@ def apply_team_color_guard(
                 "segments_with_player": segments_with_player,
                 "coverage_pct_total": round(coverage, 2),
                 "coverage_pct": round(coverage, 2),
-                "largest_gap_sec": (
-                    None if tracking_failed else round(largest_gap, 2)
-                ),
+                "largest_gap_sec": (None if tracking_failed else round(largest_gap, 2)),
                 "tracking_success": not tracking_failed,
                 "tracking_status": (
                     "ANCHOR_REJECTED"
                     if anchor_failed
                     else (
-                        "NO_PLAYER_TRACK"
-                        if segments_with_player == 0
-                        else "SUCCEEDED"
+                        "NO_PLAYER_TRACK" if segments_with_player == 0 else "SUCCEEDED"
                     )
                 ),
-                "action_required": (
-                    "RESELECT_PLAYER" if tracking_failed else None
-                ),
+                "action_required": ("RESELECT_PLAYER" if tracking_failed else None),
                 "reid_summary": summary,
             }
         )
@@ -651,7 +1121,9 @@ def _repersist_guarded_output(output: dict[str, Any], job_id: str) -> dict[str, 
             expires_seconds=expires_seconds,
         )
     except Exception:
-        logger.exception("Unable to persist kit-colour-guarded tracking output job_id=%s", job_id)
+        logger.exception(
+            "Unable to persist kit-colour-guarded tracking output job_id=%s", job_id
+        )
         return output
 
 
@@ -668,7 +1140,9 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
         if not isinstance(output.get("segments"), list):
             return output
         if len(args) < 3 or not isinstance(args[2], Mapping):
-            logger.warning("Kit-colour guard skipped because the player reference is unavailable")
+            logger.warning(
+                "Kit-colour guard skipped because the player reference is unavailable"
+            )
             return output
         try:
             corrected = apply_team_color_guard(
@@ -677,7 +1151,9 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
                 player_ref=args[2],
             )
         except Exception:
-            logger.exception("Kit-colour guard failed; clearing accepted identity links")
+            logger.exception(
+                "Kit-colour guard failed; clearing accepted identity links"
+            )
             corrected = dict(output)
             segments = []
             for raw in output.get("segments") or []:
@@ -720,7 +1196,9 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
         return _repersist_guarded_output(corrected, job_id) if job_id else corrected
 
     guarded.__name__ = getattr(implementation, "__name__", "guarded_windowed_reid")
-    guarded.__doc__ = "Windowed Player ReID with a fail-closed manual-anchor kit-colour gate."
+    guarded.__doc__ = (
+        "Windowed Player ReID with a fail-closed manual-anchor kit-colour gate."
+    )
     setattr(guarded, "__algonext_team_color_guard__", True)
     setattr(guarded, "__algonext_original_reid__", implementation)
     return guarded
