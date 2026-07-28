@@ -94,10 +94,10 @@ jobs:
           curl -fsS --retry 4 --retry-all-errors --max-time 60 \
             "$API_BASE/jobs/$JOB_ID?view=full" > /tmp/fixture-before.json
           fixture_status="$(jq -r '.data.status // empty' /tmp/fixture-before.json)"
+          fixture_active=false
           case "$fixture_status" in
             QUEUED|RUNNING|PROCESSING)
-              echo "Regression fixture is already active: $fixture_status" >&2
-              exit 1
+              fixture_active=true
               ;;
           esac
           input_bucket="$(jq -r '.data.result.assets.input_video.bucket // empty' /tmp/fixture-before.json)"
@@ -227,6 +227,118 @@ jobs:
               '.data.target.analysis_attempt_id // .data.target.analysisAttemptId // empty' \
               /tmp/fixture-before.json
           )"
+          if [ "$fixture_active" = "true" ]; then
+            test -n "$fixture_attempt_id"
+            python - <<'PY'
+          import json
+          import math
+          from pathlib import Path
+
+          before = json.loads(Path('/tmp/fixture-before.json').read_text())
+          job = before.get('data') or before
+          target = job.get('target') or {}
+          if target.get('confirmed') is not True:
+              raise SystemExit('Active regression fixture target is not confirmed')
+          if target.get('full_match_mode') is not True:
+              raise SystemExit('Active regression fixture lost full_match_mode=true')
+          expected = sorted(
+              json.loads(
+                  Path('/tmp/regression-selection.json').read_text()
+              ).get('selections') or [],
+              key=lambda item: float(item['frameTimeSec']),
+          )
+          actual = sorted(
+              target.get('selections') or [],
+              key=lambda item: float(item.get('frame_time_sec')),
+          )
+          if len(actual) != len(expected):
+              raise SystemExit('Active regression fixture selection count changed')
+          for saved, requested in zip(actual, expected):
+              if saved.get('frame_key') != requested['frameKey']:
+                  raise SystemExit('Active regression fixture frame key changed')
+              if not math.isclose(
+                  float(saved.get('frame_time_sec')),
+                  float(requested['frameTimeSec']),
+                  abs_tol=0.01,
+              ):
+                  raise SystemExit('Active regression fixture timestamp changed')
+              for key, expected_value in requested['bbox'].items():
+                  if not math.isclose(
+                      float(saved.get(key)),
+                      float(expected_value),
+                      abs_tol=1e-9,
+                  ):
+                      raise SystemExit(
+                          f'Active regression fixture bbox changed: {key}'
+                      )
+          primary = expected[0]
+          player_ref = job.get('player_ref') or {}
+          for key, expected_value in {
+              't': primary['frameTimeSec'],
+              **primary['bbox'],
+          }.items():
+              if not math.isclose(
+                  float(player_ref.get(key)),
+                  float(expected_value),
+                  abs_tol=1e-9,
+              ):
+                  raise SystemExit(
+                      f'Active regression fixture player_ref changed: {key}'
+                  )
+          PY
+            jq -n \
+              --arg expected_analysis_attempt_id "$fixture_attempt_id" \
+              '{
+                force: true,
+                supersede_active: true,
+                expected_analysis_attempt_id: $expected_analysis_attempt_id
+              }' > /tmp/supersede-active.json
+            curl -fsS --max-time 60 \
+              -X POST \
+              -H 'Accept: application/json' \
+              -H 'Content-Type: application/json' \
+              -H "X-Analysis-Attempt-Id: $fixture_attempt_id" \
+              --data @/tmp/supersede-active.json \
+              "$API_BASE/jobs/$JOB_ID/retry" \
+              | tee /tmp/enqueue-response.json
+            retry_status="$(
+              jq -r '.data.status // empty' /tmp/enqueue-response.json
+            )"
+            case "$retry_status" in
+              QUEUED|RUNNING|PROCESSING) ;;
+              *)
+                echo "Active fixture supersede did not enqueue: $retry_status" >&2
+                exit 1
+                ;;
+            esac
+            python - <<'PY'
+          import json
+          import uuid
+          from pathlib import Path
+
+          enqueue = json.loads(Path('/tmp/enqueue-response.json').read_text())
+          enqueue_data = enqueue.get('data') or enqueue
+          attempt_id = str(enqueue_data.get('analysis_attempt_id') or '')
+          if str(uuid.UUID(attempt_id)) != attempt_id.lower():
+              raise SystemExit('Retry returned a non-canonical attempt UUID')
+          before = json.loads(Path('/tmp/fixture-before.json').read_text())
+          before = before.get('data') or before
+          before_target = before.get('target') or {}
+          before_result = before.get('result') or {}
+          previous = {
+              str(value)
+              for value in (
+                  before_target.get('analysis_attempt_id'),
+                  before_result.get('analysis_attempt_id'),
+              )
+              if value
+          }
+          if attempt_id in previous:
+              raise SystemExit('Retry reused a previous analysis attempt')
+          Path('/tmp/enqueue-attempt-id.txt').write_text(attempt_id + '\n')
+          PY
+            exit 0
+          fi
           player_ref_attempt_header=()
           if [ -n "$fixture_attempt_id" ]; then
             player_ref_attempt_header=(

@@ -35,6 +35,46 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _active_retry_stale_after_seconds() -> float:
+    try:
+        configured = float(
+            os.environ.get("ACTIVE_RETRY_STALE_AFTER_SECONDS", "900") or 900
+        )
+    except (TypeError, ValueError):
+        configured = 900.0
+    return max(900.0, configured)
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _active_retry_age_seconds(job: AnalysisJob) -> float | None:
+    progress = job.progress if isinstance(job.progress, dict) else {}
+    timestamps = (
+        _as_utc_datetime(progress.get("updated_at")),
+        _as_utc_datetime(getattr(job, "updated_at", None)),
+    )
+    latest = max((value for value in timestamps if value is not None), default=None)
+    if latest is None:
+        return None
+    return max(0.0, (_now() - latest).total_seconds())
+
+
 def _meta(request: Request) -> dict[str, Any]:
     return {
         "request_id": getattr(request.state, "request_id", None),
@@ -184,7 +224,8 @@ def retry_job(
         )
 
     request_payload = payload if isinstance(payload, dict) else {}
-    force = bool(request_payload.get("force"))
+    force = request_payload.get("force") is True
+    supersede_active = request_payload.get("supersede_active") is True
     current_status = str(job.status or "").upper()
     current_retry_count = _retry_count(job.result)
     current_analysis_attempt_id = require_analysis_attempt(
@@ -194,7 +235,7 @@ def retry_job(
         mutation="retry",
     )
 
-    if current_status in ACTIVE_STATUSES:
+    if current_status in ACTIVE_STATUSES and not (force and supersede_active):
         return _ok(
             {
                 "job_id": job.id,
@@ -206,6 +247,32 @@ def retry_job(
             },
             request,
         )
+
+    if current_status in ACTIVE_STATUSES:
+        if current_analysis_attempt_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=_error_detail(
+                    "ACTIVE_RETRY_ATTEMPT_REQUIRED",
+                    "A legacy active analysis cannot be superseded safely.",
+                    {"status": current_status},
+                ),
+            )
+        active_age_seconds = _active_retry_age_seconds(job)
+        stale_after_seconds = _active_retry_stale_after_seconds()
+        if active_age_seconds is None or active_age_seconds < stale_after_seconds:
+            raise HTTPException(
+                status_code=409,
+                detail=_error_detail(
+                    "ACTIVE_RETRY_NOT_STALE",
+                    "The active analysis is too recent to supersede safely.",
+                    {
+                        "status": current_status,
+                        "active_age_seconds": active_age_seconds,
+                        "stale_after_seconds": stale_after_seconds,
+                    },
+                ),
+            )
 
     if current_status in SUCCESS_STATUSES and not force:
         raise HTTPException(
