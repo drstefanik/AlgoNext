@@ -1251,6 +1251,208 @@ def _team_color_guard_failure_output(
     preserve_source_reasons: bool = False,
 ) -> dict[str, Any]:
     source = dict(output) if isinstance(output, Mapping) else {}
+    source_summary = (
+        source.get("reid_summary")
+        if isinstance(source.get("reid_summary"), Mapping)
+        else {}
+    )
+
+    def finite_number(
+        value: Any,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+        integer: bool = False,
+    ) -> int | float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            return None
+        if minimum is not None and parsed < minimum:
+            return None
+        if maximum is not None and parsed > maximum:
+            return None
+        if integer:
+            if not parsed.is_integer():
+                return None
+            return int(parsed)
+        return parsed
+
+    def safe_text(value: Any, *, maximum_length: int = 1024) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized or len(normalized) > maximum_length:
+            return None
+        return normalized
+
+    raw_anchor_matches = source.get("anchor_matches")
+    if not isinstance(raw_anchor_matches, list):
+        raw_anchor_matches = source_summary.get("anchor_matches")
+    diagnostic_matches: list[dict[str, Any]] = []
+    if isinstance(raw_anchor_matches, list):
+        for raw_match in raw_anchor_matches:
+            if not isinstance(raw_match, Mapping):
+                continue
+            status_value = (
+                safe_text(raw_match.get("status"), maximum_length=64) or "UNKNOWN"
+            ).upper()
+            diagnostic: dict[str, Any] = {}
+            for key in ("anchor_id", "window_index"):
+                sanitized = finite_number(
+                    raw_match.get(key),
+                    minimum=0.0,
+                    maximum=100_000.0,
+                    integer=True,
+                )
+                if sanitized is not None:
+                    diagnostic[key] = sanitized
+            for key in ("time_sec", "window_start", "window_end"):
+                sanitized = finite_number(
+                    raw_match.get(key),
+                    minimum=0.0,
+                    maximum=604_800.0,
+                )
+                if sanitized is not None:
+                    diagnostic[key] = sanitized
+            for key, maximum_length in (
+                ("frame_key", 1024),
+                ("source", 128),
+            ):
+                sanitized = safe_text(
+                    raw_match.get(key),
+                    maximum_length=maximum_length,
+                )
+                if sanitized is not None:
+                    diagnostic[key] = sanitized
+            raw_local_track_id = raw_match.get("local_track_id")
+            has_primitive_local_track_id = (
+                isinstance(raw_local_track_id, int)
+                and not isinstance(raw_local_track_id, bool)
+            ) or (
+                isinstance(raw_local_track_id, str)
+                and bool(raw_local_track_id.strip())
+                and len(raw_local_track_id) <= 128
+            )
+            diagnostic.update(
+                {
+                    "raw_status": status_value,
+                    "matched_before_guard": bool(
+                        status_value == "MATCHED"
+                        or has_primitive_local_track_id
+                    ),
+                }
+            )
+            diagnostic_matches.append(diagnostic)
+    reported_total = finite_number(
+        source.get("anchors_total")
+        if source.get("anchors_total") is not None
+        else source_summary.get("anchors_total"),
+        minimum=0.0,
+        maximum=5.0,
+        integer=True,
+    )
+    diagnostic_total = max(
+        len(diagnostic_matches),
+        int(reported_total or 0),
+    )
+    diagnostic_total = min(5, diagnostic_total)
+    matched_from_records = sum(
+        1 for item in diagnostic_matches if item["matched_before_guard"]
+    )
+    diagnostic_matched = min(diagnostic_total, matched_from_records)
+
+    def sanitized_anchor_input(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        sanitized: dict[str, Any] = {}
+        for key in ("t", "frame_time_sec", "best_time_sec"):
+            parsed = finite_number(
+                value.get(key),
+                minimum=0.0,
+                maximum=604_800.0,
+            )
+            if parsed is not None:
+                sanitized[key] = parsed
+        for key in ("x", "y"):
+            parsed = finite_number(value.get(key), minimum=0.0, maximum=1.0)
+            if parsed is not None:
+                sanitized[key] = parsed
+        for key in ("w", "h"):
+            parsed = finite_number(
+                value.get(key),
+                minimum=0.000001,
+                maximum=1.0,
+            )
+            if parsed is not None:
+                sanitized[key] = parsed
+        frame_key = safe_text(value.get("frame_key"), maximum_length=1024)
+        if frame_key is not None:
+            sanitized["frame_key"] = frame_key
+        return sanitized
+
+    source_anchor_inputs = (
+        source.get("anchors_used")
+        if isinstance(source.get("anchors_used"), Mapping)
+        else {}
+    )
+    raw_selections = source_anchor_inputs.get("selections")
+    anchor_inputs = {
+        "player_ref": sanitized_anchor_input(
+            source_anchor_inputs.get("player_ref")
+        ),
+        "selections": [
+            sanitized
+            for sanitized in (
+                sanitized_anchor_input(item)
+                for item in (
+                    raw_selections if isinstance(raw_selections, list) else []
+                )
+            )
+            if sanitized
+        ],
+    }
+    acquisition_source = (
+        source.get("anchor_acquisition")
+        if isinstance(source.get("anchor_acquisition"), Mapping)
+        else {}
+    )
+    sanitized_acquisition: dict[str, Any] = {}
+    fps_value = finite_number(
+        acquisition_source.get("fps"),
+        minimum=0.01,
+        maximum=240.0,
+    )
+    if fps_value is not None:
+        sanitized_acquisition["fps"] = fps_value
+    detector_model = safe_text(
+        acquisition_source.get("detector_model"),
+        maximum_length=256,
+    )
+    if detector_model is not None:
+        sanitized_acquisition["detector_model"] = detector_model
+    for key in ("windows_processed", "seed_anchor_id", "seed_window_index"):
+        parsed = finite_number(
+            acquisition_source.get(key),
+            minimum=0.0,
+            maximum=100_000.0,
+            integer=True,
+        )
+        if parsed is not None:
+            sanitized_acquisition[key] = parsed
+    seed_anchor_input = sanitized_anchor_input(acquisition_source.get("seed_anchor"))
+    if seed_anchor_input:
+        sanitized_acquisition["seed_anchor"] = seed_anchor_input
+    anchor_diagnostics = {
+        "diagnostic_only": True,
+        "validated": False,
+        "anchors_total": diagnostic_total,
+        "anchors_matched_before_guard": diagnostic_matched,
+        "anchor_matches": diagnostic_matches,
+        "anchors_used": anchor_inputs,
+        "anchor_acquisition": sanitized_acquisition,
+    }
 
     raw_segments = source.get("segments")
     segments: list[dict[str, Any]] = []
@@ -1315,11 +1517,6 @@ def _team_color_guard_failure_output(
             "TEAM_COLOR_GUARD_INPUT_INVALID": "INPUT_INVALID_FAIL_CLOSED",
         }.get(status, "ERROR_FAIL_CLOSED")
     )
-    source_summary = (
-        source.get("reid_summary")
-        if isinstance(source.get("reid_summary"), Mapping)
-        else {}
-    )
     source_reason_codes = (
         source_summary.get("reason_codes")
         if isinstance(source_summary.get("reason_codes"), (list, tuple))
@@ -1381,6 +1578,7 @@ def _team_color_guard_failure_output(
         "anchor_matches": [],
         "anchors_used": {},
         "anchor_acquisition": {},
+        "pre_guard_anchor_diagnostics": anchor_diagnostics,
         "tracking_success": False,
         "partial": False,
         "partial_reason": None,
@@ -1393,6 +1591,7 @@ def _team_color_guard_failure_output(
             "anchors_total": 0,
             "anchors_matched": 0,
             "anchor_matches": [],
+            "pre_guard_anchor_diagnostics": anchor_diagnostics,
             "autonomous_segments_with_player": 0,
             "autonomous_bboxes_count": 0,
             "tracking_scope_status": "EMPTY",

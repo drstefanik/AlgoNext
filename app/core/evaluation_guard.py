@@ -95,6 +95,43 @@ def _tracking_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
     return normalized
 
 
+def _pre_guard_matched_anchor_count(
+    tracking_payload: Mapping[str, Any],
+) -> int:
+    summary = tracking_payload.get("reid_summary")
+    summary_payload = summary if isinstance(summary, Mapping) else {}
+    for raw_diagnostics in (
+        tracking_payload.get("pre_guard_anchor_diagnostics"),
+        summary_payload.get("pre_guard_anchor_diagnostics"),
+    ):
+        if not isinstance(raw_diagnostics, Mapping):
+            continue
+        if (
+            raw_diagnostics.get("diagnostic_only") is not True
+            or raw_diagnostics.get("validated") is not False
+        ):
+            continue
+        total_value = _safe_float(raw_diagnostics.get("anchors_total"))
+        if (
+            total_value is None
+            or total_value < 0
+            or not total_value.is_integer()
+        ):
+            continue
+        total = int(total_value)
+        raw_matches = raw_diagnostics.get("anchor_matches")
+        if not isinstance(raw_matches, list):
+            continue
+        matched = sum(
+            1
+            for item in raw_matches
+            if isinstance(item, Mapping)
+            and item.get("matched_before_guard") is True
+        )
+        return min(total, matched)
+    return 0
+
+
 def _tracking_only_warnings(result: Mapping[str, Any], existing: Any) -> list[str]:
     tracking = result.get("tracking")
     tracking_payload = tracking if isinstance(tracking, Mapping) else {}
@@ -104,7 +141,10 @@ def _tracking_only_warnings(result: Mapping[str, Any], existing: Any) -> list[st
         0.0,
         _safe_float(tracking_payload.get("anchors_matched")) or 0.0,
     )
-    matched_anchor_rejection = anchors_matched > 0 and tracking_status in {
+    diagnostic_anchors_matched = _pre_guard_matched_anchor_count(tracking_payload)
+    matched_anchor_rejection = (
+        anchors_matched > 0 or diagnostic_anchors_matched > 0
+    ) and tracking_status in {
         "ANCHOR_REJECTED",
         "ANCHOR_ONLY",
     }

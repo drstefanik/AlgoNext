@@ -337,6 +337,52 @@ def _score_candidate(
     )
 
 
+def _verified_physical_continuity(
+    candidate: CandidateProfile | None,
+    thresholds: AssociationThresholds,
+) -> bool:
+    """Return whether the builder attested duplicate-time physical continuity.
+
+    Appearance can be unavailable for small, distant players. It is safe to
+    treat it as auxiliary only when the candidate was built from one unique,
+    motion-continuous tracklet that overlaps the already verified track in at
+    least two distinct samples.
+    """
+
+    if candidate is None or not thresholds.require_strong_overlap:
+        return False
+    if (candidate.overlap_score or 0.0) < thresholds.strong_overlap_score:
+        return False
+    metadata = (
+        dict(candidate.metadata or {})
+        if isinstance(candidate.metadata, Mapping)
+        else {}
+    )
+    if metadata.get("strong_overlap_unique") is not True:
+        return False
+    if metadata.get("tracklet_scope") != "MOTION_CONTINUOUS_STRONG_OVERLAP":
+        return False
+    try:
+        linked_samples = int(metadata.get("overlap_link_samples") or 0)
+        previous_samples = int(metadata.get("overlap_previous_samples") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        linked_samples < 2
+        or previous_samples < 2
+        or candidate.detection_count < 2
+    ):
+        return False
+    raw_indices = metadata.get("tracklet_sample_indices")
+    if not isinstance(raw_indices, (list, tuple)):
+        return False
+    try:
+        distinct_indices = {int(value) for value in raw_indices}
+    except (TypeError, ValueError):
+        return False
+    return len(distinct_indices) >= 2
+
+
 def associate_identity(
     identity: IdentityProfile,
     candidates: Iterable[CandidateProfile],
@@ -355,6 +401,10 @@ def associate_identity(
                 for candidate in candidate_profiles
             ),
             key=lambda candidate: (
+                _verified_physical_continuity(
+                    profiles_by_id.get(candidate.candidate_id),
+                    thresholds,
+                ),
                 candidate.combined_score,
                 candidate.appearance_similarity or 0.0,
                 candidate.candidate_id,
@@ -381,14 +431,26 @@ def associate_identity(
     margin = max(0.0, best.combined_score - runner_up_score)
     reasons = list(best.reason_codes)
     unique_strong_overlap = bool(
-        thresholds.require_strong_overlap
-        and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
-        and best_metadata.get("strong_overlap_unique") is True
+        _verified_physical_continuity(best_profile, thresholds)
         and all(
             (candidate.overlap_score or 0.0) < thresholds.strong_overlap_score
             for candidate in scored[1:]
         )
     )
+    physical_only_reasons = {
+        "MISSING_APPEARANCE_DESCRIPTOR",
+        "LOW_DESCRIPTOR_QUALITY",
+        "INSUFFICIENT_DESCRIPTOR_SAMPLES",
+        "LOW_APPEARANCE_SIMILARITY",
+        "LOW_COMBINED_SCORE",
+    }
+    used_physical_only_path = bool(
+        unique_strong_overlap and physical_only_reasons.intersection(reasons)
+    )
+    if unique_strong_overlap:
+        reasons = [
+            reason for reason in reasons if reason not in physical_only_reasons
+        ]
     if (
         thresholds.require_strong_overlap
         and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
@@ -411,19 +473,17 @@ def associate_identity(
     }
     accepted = not hard_failures.intersection(reasons)
     if accepted:
+        accepted_reasons = [
+            "ASSOCIATION_ACCEPTED",
+            *(["STRONG_TEMPORAL_OVERLAP"] if unique_strong_overlap else []),
+            *(["PHYSICAL_CONTINUITY_ONLY"] if used_physical_only_path else []),
+        ]
         return AssociationDecision(
             status="ACCEPTED",
             selected_candidate_id=best.candidate_id,
             best_score=best.combined_score,
             margin=margin,
-            reason_codes=(
-                (
-                    "ASSOCIATION_ACCEPTED",
-                    "STRONG_TEMPORAL_OVERLAP",
-                )
-                if unique_strong_overlap
-                else ("ASSOCIATION_ACCEPTED",)
-            ),
+            reason_codes=tuple(accepted_reasons),
             candidates=scored,
         )
     return AssociationDecision(

@@ -19,6 +19,23 @@ def descriptor(values, *, samples=3, quality=0.8):
     )
 
 
+def physical_metadata(
+    *,
+    unique=True,
+    scope="MOTION_CONTINUOUS_STRONG_OVERLAP",
+    links=2,
+    previous=2,
+    indices=(0, 1),
+):
+    return {
+        "strong_overlap_unique": unique,
+        "tracklet_scope": scope,
+        "overlap_link_samples": links,
+        "overlap_previous_samples": previous,
+        "tracklet_sample_indices": indices,
+    }
+
+
 class ReIdAssociationTests(unittest.TestCase):
     def setUp(self):
         self.identity = IdentityProfile(
@@ -90,7 +107,8 @@ class ReIdAssociationTests(unittest.TestCase):
                     descriptor([0.99, 0.12, 0.0, 0.0]),
                     overlap_score=0.78,
                     geometry_score=0.60,
-                    metadata={"strong_overlap_unique": True},
+                    detection_count=3,
+                    metadata=physical_metadata(indices=(0, 1, 2)),
                 ),
                 CandidateProfile(
                     "track-lookalike",
@@ -108,6 +126,86 @@ class ReIdAssociationTests(unittest.TestCase):
         self.assertEqual(decision.selected_candidate_id, "track-overlap")
         self.assertLess(decision.margin, 0.07)
         self.assertIn("STRONG_TEMPORAL_OVERLAP", decision.reason_codes)
+
+    def test_verified_physical_candidate_wins_over_appearance_only_lookalike(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-physical",
+                    None,
+                    overlap_score=0.82,
+                    geometry_score=0.75,
+                    detection_count=3,
+                    metadata=physical_metadata(indices=(4, 5, 6)),
+                ),
+                CandidateProfile(
+                    "track-lookalike",
+                    descriptor([1.0, 0.1, 0.0, 0.0], quality=0.95),
+                    geometry_score=1.0,
+                    detection_count=20,
+                ),
+            ],
+            thresholds=AssociationThresholds(require_strong_overlap=True),
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.selected_candidate_id, "track-physical")
+        self.assertIn("PHYSICAL_CONTINUITY_ONLY", decision.reason_codes)
+
+    def test_verified_physical_continuity_tolerates_weak_crop_descriptors(self):
+        weak_descriptors = (
+            None,
+            descriptor([1.0, 0.1, 0.0, 0.0], samples=1, quality=0.9),
+            descriptor([1.0, 0.1, 0.0, 0.0], samples=3, quality=0.1),
+            descriptor([0.0, 1.0, 0.0, 0.0], samples=3, quality=0.9),
+        )
+        for weak_descriptor in weak_descriptors:
+            with self.subTest(descriptor=weak_descriptor):
+                decision = associate_identity(
+                    self.identity,
+                    [
+                        CandidateProfile(
+                            "track-physical",
+                            weak_descriptor,
+                            overlap_score=0.82,
+                            geometry_score=0.75,
+                            detection_count=3,
+                            metadata=physical_metadata(indices=(4, 5, 6)),
+                        )
+                    ],
+                    thresholds=AssociationThresholds(require_strong_overlap=True),
+                )
+                self.assertTrue(decision.accepted)
+                self.assertIn(
+                    "PHYSICAL_CONTINUITY_ONLY",
+                    decision.reason_codes,
+                )
+
+    def test_incomplete_physical_attestation_never_bypasses_appearance(self):
+        invalid_metadata = (
+            physical_metadata(links=1),
+            physical_metadata(indices=(0, 0)),
+            physical_metadata(scope="FULL_WINDOW"),
+            physical_metadata(unique=False),
+        )
+        for metadata in invalid_metadata:
+            with self.subTest(metadata=metadata):
+                decision = associate_identity(
+                    self.identity,
+                    [
+                        CandidateProfile(
+                            "track-unverified",
+                            None,
+                            overlap_score=0.82,
+                            geometry_score=0.75,
+                            detection_count=3,
+                            metadata=metadata,
+                        )
+                    ],
+                    thresholds=AssociationThresholds(require_strong_overlap=True),
+                )
+                self.assertFalse(decision.accepted)
 
     def test_unverified_unique_overlap_does_not_bypass_margin(self):
         decision = associate_identity(
@@ -325,6 +423,34 @@ class ReIdAssociationTests(unittest.TestCase):
         decision = associate_identity(
             self.identity,
             [CandidateProfile("track-6", foreign, overlap_score=0.9)],
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            "DESCRIPTOR_VERSION_MISMATCH",
+            decision.reason_codes,
+        )
+
+    def test_physical_continuity_does_not_hide_descriptor_version_mismatch(self):
+        foreign = AppearanceDescriptor(
+            vector=(1.0, 0.0, 0.0, 0.0),
+            sample_count=3,
+            quality=0.9,
+            version="foreign-v1",
+        )
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-physical",
+                    foreign,
+                    overlap_score=0.82,
+                    geometry_score=0.75,
+                    detection_count=3,
+                    metadata=physical_metadata(indices=(4, 5, 6)),
+                )
+            ],
+            thresholds=AssociationThresholds(require_strong_overlap=True),
         )
 
         self.assertFalse(decision.accepted)

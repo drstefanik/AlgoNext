@@ -149,6 +149,41 @@ def _envelope_data(envelope: Any, label: str) -> Mapping[str, Any]:
     return _mapping(data, f"{label}.data") if data is not None else source
 
 
+def _pre_guard_matched_anchor_count(
+    tracking: Mapping[str, Any],
+) -> int:
+    summary = tracking.get("reid_summary")
+    summary_payload = summary if isinstance(summary, Mapping) else {}
+    for raw_diagnostics in (
+        tracking.get("pre_guard_anchor_diagnostics"),
+        summary_payload.get("pre_guard_anchor_diagnostics"),
+    ):
+        if not isinstance(raw_diagnostics, Mapping):
+            continue
+        if (
+            raw_diagnostics.get("diagnostic_only") is not True
+            or raw_diagnostics.get("validated") is not False
+        ):
+            continue
+        total = raw_diagnostics.get("anchors_total")
+        matches = raw_diagnostics.get("anchor_matches")
+        if (
+            not isinstance(total, int)
+            or isinstance(total, bool)
+            or not 0 <= total <= 5
+            or not isinstance(matches, list)
+        ):
+            continue
+        matched = sum(
+            1
+            for item in matches
+            if isinstance(item, Mapping)
+            and item.get("matched_before_guard") is True
+        )
+        return min(total, matched)
+    return 0
+
+
 def validate_runtime_attestation(
     envelope: Mapping[str, Any],
     *,
@@ -1255,6 +1290,32 @@ def validate_regression_result(
         not mismatched_attempts,
         f"Final result contains mismatched analysis attempts: {mismatched_attempts}",
     )
+    summary = _mapping(tracking.get("reid_summary"), "tracking.reid_summary")
+    terminal_tracking_failure = (
+        tracking.get("tracking_success") is not True
+        or tracking.get("action_required") not in (None, "")
+        or str(job.get("status") or "").upper() in {"FAILED", "WAITING_FOR_PLAYER"}
+    )
+    if terminal_tracking_failure:
+        raw_reasons = summary.get("reason_codes")
+        reasons = [
+            str(reason)
+            for reason in (
+                raw_reasons if isinstance(raw_reasons, list) else []
+            )
+            if isinstance(reason, str) and reason
+        ]
+        raise ValidationError(
+            "Tracking terminal failure: "
+            f"job_status={job.get('status')!r} "
+            f"tracking_status={tracking.get('tracking_status')!r} "
+            f"action_required={tracking.get('action_required')!r} "
+            "pre_guard_anchors_matched="
+            f"{_pre_guard_matched_anchor_count(tracking)} "
+            f"reason_codes={reasons!r} "
+            f"failure_reason={job.get('failure_reason')!r} "
+            f"error={job.get('error')!r}"
+        )
     _require(
         target.get("confirmed") is True and target.get("full_match_mode") is True,
         "Final target lost canonical full-match confirmation",
@@ -1269,7 +1330,6 @@ def validate_regression_result(
         "Final job contains a failure/error",
     )
 
-    summary = _mapping(tracking.get("reid_summary"), "tracking.reid_summary")
     guard = _mapping(summary.get("team_color_guard"), "team_color_guard")
     _require(job.get("status") == "PARTIAL", "Regression must finish PARTIAL")
     _require(tracking.get("mode") == "full_match_windowed", "Unexpected tracking mode")

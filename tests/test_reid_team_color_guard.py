@@ -16,6 +16,7 @@ from app.reid.team_color_guard import (
     COLOR_FAMILIES,
     KitColorSignature,
     _VideoReader,
+    _anchor_geometry_evidence,
     _repersist_guarded_output,
     _segment_color_evidence,
     apply_team_color_guard,
@@ -747,6 +748,24 @@ class TeamColorGuardTests(unittest.TestCase):
         self.assertIn("ANCHOR_BBOX_MISMATCH", geometry["reason_codes"])
         self.assertTrue(all(segment["bboxes"] == [] for segment in result["segments"]))
 
+    def test_small_late_anchor_raw_sample_passes_geometry(self):
+        anchor = {
+            "t": 2157.009,
+            "x": 0.278125,
+            "y": 0.2875,
+            "w": 0.03125,
+            "h": 0.151388889,
+        }
+        evidence = _anchor_geometry_evidence(
+            [{"bboxes": [{**anchor, "t": 2157.0}]}],
+            [0],
+            anchor,
+        )
+
+        self.assertTrue(evidence["passed"])
+        self.assertGreater(evidence["iou"], 0.99)
+        self.assertLess(evidence["time_delta_sec"], 0.02)
+
     def test_mixed_anchor_track_invalidates_every_identity_link(self):
         result = self.run_guard(
             output_with_segments([1.0, 2.0], [3.0, 4.0]),
@@ -1403,6 +1422,52 @@ class TeamColorGuardTests(unittest.TestCase):
             "autonomous_bboxes_count": 0,
             "tracking_scope_status": "ANCHOR_ONLY",
             "coverage_pct": 3.5,
+            "anchors_total": 2,
+            "anchors_matched": 999,
+            "anchor_matches": [
+                {
+                    "anchor_id": 1,
+                    "frame_key": "frame_0004.jpg",
+                    "time_sec": 719.003,
+                    "window_index": 13,
+                    "status": "MATCHED",
+                    "local_track_id": 7,
+                    "source": "primary_player_ref",
+                    "nested_secret": {"identity_id": "do-not-copy"},
+                },
+                {
+                    "anchor_id": 2,
+                    "frame_key": "frame_0012.jpg",
+                    "time_sec": 2157.009,
+                    "window_index": 39,
+                    "status": "MATCHED",
+                    "local_track_id": 11,
+                    "source": "selection",
+                },
+            ],
+            "anchors_used": {
+                "player_ref": {
+                    "t": 719.003,
+                    **BBOX,
+                    "identity_id": "do-not-copy",
+                    "best_time_sec": float("inf"),
+                },
+                "selections": [
+                    {"t": 719.003, **BBOX},
+                    {
+                        "t": 2157.009,
+                        **BBOX,
+                        "x": -1.0,
+                        "local_track_id": 11,
+                    },
+                ],
+            },
+            "anchor_acquisition": {
+                "fps": 5,
+                "detector_model": "yolo11s.pt",
+                "seed_anchor_id": 1,
+                "seed_window_index": 13,
+            },
             "segments": [
                 {
                     "window_index": 0,
@@ -1466,6 +1531,42 @@ class TeamColorGuardTests(unittest.TestCase):
         self.assertEqual(result["action_required"], "RESELECT_PLAYER")
         self.assertEqual(result["segments_with_player"], 0)
         self.assertEqual(result["coverage_pct"], 0.0)
+        self.assertEqual(result["anchors_matched"], 0)
+        diagnostics = result["pre_guard_anchor_diagnostics"]
+        self.assertTrue(diagnostics["diagnostic_only"])
+        self.assertFalse(diagnostics["validated"])
+        self.assertEqual(diagnostics["anchors_total"], 2)
+        self.assertEqual(diagnostics["anchors_matched_before_guard"], 2)
+        self.assertEqual(
+            [item["matched_before_guard"] for item in diagnostics["anchor_matches"]],
+            [True, True],
+        )
+        self.assertTrue(
+            all(
+                "local_track_id" not in item
+                for item in diagnostics["anchor_matches"]
+            )
+        )
+        self.assertNotIn(
+            "nested_secret",
+            diagnostics["anchor_matches"][0],
+        )
+        self.assertNotIn(
+            "identity_id",
+            diagnostics["anchors_used"]["player_ref"],
+        )
+        self.assertNotIn(
+            "best_time_sec",
+            diagnostics["anchors_used"]["player_ref"],
+        )
+        self.assertNotIn(
+            "x",
+            diagnostics["anchors_used"]["selections"][1],
+        )
+        self.assertEqual(
+            result["reid_summary"]["pre_guard_anchor_diagnostics"],
+            diagnostics,
+        )
         self.assertEqual(
             result["tracking_key"],
             "jobs/job-anchor-only/attempts/attempt-a/tracking/tracking.json",
