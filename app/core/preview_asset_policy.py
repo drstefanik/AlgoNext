@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from importlib import import_module
 from threading import RLock
 from typing import Any, Callable
@@ -70,11 +71,7 @@ def _object_exists(s3_client: Any, bucket: str, key: str) -> bool:
         error = response.get("Error", {}) if isinstance(response, dict) else {}
         code = str(error.get("Code", ""))
         status = (
-            str(
-                (response.get("ResponseMetadata", {}) or {}).get(
-                    "HTTPStatusCode", ""
-                )
-            )
+            str((response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode", ""))
             if isinstance(response, dict)
             else ""
         )
@@ -94,6 +91,7 @@ def _tracking_asset_payload(frames: list[dict[str, Any]]) -> list[dict[str, Any]
         "is_target",
         "tracks",
         "asset_kind",
+        "analysis_attempt_id",
     }
     return [
         {key: copy.deepcopy(value) for key, value in frame.items() if key in allowed}
@@ -134,6 +132,11 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
         pipeline_module, "_generate_tracking_preview_frames", None
     )
     current_update_job = getattr(pipeline_module, "update_job", None)
+    current_update_analysis_job = getattr(
+        pipeline_module,
+        "update_analysis_job",
+        None,
+    )
     current_upload_file = getattr(pipeline_module, "upload_file", None)
     if not callable(current_generator):
         raise RuntimeError(
@@ -141,13 +144,30 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
         )
     if not callable(current_update_job):
         raise RuntimeError("pipeline module does not expose update_job")
+    if not callable(current_update_analysis_job):
+        raise RuntimeError("pipeline module does not expose update_analysis_job")
     if not callable(current_upload_file):
         raise RuntimeError("pipeline module does not expose upload_file")
     if getattr(current_generator, "__algonext_preview_asset_policy__", False):
         return False
 
-    pending_tracking_frames: dict[str, list[dict[str, Any]]] = {}
+    pending_tracking_frames: dict[
+        tuple[str, str | None],
+        list[dict[str, Any]],
+    ] = {}
     pending_lock = RLock()
+
+    def normalized_attempt_id(value: Any) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    def attempt_component(value: Any) -> str:
+        normalized = normalized_attempt_id(value)
+        if normalized is None:
+            return "legacy"
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", normalized) is None:
+            raise ValueError("analysis_attempt_id is not safe for preview storage")
+        return normalized
 
     def upload_immutable_asset(
         s3_internal: Any,
@@ -168,6 +188,7 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
     def generate_tracking_review_frames(
         *,
         job_id: str,
+        analysis_attempt_id: str | None = None,
         input_path: Any,
         frames_dir: Any,
         s3_internal: Any,
@@ -214,7 +235,10 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
                 continue
 
             width, height = pipeline_module.probe_image_dimensions(frame_path)
-            frame_key = f"jobs/{job_id}/tracking_frames/{frame_name}"
+            frame_key = (
+                f"jobs/{job_id}/attempts/{attempt_component(analysis_attempt_id)}"
+                f"/tracking_frames/{frame_name}"
+            )
             pipeline_module.upload_file(
                 s3_internal,
                 s3_bucket,
@@ -233,25 +257,64 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
                     "is_target": bool(candidate.get("is_target")),
                     "tracks": copy.deepcopy(candidate.get("tracks") or []),
                     "asset_kind": "tracking_review_frame",
+                    **(
+                        {
+                            "analysis_attempt_id": normalized_attempt_id(
+                                analysis_attempt_id
+                            )
+                        }
+                        if normalized_attempt_id(analysis_attempt_id) is not None
+                        else {}
+                    ),
                 }
             )
 
         if review_frames:
             with pending_lock:
-                pending_tracking_frames[job_id] = copy.deepcopy(review_frames)
+                pending_tracking_frames[
+                    (str(job_id), normalized_attempt_id(analysis_attempt_id))
+                ] = copy.deepcopy(review_frames)
         return review_frames
 
-    def preserve_selection_frames(db: Any, job_id: str, updater: Callable[[Any], None]):
-        before = pipeline_module.reload_job(db, job_id)
-        immutable_selection = copy.deepcopy(
-            list(getattr(before, "preview_frames", None) or []) if before else []
-        )
-        with pending_lock:
-            pending = copy.deepcopy(pending_tracking_frames.get(job_id) or [])
-
-        state = {"tracking_intercepted": False}
+    def governed_update(
+        delegate: Callable[..., Any],
+        db: Any,
+        job_id: str,
+        updater: Callable[[Any], None],
+        *,
+        expected_analysis_attempt_id: str | None,
+        delegate_args: tuple[Any, ...],
+    ) -> Any:
+        state: dict[str, Any] = {
+            "tracking_intercepted": False,
+            "pending_key": (
+                (
+                    str(job_id),
+                    normalized_attempt_id(expected_analysis_attempt_id),
+                )
+                if delegate_args
+                else None
+            ),
+        }
 
         def governed_updater(job: Any) -> None:
+            target = getattr(job, "target", None)
+            current_attempt_id = normalized_attempt_id(
+                target.get("analysis_attempt_id") if isinstance(target, dict) else None
+            )
+            attempt_id = (
+                normalized_attempt_id(expected_analysis_attempt_id)
+                if delegate_args
+                else current_attempt_id
+            )
+            pending_key = (str(job_id), attempt_id)
+            state["pending_key"] = pending_key
+            immutable_selection = copy.deepcopy(
+                list(getattr(job, "preview_frames", None) or [])
+            )
+            with pending_lock:
+                pending = copy.deepcopy(pending_tracking_frames.get(pending_key) or [])
+
             updater(job)
             current_frames = copy.deepcopy(
                 list(getattr(job, "preview_frames", None) or [])
@@ -303,8 +366,14 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
                 integrity.update(
                     {
                         "selection_frames_immutable": True,
+                        "selection_preserved": True,
+                        "review_in_result": state["tracking_intercepted"],
                         "selection_namespace": f"jobs/{job_id}/frames/",
-                        "tracking_review_namespace": f"jobs/{job_id}/tracking_frames/",
+                        "tracking_review_namespace": (
+                            f"jobs/{job_id}/attempts/{attempt_component(attempt_id)}"
+                            "/tracking_frames/"
+                        ),
+                        "analysis_attempt_id": attempt_id,
                     }
                 )
                 if (
@@ -317,11 +386,42 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
                 updated_result["preview_asset_integrity"] = integrity
                 job.result = updated_result
 
-        outcome = current_update_job(db, job_id, governed_updater)
-        if outcome and state["tracking_intercepted"]:
+        try:
+            return delegate(db, job_id, *delegate_args, governed_updater)
+        finally:
             with pending_lock:
-                pending_tracking_frames.pop(job_id, None)
-        return outcome
+                pending_key = state.get("pending_key")
+                if pending_key is not None:
+                    pending_tracking_frames.pop(pending_key, None)
+
+    def preserve_selection_frames(
+        db: Any,
+        job_id: str,
+        updater: Callable[[Any], None],
+    ) -> Any:
+        return governed_update(
+            current_update_job,
+            db,
+            job_id,
+            updater,
+            expected_analysis_attempt_id=None,
+            delegate_args=(),
+        )
+
+    def preserve_attempt_selection_frames(
+        db: Any,
+        job_id: str,
+        expected_analysis_attempt_id: str | None,
+        updater: Callable[[Any], None],
+    ) -> Any:
+        return governed_update(
+            current_update_analysis_job,
+            db,
+            job_id,
+            updater,
+            expected_analysis_attempt_id=expected_analysis_attempt_id,
+            delegate_args=(expected_analysis_attempt_id,),
+        )
 
     setattr(upload_immutable_asset, "__algonext_preview_asset_policy__", True)
     setattr(upload_immutable_asset, "__algonext_original__", current_upload_file)
@@ -337,10 +437,21 @@ def install_preview_asset_policy(pipeline_module: Any) -> bool:
     )
     setattr(preserve_selection_frames, "__algonext_preview_asset_policy__", True)
     setattr(preserve_selection_frames, "__algonext_original__", current_update_job)
+    setattr(
+        preserve_attempt_selection_frames,
+        "__algonext_preview_asset_policy__",
+        True,
+    )
+    setattr(
+        preserve_attempt_selection_frames,
+        "__algonext_original__",
+        current_update_analysis_job,
+    )
 
     pipeline_module.upload_file = upload_immutable_asset
     pipeline_module._generate_tracking_preview_frames = generate_tracking_review_frames
     pipeline_module.update_job = preserve_selection_frames
+    pipeline_module.update_analysis_job = preserve_attempt_selection_frames
     logger.info(
         "Installed immutable selection-preview policy with separate tracking assets"
     )

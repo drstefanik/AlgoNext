@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import uuid4
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.db import SessionLocal
@@ -74,6 +77,40 @@ def _response_meta(request: Request, request_id: str) -> dict[str, str]:
     }
 
 
+def _load_job(db, job_id: str) -> AnalysisJob | None:
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
+
+
+def _load_job_for_update(db, job_id: str) -> AnalysisJob | None:
+    execute = getattr(db, "execute", None)
+    if callable(execute):
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execute(statement).scalar_one_or_none()
+    return _load_job(db, job_id)
+
+
+def _read_only_job_snapshot(job: AnalysisJob) -> SimpleNamespace:
+    """Copy the report-visible fields so GET cannot dirty the ORM instance."""
+
+    return SimpleNamespace(
+        status=job.status,
+        progress=copy.deepcopy(job.progress),
+        result=copy.deepcopy(job.result),
+        warnings=copy.deepcopy(job.warnings),
+        report_status=job.report_status,
+        report=copy.deepcopy(job.report),
+        ai_report=copy.deepcopy(job.ai_report),
+    )
+
+
 class EvaluationReportGuardMiddleware(BaseHTTPMiddleware):
     """Prevent every report endpoint from bypassing evaluation abstention."""
 
@@ -87,7 +124,15 @@ class EvaluationReportGuardMiddleware(BaseHTTPMiddleware):
         passthrough = False
         guarded_response: JSONResponse | None = None
         try:
-            job = db.get(AnalysisJob, job_id)
+            if request.method == "POST":
+                job = _load_job_for_update(db, job_id)
+            else:
+                persisted_job = _load_job(db, job_id)
+                job = (
+                    _read_only_job_snapshot(persisted_job)
+                    if persisted_job is not None
+                    else None
+                )
             if job is None or not job_ready_for_report(job):
                 passthrough = True
             else:

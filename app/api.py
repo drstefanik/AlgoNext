@@ -20,9 +20,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
+from app.core.analysis_attempt_precondition import require_analysis_attempt
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.ai_report import generate_ai_report
@@ -55,9 +57,7 @@ POLLING_SAFE_STATUSES = {
     "FAILED",
 }
 
-S3_ENDPOINT_URL = (
-    os.environ.get("S3_ENDPOINT_URL") or "http://127.0.0.1:9000"
-).strip()
+S3_ENDPOINT_URL = (os.environ.get("S3_ENDPOINT_URL") or "http://127.0.0.1:9000").strip()
 S3_PUBLIC_ENDPOINT_URL = (
     os.environ.get("S3_PUBLIC_ENDPOINT_URL") or "https://s3.nextgroupintl.com"
 ).strip()
@@ -67,6 +67,84 @@ S3_BUCKET = (os.environ.get("S3_BUCKET") or "").strip()
 SIGNED_URL_EXPIRES_SECONDS = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
 FILENAME_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 MAX_AI_CLIPS = int(os.environ.get("AI_REPORT_MAX_CLIPS", "10"))
+ACTIVE_ANALYSIS_STATUSES = frozenset({"QUEUED", "RUNNING", "PROCESSING"})
+
+
+def _load_job_for_update(db: Session, job_id: str) -> AnalysisJob | None:
+    execute = getattr(db, "execute", None)
+    if callable(execute):
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execute(statement).scalar_one_or_none()
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
+
+
+def _analysis_attempt_id(job: AnalysisJob) -> str | None:
+    target = job.target if isinstance(job.target, dict) else {}
+    value = str(target.get("analysis_attempt_id") or "").strip()
+    return value or None
+
+
+def _reject_active_analysis_mutation(job: AnalysisJob) -> None:
+    status = str(job.status or "").upper()
+    if status not in ACTIVE_ANALYSIS_STATUSES:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=error_detail(
+            "ANALYSIS_IN_PROGRESS",
+            "Player and target selection cannot change during an active analysis.",
+            {
+                "status": status,
+                "analysis_attempt_id": _analysis_attempt_id(job),
+            },
+        ),
+    )
+
+
+def _invalidate_analysis_attempt_for_selection(job: AnalysisJob) -> str:
+    """Fence every prior worker before changing player or target selection.
+
+    The revision token intentionally remains non-empty while the job waits for
+    enqueue.  That makes both a delayed attempt-bound worker and a legacy
+    one-argument worker fail closed.  Enqueue rotates it once more to the
+    authoritative analysis-attempt id dispatched to the worker.
+    """
+
+    selection_revision_id = str(uuid4())
+    target = dict(job.target or {})
+    target["analysis_attempt_id"] = selection_revision_id
+    target["tracking"] = {
+        "status": "PENDING",
+        "analysis_attempt_id": selection_revision_id,
+    }
+    job.target = target
+    job.result = _result_for_new_analysis_attempt(
+        job.result,
+        analysis_attempt_id=selection_revision_id,
+    )
+    progress = dict(job.progress or {})
+    progress["analysis_attempt_id"] = selection_revision_id
+    job.progress = progress
+    job.error = None
+    job.failure_reason = normalize_failure_reason(None)
+    job.warnings = []
+    if hasattr(job, "ai_report"):
+        job.ai_report = None
+    if hasattr(job, "report"):
+        job.report = None
+    if hasattr(job, "report_status"):
+        job.report_status = "PENDING"
+    if hasattr(job, "report_error"):
+        job.report_error = None
+    return selection_revision_id
 
 
 def normalize_status(status: str) -> str:
@@ -84,6 +162,33 @@ def normalize_payload(payload: object) -> dict:
     if isinstance(encoded, dict):
         return encoded
     return {"value": encoded}
+
+
+def _result_for_new_analysis_attempt(
+    result_payload: Dict[str, Any] | None,
+    *,
+    analysis_attempt_id: str,
+) -> Dict[str, Any]:
+    """Drop prior analysis output while retaining the immutable input asset.
+
+    Preview frames and their selectable detections live on ``job.preview_frames``.
+    Keeping candidate/evaluation/tracking fields in ``job.result`` would allow a
+    later attempt to expose a stale successful result before its own worker run
+    has produced evidence.
+    """
+
+    source = result_payload if isinstance(result_payload, dict) else {}
+    source_assets = source.get("assets")
+    input_video = (
+        source_assets.get("input_video")
+        if isinstance(source_assets, dict)
+        and isinstance(source_assets.get("input_video"), dict)
+        else None
+    )
+    reset: Dict[str, Any] = {"analysis_attempt_id": analysis_attempt_id}
+    if input_video is not None:
+        reset["assets"] = {"input_video": dict(input_video)}
+    return reset
 
 
 def _extract_frames_processed(result_payload: Dict[str, Any] | None) -> int | None:
@@ -118,6 +223,15 @@ def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
     url = clip.get("url") or clip.get("signed_url")
     label = clip.get("label")
     clip_type = clip.get("type")
+    snake_attempt_id = str(clip.get("analysis_attempt_id") or "").strip() or None
+    camel_attempt_id = str(clip.get("analysisAttemptId") or "").strip() or None
+    analysis_attempt_id = (
+        None
+        if snake_attempt_id
+        and camel_attempt_id
+        and snake_attempt_id.lower() != camel_attempt_id.lower()
+        else snake_attempt_id or camel_attempt_id
+    )
     if label is None and start is not None and end is not None:
         label = f"{start}s-{end}s"
     return {
@@ -126,10 +240,13 @@ def _normalize_clip_asset(clip: Dict[str, Any]) -> Dict[str, Any]:
         "startSec": start,
         "endSec": end,
         "type": clip_type,
+        "analysisAttemptId": analysis_attempt_id,
     }
 
 
-def _build_result_assets(result_payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _build_result_assets(
+    result_payload: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     radar = result_payload.get("radar") or {}
     match_rating_10 = (
         result_payload.get("match_rating_10")
@@ -210,6 +327,7 @@ def _build_ai_report_payload(job: AnalysisJob) -> Dict[str, Any]:
                 "url": clip.get("url"),
                 "startSec": clip.get("startSec"),
                 "endSec": clip.get("endSec"),
+                "analysisAttemptId": clip.get("analysisAttemptId"),
             }
         )
     return {
@@ -297,6 +415,125 @@ def error_detail(code: str, message: str, details: dict | None = None) -> dict:
     if details:
         payload["details"] = details
     return {"error": payload}
+
+
+def _require_analysis_attempt(
+    job: AnalysisJob,
+    request: Request,
+    payload: Any = None,
+    *,
+    mutation: str,
+) -> str | None:
+    return require_analysis_attempt(
+        job,
+        request,
+        payload if isinstance(payload, dict) else None,
+        mutation=mutation,
+        error_detail_factory=error_detail,
+    )
+
+
+def _dispatch_analysis_or_reconcile(
+    job: AnalysisJob,
+    analysis_attempt_id: str,
+    request: Request,
+    db: Session,
+) -> dict | None:
+    """Dispatch an analysis without leaving an unclaimed QUEUED job behind."""
+
+    try:
+        from app.workers.pipeline import run_analysis
+
+        run_analysis.delay(job.id, analysis_attempt_id)
+        return None
+    except Exception as exc:
+        logger.exception(
+            "Analysis dispatch raised; reconciling delivery state job_id=%s",
+            job.id,
+        )
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        expire_all = getattr(db, "expire_all", None)
+        if callable(expire_all):
+            expire_all()
+
+        current_job = _load_job_for_update(db, job.id)
+        if current_job is None:
+            raise HTTPException(
+                status_code=503,
+                detail=error_detail(
+                    "ANALYSIS_ENQUEUE_FAILED",
+                    "Unable to enqueue the analysis.",
+                ),
+            ) from exc
+
+        current_target = (
+            current_job.target if isinstance(current_job.target, dict) else {}
+        )
+        current_progress = (
+            current_job.progress if isinstance(current_job.progress, dict) else {}
+        )
+        current_attempt_id = (
+            str(current_target.get("analysis_attempt_id") or "").strip() or None
+        )
+        progress_attempt_id = (
+            str(current_progress.get("analysis_attempt_id") or "").strip() or None
+        )
+        analysis_task_id = (
+            str(current_progress.get("analysis_task_id") or "").strip() or None
+        )
+        current_status = str(current_job.status or "").upper()
+        still_unclaimed_attempt = (
+            current_attempt_id == analysis_attempt_id
+            and progress_attempt_id == analysis_attempt_id
+            and current_status == "QUEUED"
+            and analysis_task_id is None
+        )
+
+        if not still_unclaimed_attempt:
+            logger.warning(
+                "Analysis dispatch outcome is ambiguous; preserving authoritative "
+                "job state job_id=%s expected_attempt=%s current_attempt=%s "
+                "status=%s analysis_task_id=%s",
+                current_job.id,
+                analysis_attempt_id,
+                current_attempt_id,
+                current_status,
+                analysis_task_id,
+            )
+            return ok_response(
+                {
+                    "job_id": current_job.id,
+                    "id": current_job.id,
+                    "status": current_status,
+                    "analysis_attempt_id": current_attempt_id,
+                    "dispatch_ambiguous": True,
+                },
+                request,
+            )
+
+        failed_at = datetime.now(timezone.utc)
+        current_job.status = "FAILED"
+        current_job.error = f"Analysis enqueue failed: {exc}"
+        current_job.failure_reason = normalize_failure_reason("ANALYSIS_ENQUEUE_FAILED")
+        current_job.progress = {
+            **current_progress,
+            "step": "FAILED",
+            "phase": "QUEUE",
+            "pct": 100,
+            "message": "Analysis enqueue failed",
+            "updated_at": failed_at.isoformat(),
+        }
+        current_job.updated_at = failed_at
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail=error_detail(
+                "ANALYSIS_ENQUEUE_FAILED",
+                "Unable to enqueue the analysis.",
+            ),
+        ) from exc
 
 
 def _is_private_ip(ip_value: str) -> bool:
@@ -510,7 +747,9 @@ def build_public_video_url(
     return job.video_url
 
 
-def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+def attach_presigned_urls(
+    result: Dict[str, Any], context: Dict[str, Any]
+) -> Dict[str, Any]:
     s3_public = context["s3_public"]
     bucket_default = context["bucket"]
     expires_seconds = context["expires_seconds"]
@@ -548,7 +787,11 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
         clips = assets_copy.get("clips")
         if isinstance(clips, list):
             assets_copy["clips"] = [
-                normalize_asset(clip, include_url=True) if isinstance(clip, dict) else clip
+                (
+                    normalize_asset(clip, include_url=True)
+                    if isinstance(clip, dict)
+                    else clip
+                )
                 for clip in clips
             ]
 
@@ -557,9 +800,11 @@ def attach_presigned_urls(result: Dict[str, Any], context: Dict[str, Any]) -> Di
     preview_frames = hydrated.get("preview_frames")
     if isinstance(preview_frames, list):
         hydrated["preview_frames"] = [
-            normalize_asset(frame, include_url=False)
-            if isinstance(frame, dict)
-            else frame
+            (
+                normalize_asset(frame, include_url=False)
+                if isinstance(frame, dict)
+                else frame
+            )
             for frame in preview_frames
         ]
 
@@ -891,10 +1136,7 @@ def get_job(job_id: str, request: Request, view: str = "lite"):
 
         needs_video_presign = bool(
             job.video_key
-            or (
-                job.video_url
-                and not job.video_url.startswith(("http://", "https://"))
-            )
+            or (job.video_url and not job.video_url.startswith(("http://", "https://")))
         )
         if needs_video_presign and context is None:
             context = load_s3_context()
@@ -909,9 +1151,11 @@ def get_job(job_id: str, request: Request, view: str = "lite"):
             assets = {**assets, "inputVideoUrl": public_video_url}
         if preview_frames:
             preview_frames = [
-                {**frame, "key": frame.get("key") or frame.get("s3_key")}
-                if isinstance(frame, dict)
-                else frame
+                (
+                    {**frame, "key": frame.get("key") or frame.get("s3_key")}
+                    if isinstance(frame, dict)
+                    else frame
+                )
                 for frame in preview_frames
             ]
             preview_frames = _normalize_preview_frames(preview_frames)
@@ -1019,8 +1263,15 @@ def job_diagnostic(job_id: str, request: Request, db: Session = Depends(get_db))
         )
 
     result_payload = normalize_payload(job.result)
-    result_keys = list(result_payload.keys()) if isinstance(result_payload, dict) else []
-    assets_snapshot: Dict[str, Any] = {"bucket": None, "prefix": None, "count": 0, "keys": []}
+    result_keys = (
+        list(result_payload.keys()) if isinstance(result_payload, dict) else []
+    )
+    assets_snapshot: Dict[str, Any] = {
+        "bucket": None,
+        "prefix": None,
+        "count": 0,
+        "keys": [],
+    }
     try:
         context = load_s3_context()
         bucket = context["bucket"]
@@ -1141,13 +1392,14 @@ def enqueue_job_report(
     force: int = 1,
     db: Session = Depends(get_db),
 ):
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
+    _require_analysis_attempt(job, request, mutation="report")
     _ensure_job_reportable(job)
 
     if job.report and not force:
@@ -1162,6 +1414,7 @@ def enqueue_job_report(
 
     from app.workers.ai_report import generate_report
 
+    analysis_attempt_id = _analysis_attempt_id(job)
     job.report_status = "PENDING"
     job.report_error = None
     if force:
@@ -1169,8 +1422,18 @@ def enqueue_job_report(
     db.add(job)
     db.commit()
 
-    generate_report.delay(job.id, force=bool(force))
-    return ok_response({"status": "PENDING"}, request)
+    generate_report.delay(
+        job.id,
+        analysis_attempt_id,
+        force=bool(force),
+    )
+    return ok_response(
+        {
+            "status": "PENDING",
+            "analysis_attempt_id": analysis_attempt_id,
+        },
+        request,
+    )
 
 
 @router.get("/jobs/{job_id}/report")
@@ -1202,12 +1465,13 @@ def job_ai_report(
     db: Session = Depends(get_db),
 ):
     # backward compatibility with existing clients, now backed by /report data
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    _require_analysis_attempt(job, request, mutation="ai-report")
     _ensure_job_reportable(job)
 
     if job.report and not force:
@@ -1219,6 +1483,8 @@ def job_ai_report(
             status_code=409,
             detail=error_detail("JOB_CLIPS_MISSING", "Job clips are missing"),
         )
+    analysis_attempt_id = _analysis_attempt_id(job)
+    db.commit()
 
     model = (os.environ.get("OPENAI_MODEL") or "gpt-5.2").strip()
     logger.info("AI_REPORT_START_SYNC job_id=%s model=%s", job.id, model)
@@ -1226,7 +1492,9 @@ def job_ai_report(
         ai_report, usage = generate_ai_report(ai_payload)
     except RuntimeError as exc:
         logger.error("AI_REPORT_FAIL_SYNC job_id=%s error=%s", job.id, exc)
-        raise HTTPException(status_code=503, detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc))) from exc
+        raise HTTPException(
+            status_code=503, detail=error_detail("AI_REPORT_UNAVAILABLE", str(exc))
+        ) from exc
     except Exception as exc:
         logger.error("AI_REPORT_FAIL_SYNC job_id=%s error=%s", job.id, exc)
         raise HTTPException(
@@ -1239,13 +1507,31 @@ def job_ai_report(
     else:
         logger.info("AI_REPORT_OK_SYNC job_id=%s", job.id)
 
-    job.ai_report = ai_report
-    job.report = ai_report
-    job.report_status = "DONE"
-    job.report_error = None
-    db.add(job)
+    current = _load_job_for_update(db, job_id)
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+    if _analysis_attempt_id(current) != analysis_attempt_id:
+        raise HTTPException(
+            status_code=409,
+            detail=error_detail(
+                "ANALYSIS_ATTEMPT_SUPERSEDED",
+                "The analysis attempt changed while generating the report.",
+                {
+                    "expected_analysis_attempt_id": analysis_attempt_id,
+                    "current_analysis_attempt_id": _analysis_attempt_id(current),
+                },
+            ),
+        )
+    current.ai_report = ai_report
+    current.report = ai_report
+    current.report_status = "DONE"
+    current.report_error = None
+    db.add(current)
     db.commit()
-    db.refresh(job)
+    db.refresh(current)
 
     return ok_response({"ai_report": ai_report}, request)
 
@@ -1287,7 +1573,9 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
                     "secondaryCount": 0,
                     "thresholdPct": 0.05,
                     "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
-                    "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+                    "minSeconds": float(
+                        os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0
+                    ),
                     "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
                 },
                 "autodetection_status": "PROCESSING",
@@ -1319,18 +1607,14 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
     )
     if "thresholdPct" not in autodetection:
         autodetection["thresholdPct"] = 0.05
-    autodetection.setdefault(
-        "minHits", int(os.environ.get("CANDIDATE_MIN_HITS", "2"))
-    )
+    autodetection.setdefault("minHits", int(os.environ.get("CANDIDATE_MIN_HITS", "2")))
     autodetection.setdefault(
         "minSeconds", float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0)
     )
-    autodetection.setdefault(
-        "topN", int(os.environ.get("CANDIDATE_TOP_N", "5"))
-    )
+    autodetection.setdefault("topN", int(os.environ.get("CANDIDATE_TOP_N", "5")))
     if "totalTracks" not in autodetection:
-        autodetection["totalTracks"] = (
-            result_payload.get("totalTracks") or len(candidates_payload.get("candidates") or [])
+        autodetection["totalTracks"] = result_payload.get("totalTracks") or len(
+            candidates_payload.get("candidates") or []
         )
     autodetection.setdefault(
         "rawTracks", result_payload.get("rawTracks") or autodetection["totalTracks"]
@@ -1339,16 +1623,15 @@ def job_candidates(job_id: str, request: Request, db: Session = Depends(get_db))
         autodetection["primaryCount"] = result_payload.get("primaryCount") or 0
     if "secondaryCount" not in autodetection:
         autodetection["secondaryCount"] = result_payload.get("secondaryCount") or 0
-    autodetection_status = candidates_payload.get("autodetection_status") or "PROCESSING"
+    autodetection_status = (
+        candidates_payload.get("autodetection_status") or "PROCESSING"
+    )
     error_detail_payload = candidates_payload.get("error_detail")
     candidates = _build_candidate_payload(candidates_payload, context)
     if autodetection_status == "FAILED":
         status = "FAILED"
         candidates = []
-    elif (
-        autodetection_status in {"PROCESSING", "PENDING_QUEUE"}
-        and not candidates
-    ):
+    elif autodetection_status in {"PROCESSING", "PENDING_QUEUE"} and not candidates:
         status = "PROCESSING"
         candidates = []
     elif frames_processed < MIN_FRAMES_FOR_EVAL and not candidates:
@@ -1386,7 +1669,11 @@ def _parse_track_selection_payload(payload: Any) -> TrackSelectionPayload:
             detail=error_detail(
                 "INVALID_PAYLOAD",
                 "Invalid select-track payload",
-                {"errors": [{"field": "payload", "message": "Payload must be an object"}]},
+                {
+                    "errors": [
+                        {"field": "payload", "message": "Payload must be an object"}
+                    ]
+                },
             ),
         )
     try:
@@ -1409,7 +1696,11 @@ def _parse_pick_player_payload(payload: Any) -> PickPlayerPayload:
             detail=error_detail(
                 "INVALID_PAYLOAD",
                 "Invalid pick-player payload",
-                {"errors": [{"field": "payload", "message": "Payload must be an object"}]},
+                {
+                    "errors": [
+                        {"field": "payload", "message": "Payload must be an object"}
+                    ]
+                },
             ),
         )
     try:
@@ -1459,7 +1750,9 @@ def _build_preview_lookup(preview_frames: list) -> Dict[str, Dict[str, Any]]:
     return preview_lookup
 
 
-def _find_preview_frame(preview_lookup: Dict[str, Dict[str, Any]], frame_key: str) -> Dict[str, Any] | None:
+def _find_preview_frame(
+    preview_lookup: Dict[str, Dict[str, Any]], frame_key: str
+) -> Dict[str, Any] | None:
     if not frame_key:
         return None
     return preview_lookup.get(frame_key)
@@ -1526,9 +1819,7 @@ def _normalize_preview_frames(preview_frames: list) -> list:
 def _reset_failed_tracking_attempt(job: AnalysisJob) -> bool:
     result = job.result if isinstance(job.result, dict) else {}
     tracking = (
-        result.get("tracking")
-        if isinstance(result.get("tracking"), dict)
-        else {}
+        result.get("tracking") if isinstance(result.get("tracking"), dict) else {}
     )
     summary = (
         tracking.get("reid_summary")
@@ -1541,11 +1832,7 @@ def _reset_failed_tracking_attempt(job: AnalysisJob) -> bool:
         tracking.get("tracking_status") or summary.get("status") or ""
     ).upper()
     normalized_reason_codes = (
-        {
-            str(code).strip().upper()
-            for code in reason_codes
-            if str(code).strip()
-        }
+        {str(code).strip().upper() for code in reason_codes if str(code).strip()}
         if isinstance(reason_codes, list)
         else set()
     )
@@ -1558,7 +1845,8 @@ def _reset_failed_tracking_attempt(job: AnalysisJob) -> bool:
         )
     )
     deterministic_anchor_failure = any(
-        code in {
+        code
+        in {
             "REID_ANCHORS_NOT_FOUND",
             "REID_ALL_ANCHORS_NOT_FOUND",
             "REID_ANCHOR_TRACK_NOT_FOUND",
@@ -1567,15 +1855,12 @@ def _reset_failed_tracking_attempt(job: AnalysisJob) -> bool:
         }
         for code in normalized_reason_codes
     )
-    failed_reid = (
-        not acquisition_failure
-        and (
-            action_required == "RESELECT_PLAYER"
-            or tracking_status
-            in {"ANCHOR_NOT_FOUND", "ANCHOR_REJECTED", "ANCHOR_TRACK_EMPTY"}
-            or deterministic_anchor_failure
-            or job.failure_reason == "PLAYER_RESELECTION_REQUIRED"
-        )
+    failed_reid = not acquisition_failure and (
+        action_required == "RESELECT_PLAYER"
+        or tracking_status
+        in {"ANCHOR_NOT_FOUND", "ANCHOR_REJECTED", "ANCHOR_TRACK_EMPTY"}
+        or deterministic_anchor_failure
+        or job.failure_reason == "PLAYER_RESELECTION_REQUIRED"
     )
     if not failed_reid:
         return False
@@ -1634,6 +1919,7 @@ def _bbox_iou(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
         return 0.0
     return inter_area / denom
 
+
 @router.post("/jobs/{job_id}/select-track")
 def select_track(
     job_id: str,
@@ -1641,13 +1927,20 @@ def select_track(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
-    normalized_payload = _parse_track_selection_payload(payload)
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    _require_analysis_attempt(
+        job,
+        request,
+        payload,
+        mutation="select-track",
+    )
+    _reject_active_analysis_mutation(job)
+    normalized_payload = _parse_track_selection_payload(payload)
 
     result_payload = normalize_payload(job.result)
     candidates_payload_raw = result_payload.get("candidates") or {}
@@ -1675,6 +1968,7 @@ def select_track(
         )
 
     recovery_reset = _reset_failed_tracking_attempt(job)
+    selection_revision_id = _invalidate_analysis_attempt_for_selection(job)
     player_ref_payload: Dict[str, Any] = {
         "track_id": candidate.get("track_id", normalized_payload.track_id),
         "tier": candidate.get("tier") or "UNKNOWN",
@@ -1753,6 +2047,7 @@ def select_track(
             "target": None,
             "target_suggestion": target_suggestion,
             "progress": normalize_payload(job.progress),
+            "analysis_attempt_id": selection_revision_id,
         },
         request,
     )
@@ -1765,13 +2060,20 @@ def pick_player(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
-    normalized_payload = _parse_pick_player_payload(payload)
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    _require_analysis_attempt(
+        job,
+        request,
+        payload,
+        mutation="pick-player",
+    )
+    _reject_active_analysis_mutation(job)
+    normalized_payload = _parse_pick_player_payload(payload)
 
     preview_lookup = _build_preview_lookup(job.preview_frames or [])
     selected_frame = _find_preview_frame(preview_lookup, normalized_payload.frame_key)
@@ -1810,6 +2112,7 @@ def pick_player(
         )
 
     recovery_reset = _reset_failed_tracking_attempt(job)
+    selection_revision_id = _invalidate_analysis_attempt_for_selection(job)
     frame_key = selected_frame.get("key") or selected_frame.get("s3_key")
     time_sec = selected_frame.get("time_sec")
     bbox = selected_track.get("bbox") or {}
@@ -1835,7 +2138,10 @@ def pick_player(
 
     target_payload = {**(job.target or {})}
     target_payload["confirmed"] = False
-    target_payload["tracking"] = {"status": "PENDING"}
+    target_payload["tracking"] = {
+        "status": "PENDING",
+        "analysis_attempt_id": selection_revision_id,
+    }
     target_payload["selection"] = {
         "frame_key": frame_key,
         "time_sec": float(time_sec) if time_sec is not None else None,
@@ -1869,6 +2175,7 @@ def pick_player(
             "player_ref": job.player_ref,
             "target": job.target,
             "progress": normalize_payload(job.progress),
+            "analysis_attempt_id": selection_revision_id,
         },
         request,
     )
@@ -1881,13 +2188,19 @@ def analyze_player(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
-    normalized_payload = _parse_pick_player_payload(payload)
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    _require_analysis_attempt(
+        job,
+        request,
+        payload,
+        mutation="analyze-player",
+    )
+    normalized_payload = _parse_pick_player_payload(payload)
 
     preview_lookup = _build_preview_lookup(job.preview_frames or [])
     selected_frame = _find_preview_frame(preview_lookup, normalized_payload.frame_key)
@@ -1951,12 +2264,13 @@ def analyze_player(
             )
 
     current_track = (
-        (job.player_ref or {}).get("track_id") if isinstance(job.player_ref, dict) else None
+        (job.player_ref or {}).get("track_id")
+        if isinstance(job.player_ref, dict)
+        else None
     )
-    if (
-        job.status in {"COMPLETED", "PARTIAL"}
-        and _track_id_variants(current_track) & _track_id_variants(track_id)
-    ):
+    if job.status in {"COMPLETED", "PARTIAL"} and _track_id_variants(
+        current_track
+    ) & _track_id_variants(track_id):
         return ok_response(
             {
                 "job_id": job.id,
@@ -1967,19 +2281,20 @@ def analyze_player(
             },
             request,
         )
-    if (
-        job.status in {"QUEUED", "RUNNING"}
-        and _track_id_variants(current_track) & _track_id_variants(track_id)
-    ):
+    if job.status in ACTIVE_ANALYSIS_STATUSES and _track_id_variants(
+        current_track
+    ) & _track_id_variants(track_id):
         return ok_response(
             {
                 "job_id": job.id,
                 "id": job.id,
                 "status": job.status,
                 "progress": normalize_payload(job.progress),
+                "analysis_attempt_id": _analysis_attempt_id(job),
             },
             request,
         )
+    _reject_active_analysis_mutation(job)
 
     frame_key = selected_frame.get("key") or selected_frame.get("s3_key")
     time_sec = selected_frame.get("time_sec")
@@ -2004,7 +2319,9 @@ def analyze_player(
         )
     job.player_ref = player_ref_payload
 
+    analysis_attempt_id = str(uuid4())
     target_payload = {
+        **(job.target or {}),
         "confirmed": True,
         "selection": {
             "frame_key": frame_key,
@@ -2021,12 +2338,26 @@ def analyze_player(
                 "h": float(bbox.get("h", 0.0)),
             }
         ],
-        "tracking": {"status": "PENDING"},
+        "analysis_attempt_id": analysis_attempt_id,
+        "tracking": {
+            "status": "PENDING",
+            "analysis_attempt_id": analysis_attempt_id,
+        },
     }
     job.target = target_payload
 
     job.status = "QUEUED"
     job.error = None
+    job.failure_reason = normalize_failure_reason(None)
+    job.warnings = []
+    if hasattr(job, "ai_report"):
+        job.ai_report = None
+    if hasattr(job, "report"):
+        job.report = None
+    if hasattr(job, "report_status"):
+        job.report_status = "PENDING"
+    if hasattr(job, "report_error"):
+        job.report_error = None
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
     try:
@@ -2038,6 +2369,7 @@ def analyze_player(
         "step": "QUEUED",
         "pct": max(current_pct, 20),
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_attempt_id": analysis_attempt_id,
     }
 
     player_runs = player_runs if isinstance(player_runs, dict) else {}
@@ -2047,7 +2379,10 @@ def analyze_player(
         "requested_at": datetime.now(timezone.utc).isoformat(),
     }
     job.result = {
-        **existing_result,
+        **_result_for_new_analysis_attempt(
+            existing_result,
+            analysis_attempt_id=analysis_attempt_id,
+        ),
         "player_runs": player_runs,
     }
     job.updated_at = datetime.now(timezone.utc)
@@ -2055,9 +2390,14 @@ def analyze_player(
     db.commit()
     db.refresh(job)
 
-    from app.workers.pipeline import run_analysis
-
-    run_analysis.delay(job.id)
+    dispatch_response = _dispatch_analysis_or_reconcile(
+        job,
+        analysis_attempt_id,
+        request,
+        db,
+    )
+    if dispatch_response is not None:
+        return dispatch_response
 
     return ok_response(
         {
@@ -2065,6 +2405,7 @@ def analyze_player(
             "id": job.id,
             "status": job.status,
             "progress": normalize_payload(job.progress),
+            "analysis_attempt_id": analysis_attempt_id,
         },
         request,
     )
@@ -2175,7 +2516,9 @@ def _normalize_target_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise _InvalidTargetPayload(["payload"])
 
-    frame_key = payload.get("frame_key") or payload.get("frameKey") or payload.get("key")
+    frame_key = (
+        payload.get("frame_key") or payload.get("frameKey") or payload.get("key")
+    )
     time_sec = (
         payload.get("time_sec")
         or payload.get("timeSec")
@@ -2263,7 +2606,7 @@ def _confirm_target_selection(
 ):
     request_id = getattr(request.state, "request_id", None)
     try:
-        job = db.get(AnalysisJob, job_id)
+        job = _load_job_for_update(db, job_id)
         if not job:
             return _error_response(
                 "JOB_NOT_FOUND",
@@ -2271,6 +2614,13 @@ def _confirm_target_selection(
                 request,
                 status_code=404,
             )
+        _require_analysis_attempt(
+            job,
+            request,
+            payload,
+            mutation="target",
+        )
+        _reject_active_analysis_mutation(job)
 
         normalized_payload = _normalize_target_payload(payload)
         logger.info(
@@ -2324,10 +2674,14 @@ def _confirm_target_selection(
         elif preview_lookup and time_sec is not None:
             selected_frame = min(
                 preview_lookup.values(),
-                key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
+                key=lambda item: abs(
+                    float(item.get("time_sec") or 0.0) - float(time_sec)
+                ),
             )
             closest_time = float(selected_frame.get("time_sec") or 0.0)
-            if abs(closest_time - float(time_sec)) > _preview_time_epsilon(preview_frames):
+            if abs(closest_time - float(time_sec)) > _preview_time_epsilon(
+                preview_frames
+            ):
                 logger.info(
                     "confirm-target frame_time_mismatch job_id=%s time_sec=%s",
                     job_id,
@@ -2464,10 +2818,12 @@ def _confirm_target_selection(
                     "targetRef": job.target,
                     "warnings": list(job.warnings or []),
                     "progress": normalize_payload(job.progress),
+                    "analysis_attempt_id": _analysis_attempt_id(job),
                 },
                 request,
             )
 
+        selection_revision_id = _invalidate_analysis_attempt_for_selection(job)
         selections_payload = [
             {
                 "frame_key": frame_key,
@@ -2482,7 +2838,10 @@ def _confirm_target_selection(
         target_payload["confirmed"] = True
         target_payload["selection"] = selection_payload
         target_payload["selections"] = selections_payload
-        target_payload["tracking"] = {"status": "PENDING"}
+        target_payload["tracking"] = {
+            "status": "PENDING",
+            "analysis_attempt_id": selection_revision_id,
+        }
         job.target = target_payload
         job.status = "READY_TO_ENQUEUE"
         job.updated_at = datetime.now(timezone.utc)
@@ -2517,6 +2876,7 @@ def _confirm_target_selection(
                 "targetRef": job.target,
                 "warnings": list(job.warnings or []),
                 "progress": normalize_payload(job.progress),
+                "analysis_attempt_id": selection_revision_id,
             },
             request,
         )
@@ -2651,12 +3011,14 @@ def _has_player_ref(player_ref: Any) -> bool:
 def _save_target_selection(
     job_id: str, payload: SelectionPayload, request: Request, db: Session
 ):
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
+    _require_analysis_attempt(job, request, mutation="selection")
+    _reject_active_analysis_mutation(job)
     target_payload = _merge_target_from_selections(
         job.target,
         _build_target_from_selections(payload),
@@ -2699,8 +3061,7 @@ def _save_target_selection(
                     selected_frame = min(
                         preview_lookup.values(),
                         key=lambda item: abs(
-                            float(item.get("time_sec") or 0.0)
-                            - float(time_sec)
+                            float(item.get("time_sec") or 0.0) - float(time_sec)
                         ),
                     )
             if isinstance(selected_frame, dict):
@@ -2730,9 +3091,13 @@ def _save_target_selection(
             and isinstance(selections_payload[0], dict)
         ):
             selection_payload["frame_key"] = selections_payload[0].get("frame_key")
-            selection_payload["time_sec"] = selections_payload[0].get(
-                "frame_time_sec"
-            )
+            selection_payload["time_sec"] = selections_payload[0].get("frame_time_sec")
+    selection_revision_id = _invalidate_analysis_attempt_for_selection(job)
+    target_payload["analysis_attempt_id"] = selection_revision_id
+    target_payload["tracking"] = {
+        **(target_payload.get("tracking") or {}),
+        "analysis_attempt_id": selection_revision_id,
+    }
     job.target = target_payload
 
     player_ref = job.player_ref or job.anchor or {}
@@ -2763,19 +3128,33 @@ def _save_target_selection(
 
     db.commit()
     db.refresh(job)
-    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": job.status,
+            "analysis_attempt_id": selection_revision_id,
+        },
+        request,
+    )
 
 
 @router.post("/jobs/{job_id}/selection")
 def save_selection(
-    job_id: str, payload: SelectionPayload, request: Request, db: Session = Depends(get_db)
+    job_id: str,
+    payload: SelectionPayload,
+    request: Request,
+    db: Session = Depends(get_db),
 ):
     return _save_target_selection(job_id, payload, request, db)
 
 
 @router.post("/jobs/{job_id}/target")
 def save_target(
-    job_id: str, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)
+    job_id: str,
+    request: Request,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
 ):
     return _confirm_target_selection(job_id, payload, request, db)
 
@@ -2794,6 +3173,19 @@ async def save_player_ref(
     else:
         logger.info("player-ref body=<empty>")
     logger.info("player-ref raw_payload=%s", payload)
+    job = _load_job_for_update(db, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
+        )
+    _require_analysis_attempt(
+        job,
+        request,
+        payload,
+        mutation="player-ref",
+    )
+    _reject_active_analysis_mutation(job)
     try:
         # --- compat: accept flat payload from UI ---
         if isinstance(payload, dict):
@@ -2841,12 +3233,6 @@ async def save_player_ref(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     logger.info("player-ref normalized_payload=%s", normalized_payload.model_dump())
-    job = db.get(AnalysisJob, job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=error_detail("JOB_NOT_FOUND", "Job not found"),
-        )
 
     try:
         bbox_xywh = normalized_payload.bbox_xywh or None
@@ -2873,6 +3259,7 @@ async def save_player_ref(
             )
 
         t0 = normalized_payload.frame_time_sec or 0.0
+        _invalidate_analysis_attempt_for_selection(job)
         player_ref_payload = {
             "t": float(t0),
             "x": bbox_xywh["x"],
@@ -2935,6 +3322,7 @@ async def save_player_ref(
                 "job_id": job.id,
                 "id": job.id,
                 "player_ref": normalized_player_ref,
+                "analysis_attempt_id": _analysis_attempt_id(job),
             },
             request,
         )
@@ -3080,16 +3468,37 @@ def enqueue_job(
     payload: dict | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    # idempotente: se già avanzato, non reinvio
-    if job.status in ["QUEUED", "RUNNING", "COMPLETED", "FAILED"]:
-        return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+    _require_analysis_attempt(
+        job,
+        request,
+        payload,
+        mutation="enqueue",
+    )
+    # idempotente: se già avanzato, non reinvio e non ruoto il tentativo
+    if job.status in [
+        *ACTIVE_ANALYSIS_STATUSES,
+        "COMPLETED",
+        "FAILED",
+    ]:
+        current_attempt_id = str(
+            (job.target or {}).get("analysis_attempt_id") or ""
+        ).strip()
+        return ok_response(
+            {
+                "job_id": job.id,
+                "id": job.id,
+                "status": job.status,
+                "analysis_attempt_id": current_attempt_id or None,
+            },
+            request,
+        )
 
     target_confirmed = bool((job.target or {}).get("confirmed"))
     missing: List[str] = []
@@ -3113,8 +3522,30 @@ def enqueue_job(
             },
         )
 
+    analysis_attempt_id = str(uuid4())
+    target = dict(job.target or {})
+    target["analysis_attempt_id"] = analysis_attempt_id
+    target["tracking"] = {
+        "status": "PENDING",
+        "analysis_attempt_id": analysis_attempt_id,
+    }
+    job.target = target
+    job.result = _result_for_new_analysis_attempt(
+        job.result,
+        analysis_attempt_id=analysis_attempt_id,
+    )
     job.status = "QUEUED"
     job.error = None
+    job.failure_reason = normalize_failure_reason(None)
+    job.warnings = []
+    if hasattr(job, "ai_report"):
+        job.ai_report = None
+    if hasattr(job, "report"):
+        job.report = None
+    if hasattr(job, "report_status"):
+        job.report_status = "PENDING"
+    if hasattr(job, "report_error"):
+        job.report_error = None
     progress = job.progress or {}
     current_pct = progress.get("pct") or 0
     try:
@@ -3126,12 +3557,26 @@ def enqueue_job(
         "step": "QUEUED",
         "pct": max(current_pct, 20),
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_attempt_id": analysis_attempt_id,
     }
     db.commit()
     db.refresh(job)
 
-    from app.workers.pipeline import run_analysis
+    dispatch_response = _dispatch_analysis_or_reconcile(
+        job,
+        analysis_attempt_id,
+        request,
+        db,
+    )
+    if dispatch_response is not None:
+        return dispatch_response
 
-    run_analysis.delay(job.id)
-
-    return ok_response({"job_id": job.id, "id": job.id, "status": job.status}, request)
+    return ok_response(
+        {
+            "job_id": job.id,
+            "id": job.id,
+            "status": job.status,
+            "analysis_attempt_id": analysis_attempt_id,
+        },
+        request,
+    )

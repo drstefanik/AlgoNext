@@ -1,6 +1,10 @@
 import ast
+import copy
+import os
+import socket
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 class WorkerPolicyBootstrapTests(unittest.TestCase):
@@ -45,8 +49,92 @@ class WorkerPolicyBootstrapTests(unittest.TestCase):
         ready_block = self.source[worker_ready_handler:worker_shutdown_handler]
 
         self.assertIn("install_worker_pipeline_policy()", ready_block)
-        self.assertIn("recover_interrupted_jobs()", ready_block)
+        self.assertIn("recover_interrupted_jobs(", ready_block)
         self.assertIn("start_worker_heartbeat", ready_block)
+        self.assertIn("inspect_runtime()", ready_block)
+        self.assertIn("if heartbeat_confirmed:", ready_block)
+        self.assertIn("recovery_revision=APP_GIT_SHA", ready_block)
+        self.assertLess(
+            ready_block.index("start_worker_heartbeat"),
+            ready_block.index("recover_interrupted_jobs("),
+        )
+
+    def _load_worker_ready(self, *, runtime_snapshot):
+        handler = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_on_worker_ready"
+        )
+        handler = copy.deepcopy(handler)
+        handler.decorator_list = []
+        module = ast.Module(body=[handler], type_ignores=[])
+        events = []
+        namespace = {
+            "APP_GIT_SHA": "revision-a",
+            "install_worker_pipeline_policy": lambda: True,
+            "install_worker_preview_asset_policy": lambda: True,
+            "start_worker_heartbeat": (
+                lambda worker_name: events.append(("heartbeat", worker_name))
+            ),
+            "inspect_runtime": lambda: runtime_snapshot,
+            "recover_interrupted_jobs": (
+                lambda **kwargs: events.append(("recover", kwargs))
+            ),
+            "logger": SimpleNamespace(
+                info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None
+            ),
+            "os": os,
+            "socket": socket,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(module),
+                "app/workers/celery_app.py",
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace["_on_worker_ready"], events
+
+    def test_worker_ready_recovers_only_after_its_own_heartbeat_is_confirmed(self):
+        worker_name = "celery@worker-a"
+        confirmed = {
+            "dependencies": {"worker": "ready"},
+            "worker": {
+                "worker_name": worker_name,
+                "revision": "revision-a",
+                "pid": os.getpid(),
+            },
+        }
+        handler, events = self._load_worker_ready(runtime_snapshot=confirmed)
+
+        handler(sender=SimpleNamespace(hostname=worker_name))
+
+        self.assertEqual(events[0], ("heartbeat", worker_name))
+        self.assertEqual(
+            events[1],
+            (
+                "recover",
+                {
+                    "recovery_owner": f"{worker_name}:revision-a",
+                    "recovery_revision": "revision-a",
+                },
+            ),
+        )
+
+        unconfirmed = {
+            "dependencies": {"worker": "stale"},
+            "worker": {
+                "worker_name": worker_name,
+                "revision": "revision-a",
+                "pid": os.getpid(),
+            },
+        }
+        handler, events = self._load_worker_ready(runtime_snapshot=unconfirmed)
+
+        handler(sender=SimpleNamespace(hostname=worker_name))
+
+        self.assertEqual(events, [("heartbeat", worker_name)])
 
 
 if __name__ == "__main__":

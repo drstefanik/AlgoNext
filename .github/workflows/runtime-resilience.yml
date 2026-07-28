@@ -3,6 +3,7 @@ name: Runtime resilience
 on:
   pull_request:
     paths:
+      - "app/core/analysis_attempt_precondition.py"
       - "app/core/runtime_health.py"
       - "app/core/job_recovery.py"
       - "app/core/pipeline_policy.py"
@@ -10,15 +11,23 @@ on:
       - "app/runtime_api.py"
       - "app/main.py"
       - "app/workers/celery_app.py"
+      - "app/workers/pipeline.py"
+      - "app/workers/tracking.py"
+      - "app/reid/full_match_runtime.py"
       - "app/reid/runtime.py"
       - "app/reid/progress_reporting.py"
+      - "app/reid/team_color_guard.py"
+      - "app/reid/windowed_tracking.py"
       - "Dockerfile"
       - "docker-compose.yml"
+      - ".env.example"
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
       - "tests/test_pipeline_policy.py"
       - "tests/test_preview_asset_policy.py"
       - "tests/test_worker_policy_bootstrap.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -26,6 +35,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "app/core/analysis_attempt_precondition.py"
       - "app/core/runtime_health.py"
       - "app/core/job_recovery.py"
       - "app/core/pipeline_policy.py"
@@ -33,15 +43,23 @@ on:
       - "app/runtime_api.py"
       - "app/main.py"
       - "app/workers/celery_app.py"
+      - "app/workers/pipeline.py"
+      - "app/workers/tracking.py"
+      - "app/reid/full_match_runtime.py"
       - "app/reid/runtime.py"
       - "app/reid/progress_reporting.py"
+      - "app/reid/team_color_guard.py"
+      - "app/reid/windowed_tracking.py"
       - "Dockerfile"
       - "docker-compose.yml"
+      - ".env.example"
       - "tests/test_runtime_*.py"
       - "tests/test_job_recovery.py"
       - "tests/test_pipeline_policy.py"
       - "tests/test_preview_asset_policy.py"
       - "tests/test_worker_policy_bootstrap.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
       - ".github/workflows/deploy.yml"
@@ -79,6 +97,7 @@ jobs:
       - name: Compile runtime modules and tests
         run: >-
           python -m py_compile
+          app/core/analysis_attempt_precondition.py
           app/core/runtime_health.py
           app/core/job_recovery.py
           app/core/pipeline_policy.py
@@ -86,14 +105,21 @@ jobs:
           app/runtime_api.py
           app/main.py
           app/workers/celery_app.py
+          app/workers/pipeline.py
+          app/workers/tracking.py
+          app/reid/full_match_runtime.py
           app/reid/runtime.py
           app/reid/progress_reporting.py
+          app/reid/team_color_guard.py
+          app/reid/windowed_tracking.py
           tests/test_runtime_health.py
           tests/test_runtime_api.py
           tests/test_job_recovery.py
           tests/test_pipeline_policy.py
           tests/test_preview_asset_policy.py
           tests/test_worker_policy_bootstrap.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_tracking_attempt_fencing.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 
@@ -106,6 +132,8 @@ jobs:
           tests/test_pipeline_policy.py
           tests/test_preview_asset_policy.py
           tests/test_worker_policy_bootstrap.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_tracking_attempt_fencing.py
           tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
 

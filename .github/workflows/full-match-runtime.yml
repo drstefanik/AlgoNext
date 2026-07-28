@@ -4,14 +4,22 @@ on:
   pull_request:
     paths:
       - "app/reid/full_match_runtime.py"
+      - "app/reid/progress_reporting.py"
       - "app/reid/runtime.py"
+      - "app/reid/team_color_guard.py"
+      - "app/reid/windowed_tracking.py"
+      - "app/core/preview_asset_policy.py"
       - "app/core/tracking_outcome.py"
       - "app/workers/multi_anchor.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "tests/test_multi_anchor.py"
       - "tests/test_anchor_reselection_pipeline.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_preview_asset_policy.py"
+      - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - "docker-compose.yml"
       - "Dockerfile"
       - ".github/workflows/full-match-runtime.yml"
@@ -19,14 +27,22 @@ on:
     branches: [main]
     paths:
       - "app/reid/full_match_runtime.py"
+      - "app/reid/progress_reporting.py"
       - "app/reid/runtime.py"
+      - "app/reid/team_color_guard.py"
+      - "app/reid/windowed_tracking.py"
+      - "app/core/preview_asset_policy.py"
       - "app/core/tracking_outcome.py"
       - "app/workers/multi_anchor.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "tests/test_multi_anchor.py"
       - "tests/test_anchor_reselection_pipeline.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_preview_asset_policy.py"
+      - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_runtime.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - "docker-compose.yml"
       - "Dockerfile"
       - ".github/workflows/full-match-runtime.yml"
@@ -54,21 +70,33 @@ jobs:
         run: >-
           python -m py_compile
           app/reid/full_match_runtime.py
+          app/reid/progress_reporting.py
           app/reid/runtime.py
+          app/reid/team_color_guard.py
+          app/reid/windowed_tracking.py
+          app/core/preview_asset_policy.py
           app/core/tracking_outcome.py
           app/workers/multi_anchor.py
           app/workers/pipeline.py
           app/workers/tracking.py
           tests/test_multi_anchor.py
           tests/test_anchor_reselection_pipeline.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_preview_asset_policy.py
+          tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
+          tests/test_tracking_attempt_fencing.py
 
       - name: Run runtime policy tests
         run: >-
           python -m unittest
           tests/test_multi_anchor.py
           tests/test_anchor_reselection_pipeline.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_preview_asset_policy.py
+          tests/test_reid_progress_reporting.py
           tests/test_reid_runtime.py
+          tests/test_tracking_attempt_fencing.py
 
       - name: Validate Compose configuration
         run: |

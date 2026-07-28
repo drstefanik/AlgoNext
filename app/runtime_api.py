@@ -10,6 +10,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.analysis_attempt_precondition import require_analysis_attempt
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
@@ -62,9 +63,13 @@ def _load_job_for_update(db: Session, job_id: str) -> AnalysisJob | None:
             select(AnalysisJob)
             .where(AnalysisJob.id == job_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return execute(statement).scalar_one_or_none()
-    return db.get(AnalysisJob, job_id)
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
 
 
 def _has_player_ref(player_ref: Any) -> bool:
@@ -178,9 +183,16 @@ def retry_job(
             detail=_error_detail("JOB_NOT_FOUND", "Job not found"),
         )
 
-    force = bool((payload or {}).get("force")) if isinstance(payload, dict) else False
+    request_payload = payload if isinstance(payload, dict) else {}
+    force = bool(request_payload.get("force"))
     current_status = str(job.status or "").upper()
     current_retry_count = _retry_count(job.result)
+    current_analysis_attempt_id = require_analysis_attempt(
+        job,
+        request,
+        request_payload,
+        mutation="retry",
+    )
 
     if current_status in ACTIVE_STATUSES:
         return _ok(
@@ -190,6 +202,7 @@ def retry_job(
                 "status": current_status,
                 "retry_count": current_retry_count,
                 "already_active": True,
+                "analysis_attempt_id": (current_analysis_attempt_id),
             },
             request,
         )
@@ -248,11 +261,17 @@ def retry_job(
 
     runtime_snapshot = _require_worker_ready()
     retry_id = str(uuid4())
+    analysis_attempt_id = str(uuid4())
     next_retry_count = current_retry_count + 1
     now = _now()
+    previous_target = job.target if isinstance(job.target, dict) else {}
     history_entry = {
         "attempt": next_retry_count,
         "retry_id": retry_id,
+        "analysis_attempt_id": analysis_attempt_id,
+        "previous_analysis_attempt_id": (
+            str(previous_target.get("analysis_attempt_id") or "").strip() or None
+        ),
         "requested_at": now.isoformat(),
         "previous_status": current_status,
         "previous_failure_reason": job.failure_reason,
@@ -267,7 +286,10 @@ def retry_job(
         if input_video.get("bucket"):
             job.video_bucket = str(input_video["bucket"])
 
-    job.result = _preserve_retry_inputs(job.result, history_entry)
+    job.result = {
+        **_preserve_retry_inputs(job.result, history_entry),
+        "analysis_attempt_id": analysis_attempt_id,
+    }
     job.status = "QUEUED"
     job.error = None
     job.failure_reason = normalize_failure_reason(None)
@@ -278,7 +300,12 @@ def retry_job(
     job.report_error = None
 
     target = dict(job.target or {})
-    target["tracking"] = {"status": "PENDING", "retry_id": retry_id}
+    target["analysis_attempt_id"] = analysis_attempt_id
+    target["tracking"] = {
+        "status": "PENDING",
+        "retry_id": retry_id,
+        "analysis_attempt_id": analysis_attempt_id,
+    }
     job.target = target
     job.progress = {
         "step": "QUEUED",
@@ -288,6 +315,7 @@ def retry_job(
         "updated_at": now.isoformat(),
         "retry_count": next_retry_count,
         "retry_id": retry_id,
+        "analysis_attempt_id": analysis_attempt_id,
         "worker_revision": (runtime_snapshot.get("worker") or {}).get("revision"),
     }
     job.updated_at = now
@@ -297,22 +325,89 @@ def retry_job(
     try:
         from app.workers.pipeline import run_analysis
 
-        run_analysis.delay(job.id)
+        run_analysis.delay(job.id, analysis_attempt_id)
     except Exception as exc:
-        logger.exception("Failed to enqueue retry job_id=%s", job.id)
+        logger.exception(
+            "Retry dispatch raised; reconciling delivery state job_id=%s",
+            job.id,
+        )
+        db.rollback()
+        expire_all = getattr(db, "expire_all", None)
+        if callable(expire_all):
+            expire_all()
+
+        current_job = _load_job_for_update(db, job.id)
+        if current_job is None:
+            raise HTTPException(
+                status_code=503,
+                detail=_error_detail(
+                    "RETRY_ENQUEUE_FAILED", "Unable to enqueue the retry."
+                ),
+            ) from exc
+
+        current_target = (
+            current_job.target if isinstance(current_job.target, dict) else {}
+        )
+        current_progress = (
+            current_job.progress if isinstance(current_job.progress, dict) else {}
+        )
+        current_attempt_id = (
+            str(current_target.get("analysis_attempt_id") or "").strip() or None
+        )
+        progress_attempt_id = (
+            str(current_progress.get("analysis_attempt_id") or "").strip() or None
+        )
+        analysis_task_id = (
+            str(current_progress.get("analysis_task_id") or "").strip() or None
+        )
+        current_status = str(current_job.status or "").upper()
+        still_unclaimed_attempt = (
+            current_attempt_id == analysis_attempt_id
+            and progress_attempt_id == analysis_attempt_id
+            and current_status == "QUEUED"
+            and analysis_task_id is None
+        )
+
+        if not still_unclaimed_attempt:
+            logger.warning(
+                "Retry dispatch outcome is ambiguous; preserving authoritative "
+                "job state job_id=%s expected_attempt=%s current_attempt=%s "
+                "status=%s analysis_task_id=%s",
+                current_job.id,
+                analysis_attempt_id,
+                current_attempt_id,
+                current_status,
+                analysis_task_id,
+            )
+            return _ok(
+                {
+                    "job_id": current_job.id,
+                    "id": current_job.id,
+                    "status": current_status,
+                    "retry_count": _retry_count(current_job.result),
+                    "retry_id": retry_id,
+                    "analysis_attempt_id": current_attempt_id,
+                    "worker_revision": (runtime_snapshot.get("worker") or {}).get(
+                        "revision"
+                    ),
+                    "dispatch_ambiguous": True,
+                },
+                request,
+            )
+
         failed_at = _now()
-        job.status = "FAILED"
-        job.error = f"Retry enqueue failed: {exc}"
-        job.failure_reason = normalize_failure_reason("RETRY_ENQUEUE_FAILED")
-        job.progress = {
-            **(job.progress or {}),
+        current_job.status = "FAILED"
+        current_job.error = f"Retry enqueue failed: {exc}"
+        current_job.failure_reason = normalize_failure_reason("RETRY_ENQUEUE_FAILED")
+        current_job.progress = {
+            **current_progress,
             "step": "FAILED",
             "phase": "QUEUE",
             "pct": 100,
             "message": "Retry enqueue failed",
             "updated_at": failed_at.isoformat(),
         }
-        job.updated_at = failed_at
+        current_job.updated_at = failed_at
         db.commit()
         raise HTTPException(
             status_code=503,
@@ -328,6 +423,7 @@ def retry_job(
             "status": job.status,
             "retry_count": next_retry_count,
             "retry_id": retry_id,
+            "analysis_attempt_id": analysis_attempt_id,
             "worker_revision": (runtime_snapshot.get("worker") or {}).get("revision"),
         },
         request,

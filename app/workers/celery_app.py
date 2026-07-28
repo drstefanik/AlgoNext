@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 
 import torch
 from celery import Celery
@@ -15,6 +16,7 @@ from app.core.pipeline_policy import install_worker_pipeline_policy
 from app.core.preview_asset_policy import install_worker_preview_asset_policy
 from app.core.runtime_health import (
     APP_GIT_SHA,
+    inspect_runtime,
     start_worker_heartbeat,
     stop_worker_heartbeat,
 )
@@ -83,9 +85,26 @@ def _on_worker_ready(sender=None, **_kwargs):
         tracking_policy_installed,
         preview_asset_policy_installed,
     )
-    recover_interrupted_jobs()
     worker_name = getattr(sender, "hostname", None)
-    start_worker_heartbeat(str(worker_name) if worker_name else None)
+    normalized_worker_name = str(worker_name) if worker_name else socket.gethostname()
+    start_worker_heartbeat(normalized_worker_name)
+    runtime_snapshot = inspect_runtime()
+    heartbeat = runtime_snapshot.get("worker") or {}
+    heartbeat_confirmed = bool(
+        (runtime_snapshot.get("dependencies") or {}).get("worker") == "ready"
+        and str(heartbeat.get("worker_name") or "") == normalized_worker_name
+        and str(heartbeat.get("revision") or "") == APP_GIT_SHA
+        and str(heartbeat.get("pid") or "") == str(os.getpid())
+    )
+    if heartbeat_confirmed:
+        recover_interrupted_jobs(
+            recovery_owner=f"{normalized_worker_name}:{APP_GIT_SHA}",
+            recovery_revision=APP_GIT_SHA,
+        )
+    else:
+        logger.warning(
+            "Interrupted-job recovery skipped: current worker heartbeat unconfirmed"
+        )
 
 
 @worker_shutdown.connect

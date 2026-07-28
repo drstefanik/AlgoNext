@@ -6,10 +6,13 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.tracking_outcome import StaleAnalysisAttemptError
+
 logger = logging.getLogger(__name__)
 
-_profiles: dict[str, Any] = {}
+_profiles: dict[tuple[str, str | None], Any] = {}
 _profiles_lock = threading.Lock()
+_ACTIVE_ANALYSIS_STATUSES = frozenset({"QUEUED", "RUNNING", "PROCESSING"})
 
 
 def _window_count(profile: Any) -> int:
@@ -44,6 +47,7 @@ def _profile_payload(profile: Any) -> dict[str, Any]:
 def _persist_progress(
     job_id: str,
     *,
+    analysis_attempt_id: str | None,
     profile: Any,
     windows_completed: int,
     windows_total: int,
@@ -53,6 +57,7 @@ def _persist_progress(
     try:
         from app.core.db import SessionLocal
         from app.core.models import AnalysisJob
+        from sqlalchemy import select
     except Exception:
         logger.exception("Unable to import progress persistence")
         return
@@ -60,9 +65,40 @@ def _persist_progress(
     db = None
     try:
         db = SessionLocal()
-        job = db.get(AnalysisJob, job_id)
+        execute = getattr(db, "execute", None)
+        if callable(execute):
+            statement = (
+                select(AnalysisJob)
+                .where(AnalysisJob.id == job_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            job = execute(statement).scalar_one_or_none()
+        else:
+            try:
+                job = db.get(AnalysisJob, job_id, populate_existing=True)
+            except TypeError:
+                job = db.get(AnalysisJob, job_id)
         if not job:
             return
+        target = job.target if isinstance(job.target, dict) else {}
+        current_attempt_id = (
+            str(target.get("analysis_attempt_id") or "").strip() or None
+        )
+        expected_attempt_id = str(analysis_attempt_id or "").strip() or None
+        if current_attempt_id != expected_attempt_id:
+            raise StaleAnalysisAttemptError(
+                "ReID progress attempt differs from the current job target: "
+                f"worker={expected_attempt_id or '<missing>'} "
+                f"target={current_attempt_id or '<missing>'}"
+            )
+        status = str(job.status or "").strip().upper()
+        if status not in _ACTIVE_ANALYSIS_STATUSES:
+            raise StaleAnalysisAttemptError(
+                "ReID progress cannot mutate a terminal or inactive job: "
+                f"status={status or '<missing>'} "
+                f"attempt={expected_attempt_id or '<missing>'}"
+            )
         progress = dict(job.progress or {})
         stats = dict(progress.get("stats") or {})
         payload = _profile_payload(profile)
@@ -86,8 +122,14 @@ def _persist_progress(
         progress["updated_at"] = datetime.now(timezone.utc).isoformat()
         if message:
             progress["message"] = message
+        if expected_attempt_id is not None:
+            progress["analysis_attempt_id"] = expected_attempt_id
         job.progress = progress
         db.commit()
+    except StaleAnalysisAttemptError:
+        if db is not None:
+            db.rollback()
+        raise
     except Exception:
         if db is not None:
             db.rollback()
@@ -97,27 +139,39 @@ def _persist_progress(
             db.close()
 
 
-def begin_full_match_progress(job_id: str | None, profile: Any | None) -> None:
+def begin_full_match_progress(
+    job_id: str | None,
+    profile: Any | None,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> None:
     if not job_id or profile is None:
         return
-    with _profiles_lock:
-        _profiles[job_id] = profile
     total = _window_count(profile)
     _persist_progress(
         job_id,
+        analysis_attempt_id=analysis_attempt_id,
         profile=profile,
         windows_completed=0,
         windows_total=total,
         window_progress_pct=0.0,
         message=f"Tracking player · 0/{total} finestre" if total else "Tracking player",
     )
+    key = (job_id, str(analysis_attempt_id or "").strip() or None)
+    with _profiles_lock:
+        _profiles[key] = profile
 
 
-def end_full_match_progress(job_id: str | None) -> None:
+def end_full_match_progress(
+    job_id: str | None,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> None:
     if not job_id:
         return
+    key = (job_id, str(analysis_attempt_id or "").strip() or None)
     with _profiles_lock:
-        _profiles.pop(job_id, None)
+        _profiles.pop(key, None)
 
 
 def install_progress_stats_adapter(tracking_module: Any) -> None:
@@ -125,23 +179,38 @@ def install_progress_stats_adapter(tracking_module: Any) -> None:
     if not callable(current) or getattr(current, "__algonext_stats_adapter__", False):
         return
 
-    def adapted(job_id: str, pct: int, message: str) -> Any:
-        result = current(job_id, pct, message)
+    def adapted(
+        job_id: str,
+        pct: int,
+        message: str,
+        *,
+        analysis_attempt_id: str | None = None,
+    ) -> Any:
+        result = current(
+            job_id,
+            pct,
+            message,
+            analysis_attempt_id=analysis_attempt_id,
+        )
         if message not in {
             "Tracking player with experimental ReID",
             "Tracking player (windowed)",
         }:
             return result
+        key = (job_id, str(analysis_attempt_id or "").strip() or None)
         with _profiles_lock:
-            profile = _profiles.get(job_id)
+            profile = _profiles.get(key)
         if profile is None:
             return result
         ratio = max(0.0, min(1.0, (float(pct) - 10.0) / 30.0))
         total = _window_count(profile)
         completed = min(total, max(0, int(round(total * ratio)))) if total else 0
-        exact_message = f"{message} · {completed}/{total} finestre" if total else message
+        exact_message = (
+            f"{message} · {completed}/{total} finestre" if total else message
+        )
         _persist_progress(
             job_id,
+            analysis_attempt_id=analysis_attempt_id,
             profile=profile,
             windows_completed=completed,
             windows_total=total,

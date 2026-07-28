@@ -4,11 +4,13 @@ import logging
 import os
 from typing import Any, Callable
 
+from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.reid.full_match_runtime import (
     budget_full_match_kwargs,
     install_progress_adapter,
     mark_partial_timeout,
     partial_timeout_output,
+    persist_fail_closed_legacy_fallback,
 )
 from app.reid.progress_reporting import (
     begin_full_match_progress,
@@ -51,14 +53,18 @@ def _partial_timeout_result(
     output = dict(output)
     output["identity_mode"] = "disabled"
     output["method"] = "yolo+bytetrack"
-    output["reid_summary"] = {
-        "status": "DISABLED",
-        "validated": False,
-        "reason_codes": [
-            "PLAYER_REID_DISABLED",
-            "TRACKING_BUDGET_EXHAUSTED",
-        ],
-    }
+    summary = dict(output.get("reid_summary") or {})
+    summary.update(
+        {
+            "status": "DISABLED",
+            "validated": False,
+            "reason_codes": [
+                "PLAYER_REID_DISABLED",
+                "TRACKING_BUDGET_EXHAUSTED",
+            ],
+        }
+    )
+    output["reid_summary"] = summary
     return output
 
 
@@ -93,23 +99,45 @@ def install_windowed_reid(
 
     def patched(*args: Any, **kwargs: Any) -> Any:
         effective_kwargs, profile = budget_full_match_kwargs(kwargs)
-        job_id = str(args[0]) if args else None
+        raw_job_id = args[0] if args else None
+        job_id = str(raw_job_id) if raw_job_id is not None else None
+        analysis_attempt_id = (
+            str(effective_kwargs.get("analysis_attempt_id") or "").strip() or None
+        )
         reid_was_active = reid_enabled() and implementation is not None
-        begin_full_match_progress(job_id, profile)
+        begin_full_match_progress(
+            job_id,
+            profile,
+            analysis_attempt_id=analysis_attempt_id,
+        )
         try:
             if not reid_was_active:
-                output = original(*args, **effective_kwargs)
-                output = _decorate_output(output, profile)
-                if isinstance(output, dict):
-                    output.setdefault(
-                        "reid_summary",
-                        {
-                            "status": "DISABLED",
-                            "validated": False,
-                            "reason_codes": ["PLAYER_REID_DISABLED"],
-                        },
-                    )
-                return output
+                output = {
+                    "mode": "full_match_windowed",
+                    "identity_mode": "disabled",
+                    "method": "yolo+bytetrack",
+                    "fps": effective_kwargs.get("fps"),
+                    "window_sec": effective_kwargs.get("window_sec"),
+                    "overlap_sec": effective_kwargs.get("overlap_sec"),
+                    "runtime_profile": (
+                        profile.to_payload() if profile is not None else None
+                    ),
+                }
+                return persist_fail_closed_legacy_fallback(
+                    output,
+                    reason_code="PLAYER_REID_DISABLED",
+                    job_id=raw_job_id,
+                    tracking_module=tracking_module,
+                    analysis_attempt_id=analysis_attempt_id,
+                    summary_status="DISABLED",
+                    tracking_status="PLAYER_REID_DISABLED_UNVERIFIED",
+                    identity_mode="disabled",
+                    notes=(
+                        "Legacy tracking output was discarded because Player "
+                        "ReID is disabled and selected-player identity cannot "
+                        "be verified."
+                    ),
+                )
 
             try:
                 output = implementation(
@@ -124,7 +152,11 @@ def install_windowed_reid(
                         "Full-match tracking reached its runtime budget job_id=%s",
                         job_id,
                     )
-                    mark_partial_timeout(job_id, profile)
+                    mark_partial_timeout(
+                        job_id,
+                        profile,
+                        analysis_attempt_id=analysis_attempt_id,
+                    )
                     return _partial_timeout_result(
                         args,
                         effective_kwargs,
@@ -132,26 +164,30 @@ def install_windowed_reid(
                         reid_was_active=True,
                     )
 
+                if isinstance(exc, StaleAnalysisAttemptError):
+                    raise
                 logger.exception("Experimental Player ReID failed")
                 if not fail_open_enabled():
                     raise
-                output = _decorate_output(
-                    original(*args, **effective_kwargs), profile
+                output = _decorate_output(original(*args, **effective_kwargs), profile)
+                return persist_fail_closed_legacy_fallback(
+                    output,
+                    reason_code="REID_RUNTIME_EXCEPTION",
+                    job_id=raw_job_id,
+                    tracking_module=tracking_module,
+                    analysis_attempt_id=analysis_attempt_id,
                 )
-                if isinstance(output, dict):
-                    output["reid_summary"] = {
-                        "status": "FALLBACK_LEGACY",
-                        "validated": False,
-                        "reason_codes": ["REID_RUNTIME_EXCEPTION"],
-                    }
-                return output
         except Exception as exc:
             if isinstance(timeout_error, type) and isinstance(exc, timeout_error):
                 logger.warning(
                     "Legacy full-match tracking reached its runtime budget job_id=%s",
                     job_id,
                 )
-                mark_partial_timeout(job_id, profile)
+                mark_partial_timeout(
+                    job_id,
+                    profile,
+                    analysis_attempt_id=analysis_attempt_id,
+                )
                 return _partial_timeout_result(
                     args,
                     effective_kwargs,
@@ -160,7 +196,10 @@ def install_windowed_reid(
                 )
             raise
         finally:
-            end_full_match_progress(job_id)
+            end_full_match_progress(
+                job_id,
+                analysis_attempt_id=analysis_attempt_id,
+            )
 
     patched.__name__ = "track_player_windowed_budgeted"
     patched.__doc__ = (

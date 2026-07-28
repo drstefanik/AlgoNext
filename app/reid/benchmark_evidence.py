@@ -55,9 +55,7 @@ def candidate_evidence(
             "time_sec": round(absolute_time, 6),
             "frame_index": int(round(absolute_time * max(1e-9, fps))),
             "bbox": bbox,
-            "confidence": round(
-                max(0.0, min(1.0, _finite(detection.get("conf")))), 6
-            ),
+            "confidence": round(max(0.0, min(1.0, _finite(detection.get("conf")))), 6),
         }
         evidence.append(item)
     return evidence
@@ -89,7 +87,9 @@ class _DecisionWithEvidence:
 def install_candidate_evidence(windowed_tracking_module: Any) -> bool:
     """Patch the experimental runtime without changing its association semantics."""
 
-    current_builder = getattr(windowed_tracking_module, "_build_candidate_profiles", None)
+    current_builder = getattr(
+        windowed_tracking_module, "_build_candidate_profiles", None
+    )
     current_associate = getattr(windowed_tracking_module, "associate_identity", None)
     if not callable(current_builder) or not callable(current_associate):
         raise RuntimeError("windowed tracking module lacks ReID candidate hooks")
@@ -107,6 +107,19 @@ def install_candidate_evidence(windowed_tracking_module: Any) -> bool:
             metadata = dict(profile.metadata or {})
             local_track_id = metadata.get("local_track_id")
             raw_detections = track_map.get(local_track_id) or []
+            if "tracklet_detections" in metadata:
+                raw_detections = list(metadata.get("tracklet_detections") or ())
+            elif "tracklet_sample_indices" in metadata:
+                tracklet_sample_indices = {
+                    int(value)
+                    for value in (metadata.get("tracklet_sample_indices") or ())
+                }
+                raw_detections = [
+                    item
+                    for item in raw_detections
+                    if item.get("sample_index") is not None
+                    and int(item.get("sample_index")) in tracklet_sample_indices
+                ]
             metadata["benchmark_evidence"] = candidate_evidence(
                 [item for item in raw_detections if isinstance(item, Mapping)],
                 window_start=window_start,

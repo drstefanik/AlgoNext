@@ -50,6 +50,30 @@ class PreviewAssetPolicyTests(unittest.TestCase):
             )
             return True
 
+        def update_analysis_job(db, job_id, expected_attempt_id, updater):
+            job = db.get(job_id)
+            if job is None:
+                return False
+            target = getattr(job, "target", None)
+            current_attempt_id = (
+                str(target.get("analysis_attempt_id") or "").strip() or None
+                if isinstance(target, dict)
+                else None
+            )
+            expected_attempt_id = str(expected_attempt_id or "").strip() or None
+            if current_attempt_id != expected_attempt_id:
+                raise RuntimeError("stale analysis attempt")
+            updater(job)
+            commits.append(
+                {
+                    "preview_frames": copy.deepcopy(
+                        list(getattr(job, "preview_frames", None) or [])
+                    ),
+                    "result": copy.deepcopy(getattr(job, "result", None) or {}),
+                }
+            )
+            return True
+
         def reload_job(db, job_id):
             return db.get(job_id)
 
@@ -75,6 +99,7 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         return SimpleNamespace(
             _generate_tracking_preview_frames=legacy_generator,
             update_job=update_job,
+            update_analysis_job=update_analysis_job,
             reload_job=reload_job,
             safe_commit=safe_commit,
             _run=run,
@@ -123,7 +148,10 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         self.assertEqual(len(generated), 1)
         self.assertEqual(
             generated[0]["key"],
-            f"jobs/{job_id}/tracking_frames/tracking_frame_0001.jpg",
+            (
+                f"jobs/{job_id}/attempts/legacy/"
+                "tracking_frames/tracking_frame_0001.jpg"
+            ),
         )
         self.assertEqual(uploads[0]["key"], generated[0]["key"])
         self.assertNotEqual(generated[0]["key"], selection_frames[0]["key"])
@@ -146,7 +174,86 @@ class PreviewAssetPolicyTests(unittest.TestCase):
         self.assertTrue(
             job.result["preview_asset_integrity"]["selection_frames_immutable"]
         )
+        self.assertTrue(job.result["preview_asset_integrity"]["selection_preserved"])
+        self.assertTrue(job.result["preview_asset_integrity"]["review_in_result"])
         self.assertEqual(len(commits), 1)
+
+    def test_attempt_bound_pending_frames_do_not_cross_or_survive_stale_write(self):
+        job_id = "job-attempt-race"
+        attempt_a = "attempt-a"
+        attempt_b = "attempt-b"
+        selection_frames = [
+            {
+                "time_sec": 10.0,
+                "key": f"jobs/{job_id}/frames/frame_0001.jpg",
+                "tracks": [],
+            }
+        ]
+        job = SimpleNamespace(
+            target={"analysis_attempt_id": attempt_b},
+            preview_frames=copy.deepcopy(selection_frames),
+            result={},
+        )
+        jobs = {job_id: job}
+        commits = []
+        pipeline = self.pipeline(jobs, [], commits)
+        install_preview_asset_policy(pipeline)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stale_frames = pipeline._generate_tracking_preview_frames(
+                job_id=job_id,
+                analysis_attempt_id=attempt_a,
+                input_path=Path(tmpdir) / "input.mp4",
+                frames_dir=Path(tmpdir) / "attempt-a",
+                s3_internal=object(),
+                s3_bucket="fnh",
+                candidates=[{"time_sec": 11.0, "has_player": True}],
+            )
+            with self.assertRaises(RuntimeError):
+                pipeline.update_analysis_job(
+                    jobs,
+                    job_id,
+                    attempt_a,
+                    lambda current: setattr(
+                        current,
+                        "preview_frames",
+                        stale_frames,
+                    ),
+                )
+
+            current_frames = pipeline._generate_tracking_preview_frames(
+                job_id=job_id,
+                analysis_attempt_id=attempt_b,
+                input_path=Path(tmpdir) / "input.mp4",
+                frames_dir=Path(tmpdir) / "attempt-b",
+                s3_internal=object(),
+                s3_bucket="fnh",
+                candidates=[{"time_sec": 12.0, "has_player": True}],
+            )
+            pipeline.update_analysis_job(
+                jobs,
+                job_id,
+                attempt_b,
+                lambda current: setattr(
+                    current,
+                    "preview_frames",
+                    current_frames,
+                ),
+            )
+
+        self.assertEqual(job.preview_frames, selection_frames)
+        review_frames = job.result["tracking_review_frames"]
+        self.assertEqual(
+            {frame["analysis_attempt_id"] for frame in review_frames},
+            {attempt_b},
+        )
+        self.assertTrue(
+            all(f"/attempts/{attempt_b}/" in frame["key"] for frame in review_frames)
+        )
+        integrity = job.result["preview_asset_integrity"]
+        self.assertTrue(integrity["selection_preserved"])
+        self.assertTrue(integrity["review_in_result"])
+        self.assertEqual(integrity["analysis_attempt_id"], attempt_b)
 
     def test_analysis_refresh_cannot_overwrite_selection_object_or_metadata(self):
         job_id = "job-456"

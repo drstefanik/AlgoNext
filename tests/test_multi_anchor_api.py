@@ -93,6 +93,28 @@ class MultiAnchorApiTests(unittest.TestCase):
         self.request = Request({"type": "http", "headers": []})
         self.request.state.request_id = "req-multi"
 
+    def test_result_clip_preserves_analysis_attempt_id(self):
+        normalized = api._normalize_clip_asset(
+            {
+                "label": "Current attempt",
+                "url": "https://example.test/current.mp4",
+                "start_sec": 10.0,
+                "end_sec": 20.0,
+                "analysis_attempt_id": "attempt-b",
+            }
+        )
+
+        self.assertEqual(normalized["analysisAttemptId"], "attempt-b")
+
+        conflicting = api._normalize_clip_asset(
+            {
+                "url": "https://example.test/conflicting.mp4",
+                "analysis_attempt_id": "attempt-b",
+                "analysisAttemptId": "attempt-a",
+            }
+        )
+        self.assertIsNone(conflicting["analysisAttemptId"])
+
     def test_selection_accepts_one_through_five_and_preserves_job_metadata(self):
         for count in range(1, 6):
             with self.subTest(count=count):
@@ -133,9 +155,20 @@ class MultiAnchorApiTests(unittest.TestCase):
                     job.target["metadata"],
                     {"source": "full-match-create"},
                 )
+                selection_revision = job.target["analysis_attempt_id"]
+                self.assertTrue(selection_revision)
+                self.assertEqual(job.target["tracking"]["status"], "PENDING")
                 self.assertEqual(
-                    job.target["tracking"],
-                    {"status": "PENDING"},
+                    job.target["tracking"]["analysis_attempt_id"],
+                    selection_revision,
+                )
+                self.assertEqual(
+                    job.progress["analysis_attempt_id"],
+                    selection_revision,
+                )
+                self.assertEqual(
+                    job.result["analysis_attempt_id"],
+                    selection_revision,
                 )
                 self.assertEqual(len(job.target["selections"]), count)
                 self.assertEqual(

@@ -95,15 +95,41 @@ def _tracking_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
     return normalized
 
 
-def _tracking_only_warnings(
-    result: Mapping[str, Any], existing: Any
-) -> list[str]:
+def _tracking_only_warnings(result: Mapping[str, Any], existing: Any) -> list[str]:
+    tracking = result.get("tracking")
+    tracking_payload = tracking if isinstance(tracking, Mapping) else {}
+    action_required = str(tracking_payload.get("action_required") or "").upper()
+    tracking_status = str(tracking_payload.get("tracking_status") or "").upper()
+    anchors_matched = max(
+        0.0,
+        _safe_float(tracking_payload.get("anchors_matched")) or 0.0,
+    )
+    matched_anchor_rejection = anchors_matched > 0 and tracking_status in {
+        "ANCHOR_REJECTED",
+        "ANCHOR_ONLY",
+    }
+
+    reid_summary = tracking_payload.get("reid_summary")
+    summary_payload = reid_summary if isinstance(reid_summary, Mapping) else {}
+    raw_tracking_reasons = summary_payload.get("reason_codes")
+    tracking_reasons = [
+        str(reason).strip()
+        for reason in (
+            raw_tracking_reasons if isinstance(raw_tracking_reasons, list) else []
+        )
+        if str(reason).strip() and str(reason).strip() != "PLAYER_ANCHOR_NOT_FOUND"
+    ]
+    if tracking_status and tracking_status not in tracking_reasons:
+        tracking_reasons.append(tracking_status)
+
     warnings: list[str] = []
     for warning in existing if isinstance(existing, list) else []:
         if not isinstance(warning, str):
             continue
         normalized = warning.strip()
         if not normalized or normalized in _OBSOLETE_SCORING_WARNINGS:
+            continue
+        if matched_anchor_rejection and normalized == "PLAYER_ANCHOR_NOT_FOUND":
             continue
         if normalized not in warnings:
             warnings.append(normalized)
@@ -123,14 +149,6 @@ def _tracking_only_warnings(
     if "LONG_TRACKING_GAPS" in reasons:
         derived.append("LONG_TRACKING_GAPS")
     if result.get("evaluation_status") == "TRACKING_FAILED":
-        tracking = result.get("tracking")
-        tracking_payload = tracking if isinstance(tracking, Mapping) else {}
-        action_required = str(
-            tracking_payload.get("action_required") or ""
-        ).upper()
-        tracking_status = str(
-            tracking_payload.get("tracking_status") or ""
-        ).upper()
         anchor_acquisition_failure = (
             tracking_status == "ANCHOR_ACQUISITION_ERROR"
             or "REID_ANCHOR_ACQUISITION_ERROR" in reasons
@@ -140,6 +158,9 @@ def _tracking_only_warnings(
             derived.append("PLAYER_ANCHOR_ACQUISITION_FAILED")
         elif action_required == "RETRY_ANALYSIS":
             derived.append("PLAYER_TRACKING_RETRY_REQUIRED")
+        elif matched_anchor_rejection:
+            derived.extend(tracking_reasons)
+            derived.append("PLAYER_RESELECTION_REQUIRED")
         else:
             derived.extend(
                 [
@@ -148,12 +169,16 @@ def _tracking_only_warnings(
                 ]
             )
     elif "PLAYER_RESELECTION_REQUIRED" in reasons:
-        derived.extend(
-            [
-                "PLAYER_ANCHOR_NOT_FOUND",
-                "PLAYER_RESELECTION_REQUIRED",
-            ]
-        )
+        if matched_anchor_rejection:
+            derived.extend(tracking_reasons)
+            derived.append("PLAYER_RESELECTION_REQUIRED")
+        else:
+            derived.extend(
+                [
+                    "PLAYER_ANCHOR_NOT_FOUND",
+                    "PLAYER_RESELECTION_REQUIRED",
+                ]
+            )
     if result.get("player_evaluation_available") is not True:
         derived.append("PLAYER_EVALUATION_WITHHELD")
 

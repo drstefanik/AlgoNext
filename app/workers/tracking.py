@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from functools import lru_cache
@@ -13,6 +14,7 @@ import cv2
 import numpy as np
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from sqlalchemy import select
 from ultralytics import YOLO
 
 try:
@@ -23,6 +25,7 @@ except ModuleNotFoundError:
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
+from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.workers.multi_anchor import (
     assign_anchors_to_windows,
     normalize_anchors,
@@ -35,10 +38,19 @@ logger = logging.getLogger(__name__)
 CANDIDATE_MIN_HITS = int(os.environ.get("CANDIDATE_MIN_HITS", "2"))
 CANDIDATE_MIN_SECONDS = float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0)
 CANDIDATE_TOP_N = int(os.environ.get("CANDIDATE_TOP_N", "5"))
-CANDIDATE_SAMPLE_FRAMES = max(
-    1, int(os.environ.get("CANDIDATE_SAMPLE_FRAMES", "10"))
-)
+CANDIDATE_SAMPLE_FRAMES = max(1, int(os.environ.get("CANDIDATE_SAMPLE_FRAMES", "10")))
 PRIMARY_COVERAGE_THRESHOLD = 0.05
+_SAFE_ATTEMPT_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_TRACKING_MUTABLE_STATUSES = frozenset(
+    {
+        "CREATED",
+        "WAITING_FOR_SELECTION",
+        "QUEUED",
+        "RUNNING",
+        "PROCESSING",
+    }
+)
+
 
 class TrackingTimeoutError(RuntimeError):
     pass
@@ -71,37 +83,108 @@ def _normalize_player_ref(player_ref: Dict[str, Any]) -> Dict[str, float] | None
     }
 
 
-def _update_tracking_progress(job_id: str, pct: int, message: str) -> None:
+def _normalized_analysis_attempt_id(value: Any) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _analysis_attempt_component(analysis_attempt_id: str | None) -> str:
+    normalized = _normalized_analysis_attempt_id(analysis_attempt_id)
+    if normalized is None:
+        return "legacy"
+    if _SAFE_ATTEMPT_COMPONENT.fullmatch(normalized) is None:
+        raise ValueError("analysis_attempt_id is not safe for artifact storage")
+    return normalized
+
+
+def _load_job_for_update(db: Any, job_id: str) -> AnalysisJob | None:
+    execute = getattr(db, "execute", None)
+    if callable(execute):
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execute(statement).scalar_one_or_none()
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
+
+
+def _require_analysis_attempt(
+    job: AnalysisJob,
+    analysis_attempt_id: str | None,
+) -> str | None:
+    target = job.target if isinstance(job.target, dict) else {}
+    current = _normalized_analysis_attempt_id(target.get("analysis_attempt_id"))
+    expected = _normalized_analysis_attempt_id(analysis_attempt_id)
+    if current != expected:
+        raise StaleAnalysisAttemptError(
+            "Tracking worker attempt differs from the current job target: "
+            f"worker={expected or '<missing>'} target={current or '<missing>'}"
+        )
+    status = str(job.status or "").strip().upper()
+    if status not in _TRACKING_MUTABLE_STATUSES:
+        raise StaleAnalysisAttemptError(
+            "Tracking worker cannot mutate a terminal or inactive job: "
+            f"status={status or '<missing>'} "
+            f"attempt={expected or '<missing>'}"
+        )
+    return expected
+
+
+def _update_tracking_progress(
+    job_id: str,
+    pct: int,
+    message: str,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> None:
     pct = max(0, min(100, int(pct)))
     db = SessionLocal()
     try:
-        job = db.get(AnalysisJob, job_id)
+        job = _load_job_for_update(db, job_id)
         if not job:
             return
+        attempt_id = _require_analysis_attempt(job, analysis_attempt_id)
         progress = job.progress or {}
         current_pct = progress.get("pct") or 0
         try:
             current_pct = int(current_pct)
         except (TypeError, ValueError):
             current_pct = 0
-        job.progress = {
+        updated_progress = {
             **progress,
             "step": "TRACKING",
             "pct": max(current_pct, pct),
             "message": message,
             "updated_at": _utc_now_iso(),
         }
+        if attempt_id is not None:
+            updated_progress["analysis_attempt_id"] = attempt_id
+        job.progress = updated_progress
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
-def _update_candidates_frames_processed(job_id: str, frames_processed: int) -> None:
+def _update_candidates_frames_processed(
+    job_id: str,
+    frames_processed: int,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> None:
     db = SessionLocal()
     try:
-        job = db.get(AnalysisJob, job_id)
+        job = _load_job_for_update(db, job_id)
         if not job:
             return
+        attempt_id = _require_analysis_attempt(job, analysis_attempt_id)
         result = dict(job.result or {})
         candidates_payload = result.get("candidates")
         if not isinstance(candidates_payload, dict):
@@ -110,19 +193,31 @@ def _update_candidates_frames_processed(job_id: str, frames_processed: int) -> N
         candidates_payload.pop("frames_processed", None)
         result["candidates"] = candidates_payload
         result["framesProcessed"] = int(frames_processed)
+        if attempt_id is not None:
+            result["analysis_attempt_id"] = attempt_id
         job.result = result
         job.updated_at = datetime.now(timezone.utc)
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
-def _mark_tracking_timeout(job_id: str, timeout_seconds: int, elapsed: float) -> None:
+def _mark_tracking_timeout(
+    job_id: str,
+    timeout_seconds: int,
+    elapsed: float,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> None:
     db = SessionLocal()
     try:
-        job = db.get(AnalysisJob, job_id)
+        job = _load_job_for_update(db, job_id)
         if not job:
             return
+        attempt_id = _require_analysis_attempt(job, analysis_attempt_id)
         logger.warning(
             "TRACKING_TIMEOUT job_id=%s elapsed=%.1fs timeout=%ss",
             job_id,
@@ -136,25 +231,29 @@ def _mark_tracking_timeout(job_id: str, timeout_seconds: int, elapsed: float) ->
         job.status = "FAILED"
         job.failure_reason = normalize_failure_reason("TRACKING_TIMEOUT")
         job.error = f"Tracking exceeded timeout of {timeout_seconds} seconds"
-        job.progress = {
+        updated_progress = {
             **(job.progress or {}),
             "step": "FAILED",
             "pct": 100,
             "message": "Tracking timeout",
             "updated_at": _utc_now_iso(),
         }
+        if attempt_id is not None:
+            updated_progress["analysis_attempt_id"] = attempt_id
+        job.progress = updated_progress
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
 REGION = os.getenv("AWS_REGION") or os.getenv("S3_REGION", "us-east-1")
-S3_ENDPOINT_URL = (
-    os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
-)
-S3_PUBLIC_ENDPOINT_URL = (
-    os.getenv("S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com").strip()
-)
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
+S3_PUBLIC_ENDPOINT_URL = os.getenv(
+    "S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com"
+).strip()
 
 
 def _make_s3(endpoint_url: str):
@@ -402,9 +501,7 @@ def _extract_segment(
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg segment extraction failed: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"ffmpeg segment extraction failed: {result.stderr.strip()}")
 
 
 def _collect_window_samples(
@@ -414,6 +511,7 @@ def _collect_window_samples(
     model: YOLO,
     tracker: str,
     job_id: str,
+    analysis_attempt_id: str | None,
     tracking_started_at: float,
     tracking_timeout_seconds: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, Any]]]]:
@@ -493,11 +591,6 @@ def _collect_window_samples(
             processed_samples += 1
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
-                _mark_tracking_timeout(
-                    job_id,
-                    tracking_timeout_seconds,
-                    now - tracking_started_at,
-                )
                 raise TrackingTimeoutError("Tracking timeout exceeded")
 
             frame_index += 1
@@ -597,6 +690,7 @@ def track_player(
     player_ref: dict,
     selections: List[Dict[str, Any]],
     *,
+    analysis_attempt_id: str | None = None,
     fps: int = 5,
     detector_model: str = "yolo11s.pt",
     tracker: str = "bytetrack.yaml",
@@ -704,9 +798,7 @@ def track_player(
                                     "w": bbox_norm[2],
                                     "h": bbox_norm[3],
                                 },
-                                "conf": float(confs[idx])
-                                if idx < len(confs)
-                                else 0.0,
+                                "conf": float(confs[idx]) if idx < len(confs) else 0.0,
                             }
                         )
 
@@ -718,6 +810,7 @@ def track_player(
                     job_id,
                     tracking_timeout_seconds,
                     now - tracking_started_at,
+                    analysis_attempt_id=analysis_attempt_id,
                 )
                 raise TrackingTimeoutError("Tracking timeout exceeded")
             if processed_samples % 200 == 0:
@@ -731,13 +824,23 @@ def track_player(
                 pct = start_pct + int(
                     (processed_samples / float(total_samples)) * (end_pct - start_pct)
                 )
-                _update_tracking_progress(job_id, pct, "Tracking player")
+                _update_tracking_progress(
+                    job_id,
+                    pct,
+                    "Tracking player",
+                    analysis_attempt_id=analysis_attempt_id,
+                )
 
             frame_index += 1
     finally:
         cap.release()
 
-    _update_tracking_progress(job_id, end_pct, "Tracking player")
+    _update_tracking_progress(
+        job_id,
+        end_pct,
+        "Tracking player",
+        analysis_attempt_id=analysis_attempt_id,
+    )
 
     if not samples:
         raise RuntimeError("No frames sampled for tracking")
@@ -844,9 +947,7 @@ def track_player(
                 first_missing_time = timestamp
             last_missing_time = timestamp
             if missing_count == missing_threshold:
-                notes.append(
-                    f"Lost track starting at t={first_missing_time:.2f}s"
-                )
+                notes.append(f"Lost track starting at t={first_missing_time:.2f}s")
         else:
             if missing_count >= missing_threshold and first_missing_time is not None:
                 lost_segments.append(
@@ -883,6 +984,7 @@ def track_player(
 
     coverage_pct = (len(bboxes) / float(len(samples))) * 100.0
     tracking_output: Dict[str, Any] = {
+        "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
         "method": "yolo+bytetrack",
         "fps": fps,
         "track_id": selected_track_id,
@@ -893,7 +995,10 @@ def track_player(
         "notes": "; ".join(notes) if notes else "",
     }
 
-    tracking_dir = Path("/tmp/fnh_jobs") / job_id / "tracking"
+    attempt_component = _analysis_attempt_component(analysis_attempt_id)
+    tracking_dir = (
+        Path("/tmp/fnh_jobs") / job_id / "attempts" / attempt_component / "tracking"
+    )
     tracking_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = tracking_dir / "tracking.json"
     with tracking_path.open("w", encoding="utf-8") as handle:
@@ -901,8 +1006,10 @@ def track_player(
 
     s3_internal = _get_s3_client(s3_endpoint_url)
     _ensure_bucket_exists(s3_internal, s3_bucket)
-    tracking_key = f"jobs/{job_id}/tracking/tracking.json"
-    _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
+    tracking_key = f"jobs/{job_id}/attempts/{attempt_component}/tracking/tracking.json"
+    _upload_file(
+        s3_internal, s3_bucket, tracking_path, tracking_key, "application/json"
+    )
     tracking_url = _presign_get_object(s3_bucket, tracking_key, expires_seconds)
 
     tracking_output["tracking_key"] = tracking_key
@@ -917,6 +1024,7 @@ def track_player_windowed(
     player_ref: dict,
     selections: List[Dict[str, Any]],
     *,
+    analysis_attempt_id: str | None = None,
     video_duration_sec: float,
     window_sec: float = 45.0,
     overlap_sec: float = 10.0,
@@ -982,7 +1090,15 @@ def track_player_windowed(
     segments_with_player = 0
     anchor_reacquisitions = 0
 
-    windows_dir = Path("/tmp/fnh_jobs") / job_id / "tracking" / "windows"
+    attempt_component = _analysis_attempt_component(analysis_attempt_id)
+    windows_dir = (
+        Path("/tmp/fnh_jobs")
+        / job_id
+        / "attempts"
+        / attempt_component
+        / "tracking"
+        / "windows"
+    )
     windows_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, (window_start, window_end) in enumerate(windows, start=1):
@@ -1001,11 +1117,14 @@ def track_player_windowed(
                 model=model,
                 tracker=tracker,
                 job_id=job_id,
+                analysis_attempt_id=analysis_attempt_id,
                 tracking_started_at=tracking_started_at,
                 tracking_timeout_seconds=tracking_timeout_seconds,
             )
             if hasattr(model, "reset"):
                 model.reset()
+        except (TrackingTimeoutError, StaleAnalysisAttemptError):
+            raise
         except Exception:
             samples = []
             track_map = {}
@@ -1035,9 +1154,7 @@ def track_player_windowed(
             lost_segments = []
             last_good_bbox = None
 
-        coverage_pct = (
-            (len(bboxes) / float(len(samples))) * 100.0 if samples else 0.0
-        )
+        coverage_pct = (len(bboxes) / float(len(samples))) * 100.0 if samples else 0.0
         if bboxes:
             tracked_seconds_total += len(bboxes) / float(max(1, fps))
             segments_with_player += 1
@@ -1055,8 +1172,7 @@ def track_player_windowed(
                 ),
             )
             prev_bbox_abs = {
-                key: float(continuity_bbox[key])
-                for key in ("x", "y", "w", "h")
+                key: float(continuity_bbox[key]) for key in ("x", "y", "w", "h")
             }
 
         segments.append(
@@ -1079,7 +1195,12 @@ def track_player_windowed(
 
         if idx % 5 == 0 or idx == len(windows):
             pct = 10 + int((idx / float(len(windows))) * 30)
-            _update_tracking_progress(job_id, pct, "Tracking player (windowed)")
+            _update_tracking_progress(
+                job_id,
+                pct,
+                "Tracking player (windowed)",
+                analysis_attempt_id=analysis_attempt_id,
+            )
 
     total_duration = float(video_duration_sec) if video_duration_sec else windows[-1][1]
     coverage_pct_total = (
@@ -1103,6 +1224,7 @@ def track_player_windowed(
         largest_gap_sec = max(largest_gap_sec, total_duration - cursor)
 
     tracking_output: Dict[str, Any] = {
+        "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
         "mode": "full_match_windowed",
         "method": "yolo+bytetrack",
         "fps": fps,
@@ -1118,7 +1240,9 @@ def track_player_windowed(
         "anchors_used": {"player_ref": player_ref_norm, "selections": anchors},
     }
 
-    tracking_dir = Path("/tmp/fnh_jobs") / job_id / "tracking"
+    tracking_dir = (
+        Path("/tmp/fnh_jobs") / job_id / "attempts" / attempt_component / "tracking"
+    )
     tracking_dir.mkdir(parents=True, exist_ok=True)
     tracking_path = tracking_dir / "tracking.json"
     with tracking_path.open("w", encoding="utf-8") as handle:
@@ -1126,8 +1250,10 @@ def track_player_windowed(
 
     s3_internal = _get_s3_client(s3_endpoint_url)
     _ensure_bucket_exists(s3_internal, s3_bucket)
-    tracking_key = f"jobs/{job_id}/tracking/tracking.json"
-    _upload_file(s3_internal, s3_bucket, tracking_path, tracking_key, "application/json")
+    tracking_key = f"jobs/{job_id}/attempts/{attempt_component}/tracking/tracking.json"
+    _upload_file(
+        s3_internal, s3_bucket, tracking_path, tracking_key, "application/json"
+    )
     tracking_url = _presign_get_object(s3_bucket, tracking_key, expires_seconds)
 
     tracking_output["tracking_key"] = tracking_key
@@ -1196,9 +1322,7 @@ def _build_candidate_tracks(
         avg_box_area = float(
             np.mean([det["bbox"]["w"] * det["bbox"]["h"] for det in detections_sorted])
         )
-        avg_conf = float(
-            np.mean([det.get("conf", 0.0) for det in detections_sorted])
-        )
+        avg_conf = float(np.mean([det.get("conf", 0.0) for det in detections_sorted]))
         segments = 1
         last_index = detections_sorted[0]["sample_index"]
         for det in detections_sorted[1:]:
@@ -1218,9 +1342,7 @@ def _build_candidate_tracks(
             }
             for sample in selected_samples
         ]
-        duration = float(
-            detections_sorted[-1]["t"] - detections_sorted[0]["t"]
-        )
+        duration = float(detections_sorted[-1]["t"] - detections_sorted[0]["t"])
         required_primary_hits = max(2, int(np.ceil(sample_count * 0.10)))
         is_eligible = hit_count >= min_hits and (
             min_seconds <= 0 or duration >= min_seconds
@@ -1268,9 +1390,7 @@ def _build_candidate_tracks(
     secondary = [
         item["payload"] for item in track_records if item["tier"] == "SECONDARY"
     ]
-    low_coverage = [
-        item for item in track_records if item["tier"] == "LOW_COVERAGE"
-    ]
+    low_coverage = [item for item in track_records if item["tier"] == "LOW_COVERAGE"]
 
     primary.sort(
         key=lambda item: (
@@ -1299,9 +1419,7 @@ def _build_candidate_tracks(
 
     candidates = primary + secondary
     if top_n > 0 and low_coverage:
-        candidates.extend(
-            [item["payload"] for item in low_coverage[:top_n]]
-        )
+        candidates.extend([item["payload"] for item in low_coverage[:top_n]])
     if not candidates and track_records:
         fallback = sorted(
             track_records,
@@ -1327,6 +1445,7 @@ def track_all_players(
     job_id: str,
     input_video_path: str,
     *,
+    analysis_attempt_id: str | None = None,
     fps: int = 5,
     detector_model: str = "yolo11s.pt",
     tracker: str = "bytetrack.yaml",
@@ -1431,13 +1550,18 @@ def track_all_players(
             samples.append({"t": float(timestamp), "detections": detections})
             processed_samples += 1
             if processed_samples % 2 == 0 or processed_samples == total_samples:
-                _update_candidates_frames_processed(job_id, processed_samples)
+                _update_candidates_frames_processed(
+                    job_id,
+                    processed_samples,
+                    analysis_attempt_id=analysis_attempt_id,
+                )
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
                 _mark_tracking_timeout(
                     job_id,
                     tracking_timeout_seconds,
                     now - tracking_started_at,
+                    analysis_attempt_id=analysis_attempt_id,
                 )
                 raise TrackingTimeoutError("Tracking timeout exceeded")
             if processed_samples % 200 == 0:
@@ -1451,13 +1575,23 @@ def track_all_players(
                 pct = start_pct + int(
                     (processed_samples / float(total_samples)) * (end_pct - start_pct)
                 )
-                _update_tracking_progress(job_id, pct, "Tracking all players")
+                _update_tracking_progress(
+                    job_id,
+                    pct,
+                    "Tracking all players",
+                    analysis_attempt_id=analysis_attempt_id,
+                )
 
             frame_index += 1
     finally:
         cap.release()
 
-    _update_tracking_progress(job_id, end_pct, "Tracking all players")
+    _update_tracking_progress(
+        job_id,
+        end_pct,
+        "Tracking all players",
+        analysis_attempt_id=analysis_attempt_id,
+    )
 
     if not samples:
         raise RuntimeError("No frames sampled for tracking")
@@ -1473,6 +1607,7 @@ def track_all_players(
 
     if not candidates:
         return {
+            "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
             "method": "yolo+bytetrack",
             "fps": fps,
             "generated_at": _utc_now_iso(),
@@ -1499,7 +1634,10 @@ def track_all_players(
     s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
 
-    candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
+    attempt_component = _analysis_attempt_component(analysis_attempt_id)
+    candidates_dir = (
+        Path("/tmp/fnh_jobs") / job_id / "attempts" / attempt_component / "candidates"
+    )
     candidates_dir.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(str(input_video_path))
@@ -1516,7 +1654,10 @@ def track_all_players(
                 frame_name = f"track_{candidate['track_id']}_{idx:02d}.jpg"
                 frame_path = candidates_dir / frame_name
                 cv2.imwrite(str(frame_path), frame)
-                frame_key = f"jobs/{job_id}/candidates/{frame_name}"
+                frame_key = (
+                    f"jobs/{job_id}/attempts/{attempt_component}/"
+                    f"candidates/{frame_name}"
+                )
                 _upload_file(
                     s3_internal,
                     s3_bucket,
@@ -1542,6 +1683,7 @@ def track_all_players(
     autodetection_status = "LOW_COVERAGE" if primary_count == 0 else "OK"
 
     return {
+        "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
         "method": "yolo+bytetrack",
         "fps": fps,
         "generated_at": _utc_now_iso(),
@@ -1564,7 +1706,7 @@ def track_all_players(
         },
         "autodetection_status": autodetection_status,
         "bucket": s3_bucket,
-        "assets_prefix": f"jobs/{job_id}/candidates/",
+        "assets_prefix": (f"jobs/{job_id}/attempts/{attempt_component}/candidates/"),
     }
 
 
@@ -1572,6 +1714,7 @@ def track_all_players_from_frames(
     job_id: str,
     frames: List[Dict[str, Any]],
     *,
+    analysis_attempt_id: str | None = None,
     detector_model: str = "yolo11s.pt",
     tracker: str = "bytetrack.yaml",
 ) -> Dict[str, Any]:
@@ -1616,7 +1759,11 @@ def track_all_players_from_frames(
         if frame is None:
             processed_samples += 1
             if processed_samples % 2 == 0 or processed_samples == total_samples:
-                _update_candidates_frames_processed(job_id, processed_samples)
+                _update_candidates_frames_processed(
+                    job_id,
+                    processed_samples,
+                    analysis_attempt_id=analysis_attempt_id,
+                )
             frame_tracks.append(
                 {"frame_key": frame_key, "time_sec": timestamp, "tracks": []}
             )
@@ -1644,9 +1791,7 @@ def track_all_players_from_frames(
                     track_id = ids[idx]
                     if track_id is None:
                         continue
-                    bbox_norm = _bbox_xyxy_to_xywh_norm(
-                        tuple(xyxy[idx]), width, height
-                    )
+                    bbox_norm = _bbox_xyxy_to_xywh_norm(tuple(xyxy[idx]), width, height)
                     detection = {
                         "track_id": int(track_id),
                         "bbox": {
@@ -1683,13 +1828,18 @@ def track_all_players_from_frames(
         )
         processed_samples += 1
         if processed_samples % 2 == 0 or processed_samples == total_samples:
-            _update_candidates_frames_processed(job_id, processed_samples)
+            _update_candidates_frames_processed(
+                job_id,
+                processed_samples,
+                analysis_attempt_id=analysis_attempt_id,
+            )
         now = time.monotonic()
         if now - tracking_started_at > tracking_timeout_seconds:
             _mark_tracking_timeout(
                 job_id,
                 tracking_timeout_seconds,
                 now - tracking_started_at,
+                analysis_attempt_id=analysis_attempt_id,
             )
             raise TrackingTimeoutError("Tracking timeout exceeded")
         if processed_samples % 200 == 0:
@@ -1703,9 +1853,19 @@ def track_all_players_from_frames(
             pct = start_pct + int(
                 (processed_samples / float(total_samples)) * (end_pct - start_pct)
             )
-            _update_tracking_progress(job_id, pct, "Tracking all players")
+            _update_tracking_progress(
+                job_id,
+                pct,
+                "Tracking all players",
+                analysis_attempt_id=analysis_attempt_id,
+            )
 
-    _update_tracking_progress(job_id, end_pct, "Tracking all players")
+    _update_tracking_progress(
+        job_id,
+        end_pct,
+        "Tracking all players",
+        analysis_attempt_id=analysis_attempt_id,
+    )
 
     frames_processed = total_samples
     candidates, total_tracks, raw_tracks = _build_candidate_tracks(
@@ -1718,6 +1878,7 @@ def track_all_players_from_frames(
 
     if not candidates:
         return {
+            "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
             "method": "yolo+bytetrack",
             "fps": len(frames),
             "generated_at": _utc_now_iso(),
@@ -1745,7 +1906,10 @@ def track_all_players_from_frames(
     s3_public = _get_public_s3_client()
     _ensure_bucket_exists(s3_internal, s3_bucket)
 
-    candidates_dir = Path("/tmp/fnh_jobs") / job_id / "candidates"
+    attempt_component = _analysis_attempt_component(analysis_attempt_id)
+    candidates_dir = (
+        Path("/tmp/fnh_jobs") / job_id / "attempts" / attempt_component / "candidates"
+    )
     candidates_dir.mkdir(parents=True, exist_ok=True)
 
     frame_lookup: List[Tuple[float, Path]] = [
@@ -1771,7 +1935,10 @@ def track_all_players_from_frames(
             frame_name = f"track_{candidate['track_id']}_{idx:02d}.jpg"
             output_path = candidates_dir / frame_name
             cv2.imwrite(str(output_path), frame)
-            frame_key = f"jobs/{job_id}/candidates/{frame_name}"
+            frame_key = (
+                f"jobs/{job_id}/attempts/{attempt_component}/"
+                f"candidates/{frame_name}"
+            )
             _upload_file(
                 s3_internal,
                 s3_bucket,
@@ -1795,6 +1962,7 @@ def track_all_players_from_frames(
     autodetection_status = "LOW_COVERAGE" if primary_count == 0 else "OK"
 
     return {
+        "analysis_attempt_id": _normalized_analysis_attempt_id(analysis_attempt_id),
         "method": "yolo+bytetrack",
         "fps": len(frames),
         "generated_at": _utc_now_iso(),
@@ -1818,5 +1986,5 @@ def track_all_players_from_frames(
         },
         "autodetection_status": autodetection_status,
         "bucket": s3_bucket,
-        "assets_prefix": f"jobs/{job_id}/candidates/",
+        "assets_prefix": (f"jobs/{job_id}/attempts/{attempt_component}/candidates/"),
     }

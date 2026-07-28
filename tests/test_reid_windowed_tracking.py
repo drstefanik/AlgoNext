@@ -1,6 +1,8 @@
 import importlib
+import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -102,9 +104,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             )
             track_map = cls.track_maps[window_number]
             default_times = (
-                [15.0, 16.0, 17.0]
-                if window_number == 2
-                else [0.0, 1.0, 2.0]
+                [15.0, 16.0, 17.0] if window_number == 2 else [0.0, 1.0, 2.0]
             )
             sample_times = cls.sample_times.get(window_number, default_times)
             samples = [
@@ -169,9 +169,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         if cls._saved_reid_windowed_tracking is cls._missing_module:
             cls._reid_module.__dict__.pop("windowed_tracking", None)
         else:
-            cls._reid_module.windowed_tracking = (
-                cls._saved_reid_windowed_tracking
-            )
+            cls._reid_module.windowed_tracking = cls._saved_reid_windowed_tracking
 
     def setUp(self):
         type(self).sample_times = {}
@@ -192,6 +190,94 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             for track_id in track_ids
         }
 
+    def test_early_fallback_rewrites_persisted_legacy_asset_fail_closed(self):
+        uploaded = {}
+
+        def fallback(*_args, **_kwargs):
+            return {
+                "mode": "full_match_windowed",
+                "tracking_key": "jobs/job-early-fallback/tracking/tracking.json",
+                "tracking_url": "https://unsafe.example/raw-tracking.json",
+                "segments": [
+                    {
+                        "selected_track_id": 7,
+                        "selected_track_ids": [7, 8],
+                        "identity_id": "legacy-identity-secret",
+                        "identity_status": "ACCEPTED",
+                        "anchor_matches": [{"anchor_id": 1, "local_track_id": 7}],
+                        "reacquire_score": 0.99,
+                        "reacquire_source": "manual_anchor",
+                        "reacquire_metrics": {"candidate_id": 7},
+                        "bboxes": [{"t": 1.0, **_bbox()}],
+                    }
+                ],
+                "segments_total": 1,
+                "segments_with_player": 1,
+                "anchors_total": 1,
+                "anchors_matched": 1,
+                "anchor_matches": [{"anchor_id": 1, "local_track_id": 7}],
+                "anchors_used": {"player_ref": {"track_id": 7}},
+                "coverage_pct": 25.0,
+                "largest_gap_sec": 10.0,
+            }
+
+        def upload_file(_client, bucket, path, key, content_type):
+            uploaded.update(
+                {
+                    "bucket": bucket,
+                    "key": key,
+                    "content_type": content_type,
+                    "payload": json.loads(Path(path).read_text()),
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_root, patch.dict(
+            os.environ,
+            {"S3_BUCKET": "tracking"},
+            clear=False,
+        ), patch(
+            "app.reid.full_match_runtime.TRACKING_ARTIFACT_ROOT",
+            Path(temporary_root),
+        ), patch.object(
+            self.module.legacy,
+            "_upload_file",
+            side_effect=upload_file,
+        ):
+            output = self.module._fallback(
+                fallback,
+                "REID_ANCHOR_NORMALIZATION_FAILED",
+                "job-early-fallback",
+                analysis_attempt_id="attempt-a",
+            )
+
+        persisted = uploaded["payload"]
+        self.assertFalse(persisted["tracking_success"])
+        self.assertEqual(persisted["segments"], [])
+        self.assertEqual(persisted["segments_total"], 0)
+        self.assertEqual(persisted["bboxes"], [])
+        self.assertEqual(persisted["anchors_matched"], 0)
+        self.assertEqual(persisted["anchor_matches"], [])
+        self.assertEqual(persisted["anchors_used"], {})
+        persisted_json = json.dumps(persisted, sort_keys=True)
+        self.assertNotIn("legacy-identity-secret", persisted_json)
+        self.assertNotIn("local_track_id", persisted_json)
+        self.assertNotIn("candidate_id", persisted_json)
+        self.assertNotIn("selected_track_id", persisted_json)
+        self.assertNotIn("selected_track_ids", persisted_json)
+        self.assertNotIn("reacquire_score", persisted_json)
+        self.assertNotIn("reacquire_source", persisted_json)
+        self.assertNotIn("reacquire_metrics", persisted_json)
+        self.assertEqual(
+            output["tracking_key"],
+            "jobs/job-early-fallback/attempts/attempt-a/tracking/tracking.json",
+        )
+        self.assertEqual(persisted["analysis_attempt_id"], "attempt-a")
+        self.assertEqual(output["analysis_attempt_id"], "attempt-a")
+        self.assertNotEqual(
+            output["tracking_url"],
+            "https://unsafe.example/raw-tracking.json",
+        )
+
     def _track_boxes(self, boxes):
         return {
             track_id: [
@@ -205,6 +291,622 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             ]
             for track_id, bbox in boxes.items()
         }
+
+    def test_overlap_tracklet_excludes_same_raw_id_outside_the_boundary(self):
+        linked = self.module._overlap_linked_detections(
+            [
+                {"t": 715.0, **_bbox()},
+                {"t": 720.0, **_bbox()},
+            ],
+            [
+                {
+                    "t": 43.0,
+                    "sample_index": 0,
+                    "bbox": _bbox(),
+                },
+                {
+                    "t": 55.0,
+                    "sample_index": 1,
+                    "bbox": _bbox(),
+                },
+                {
+                    "t": 58.0,
+                    "sample_index": 2,
+                    "bbox": {
+                        "x": 0.75,
+                        "y": 0.20,
+                        "w": 0.10,
+                        "h": 0.20,
+                    },
+                },
+                {
+                    "t": 60.0,
+                    "sample_index": 3,
+                    "bbox": _bbox(),
+                },
+            ],
+            window_start=660.0,
+            tolerance_sec=0.6,
+        )
+
+        self.assertEqual(
+            [item["sample_index"] for item in linked],
+            [1, 3],
+        )
+
+    def test_overlap_tracklet_deduplicates_frames_and_excludes_weak_iou(self):
+        weak = {
+            "x": 0.25,
+            "y": 0.20,
+            "w": 0.10,
+            "h": 0.20,
+        }
+        linked = self.module._overlap_linked_detections(
+            [
+                {"t": 715.0, **_bbox()},
+                {"t": 720.0, **_bbox()},
+            ],
+            [
+                {
+                    "t": 55.0,
+                    "sample_index": 1,
+                    "bbox": weak,
+                    "conf": 0.99,
+                },
+                {
+                    "t": 55.0,
+                    "sample_index": 1,
+                    "bbox": _bbox(),
+                    "conf": 0.90,
+                },
+                {
+                    "t": 60.0,
+                    "sample_index": 2,
+                    "bbox": _bbox(),
+                    "conf": 0.90,
+                },
+            ],
+            window_start=660.0,
+            tolerance_sec=0.6,
+        )
+
+        self.assertEqual(
+            [item["sample_index"] for item in linked],
+            [1, 2],
+        )
+        self.assertEqual(linked[0]["bbox"], _bbox())
+
+    def test_manual_anchor_emits_only_its_verified_local_tracklet(self):
+        samples = [
+            {
+                "t": time_sec,
+                "detections": [
+                    {
+                        "track_id": 7,
+                        "bbox": _bbox(),
+                        "conf": 0.95,
+                    }
+                ],
+            }
+            for time_sec in (0.0, 5.0, 10.0)
+        ]
+        bboxes, track_ids = self.module._stitch_manual_anchor_bboxes(
+            [
+                {
+                    "anchor": {"anchor_id": 1, "t": 10.0, **_bbox()},
+                    "track_id": 7,
+                    "descriptor": AppearanceDescriptor(
+                        vector=(1.0, 0.0),
+                        sample_count=3,
+                        quality=0.9,
+                    ),
+                }
+            ],
+            samples,
+            fps=1,
+            window_start=0.0,
+            radius_sec=1.0,
+        )
+
+        self.assertEqual(track_ids, [7])
+        self.assertEqual([item["t"] for item in bboxes], [10.0])
+
+    def test_manual_anchor_tracklet_stops_before_spatial_id_switch(self):
+        distant = {"x": 0.72, "y": 0.20, "w": 0.10, "h": 0.20}
+        tracklet = self.module._anchor_tracklet_detections(
+            [
+                {
+                    "t": 9.5,
+                    "sample_index": 0,
+                    "bbox": _bbox(),
+                    "conf": 0.95,
+                },
+                {
+                    "t": 10.0,
+                    "sample_index": 1,
+                    "bbox": _bbox(),
+                    "conf": 0.95,
+                },
+                {
+                    "t": 10.5,
+                    "sample_index": 2,
+                    "bbox": distant,
+                    "conf": 0.95,
+                },
+            ],
+            anchor_time_local=10.0,
+            anchor_bbox=_bbox(),
+            radius_sec=2.0,
+        )
+
+        self.assertEqual(
+            [item["sample_index"] for item in tracklet],
+            [0, 1],
+        )
+
+    def test_same_raw_id_anchor_tracklets_remain_separate(self):
+        distant = {"x": 0.72, "y": 0.20, "w": 0.10, "h": 0.20}
+        raw = [
+            {
+                "t": 10.0,
+                "sample_index": 0,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            },
+            {
+                "t": 10.5,
+                "sample_index": 1,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            },
+            {
+                "t": 20.0,
+                "sample_index": 2,
+                "bbox": distant,
+                "conf": 0.95,
+            },
+            {
+                "t": 20.5,
+                "sample_index": 3,
+                "bbox": distant,
+                "conf": 0.95,
+            },
+        ]
+
+        first = self.module._anchor_tracklet_detections(
+            raw,
+            anchor_time_local=10.0,
+            anchor_bbox=_bbox(),
+            radius_sec=2.0,
+        )
+        second = self.module._anchor_tracklet_detections(
+            raw,
+            anchor_time_local=20.0,
+            anchor_bbox=distant,
+            radius_sec=2.0,
+        )
+
+        self.assertEqual(
+            [item["sample_index"] for item in first],
+            [0, 1],
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in second],
+            [2, 3],
+        )
+
+    def test_strong_overlap_without_two_linked_samples_fails_closed(self):
+        raw = [
+            {
+                "t": 55.0,
+                "sample_index": 0,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            },
+            {
+                "t": 30.0,
+                "sample_index": 1,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            },
+            {
+                "t": 20.0,
+                "sample_index": 2,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            },
+        ]
+        descriptor = AppearanceDescriptor(
+            vector=(1.0, 0.0),
+            sample_count=3,
+            quality=0.9,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"PLAYER_REID_MIN_OVERLAP_LINK_SAMPLES": "2"},
+            clear=False,
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda _path, track_map, track_ids: {
+                track_id: descriptor if track_map.get(track_id) else None
+                for track_id in track_ids
+            },
+        ):
+            profiles, _ids, descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {326: raw},
+                previous_bboxes=[{"t": 715.0, **_bbox()}],
+                window_start=660.0,
+                direction="backward",
+                fps=2,
+                strong_overlap_score=0.65,
+            )
+
+        self.assertEqual(len(profiles), 1)
+        self.assertIsNone(profiles[0].overlap_score)
+        self.assertEqual(profiles[0].detection_count, 0)
+        self.assertIsNone(descriptors["326"])
+        self.assertEqual(
+            profiles[0].metadata["tracklet_scope"],
+            "STRONG_OVERLAP_UNRESOLVED",
+        )
+        self.assertFalse(profiles[0].metadata["strong_overlap_unique"])
+
+    def test_verified_strong_runner_is_not_hidden_by_candidate_cap(self):
+        def raw_track(track_id, confidence):
+            return [
+                {
+                    "t": local_time,
+                    "sample_index": sample_index,
+                    "track_id": track_id,
+                    "bbox": _bbox(),
+                    "conf": confidence,
+                }
+                for sample_index, local_time in enumerate((55.0, 56.0, 30.0))
+            ]
+
+        descriptor = AppearanceDescriptor(
+            vector=(1.0, 0.0),
+            sample_count=2,
+            quality=0.9,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "PLAYER_REID_MAX_CANDIDATES": "1",
+                "PLAYER_REID_MIN_OVERLAP_LINK_SAMPLES": "2",
+            },
+            clear=False,
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda _path, _track_map, track_ids: {
+                track_id: descriptor for track_id in track_ids
+            },
+        ):
+            profiles, _ids, _descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {
+                    326: raw_track(326, 0.99),
+                    927: raw_track(927, 0.50),
+                },
+                previous_bboxes=[
+                    {"t": 715.0, **_bbox()},
+                    {"t": 716.0, **_bbox()},
+                ],
+                window_start=660.0,
+                direction="backward",
+                fps=2,
+                strong_overlap_score=0.65,
+            )
+
+        self.assertEqual({item.candidate_id for item in profiles}, {"326", "927"})
+        self.assertTrue(
+            all(item.metadata["strong_overlap_unique"] is False for item in profiles)
+        )
+
+    def test_near_threshold_overlap_runner_blocks_unique_margin_override(self):
+        first = [
+            {
+                "t": local_time,
+                "sample_index": sample_index,
+                "track_id": 326,
+                "bbox": _bbox(),
+                "conf": 0.95,
+            }
+            for sample_index, local_time in enumerate((55.0, 56.0, 30.0))
+        ]
+        runner_bbox = {
+            "x": 0.2214,
+            "y": 0.20,
+            "w": 0.10,
+            "h": 0.20,
+        }
+        second = [
+            {
+                "t": local_time,
+                "sample_index": sample_index,
+                "track_id": 927,
+                "bbox": runner_bbox,
+                "conf": 0.95,
+            }
+            for sample_index, local_time in enumerate((55.0, 56.0, 30.0))
+        ]
+        descriptor = AppearanceDescriptor(
+            vector=(1.0, 0.0),
+            sample_count=2,
+            quality=0.9,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAYER_REID_MAX_CANDIDATES": "1",
+                "PLAYER_REID_MIN_OVERLAP_LINK_SAMPLES": "2",
+                "PLAYER_REID_OVERLAP_UNIQUENESS_MARGIN": "0.05",
+            },
+            clear=False,
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda _path, _track_map, track_ids: {
+                track_id: descriptor for track_id in track_ids
+            },
+        ):
+            profiles, _ids, _descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {326: first, 927: second},
+                previous_bboxes=[
+                    {"t": 715.0, **_bbox()},
+                    {"t": 716.0, **_bbox()},
+                ],
+                window_start=660.0,
+                direction="backward",
+                fps=2,
+                strong_overlap_score=0.65,
+            )
+
+        strongest = max(
+            profiles,
+            key=lambda item: float(item.overlap_score or 0.0),
+        )
+        self.assertGreaterEqual(float(strongest.overlap_score or 0.0), 0.65)
+        self.assertTrue(
+            any(
+                0.60 <= float(item.metadata["raw_overlap_score"] or 0.0) < 0.65
+                for item in profiles
+            )
+        )
+        self.assertFalse(strongest.metadata["strong_overlap_unique"])
+        self.assertEqual({item.candidate_id for item in profiles}, {"326", "927"})
+
+    def test_overlap_tracklet_extends_only_through_consecutive_motion(self):
+        raw = [
+            {
+                "t": float(index),
+                "sample_index": index,
+                "track_id": 7,
+                "bbox": _bbox(),
+                "conf": 0.9,
+            }
+            for index in range(5)
+        ]
+        extended = self.module._tracklet_detections_from_overlap(
+            raw,
+            raw[:2],
+            direction="forward",
+            fps=1,
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in extended],
+            [0, 1, 2, 3, 4],
+        )
+
+        missing_sample = [raw[0], raw[1], {**raw[2], "sample_index": 4}]
+        stopped = self.module._tracklet_detections_from_overlap(
+            missing_sample,
+            missing_sample[:2],
+            direction="forward",
+            fps=1,
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in stopped],
+            [0, 1],
+        )
+
+        jumped = [
+            raw[0],
+            raw[1],
+            {
+                **raw[2],
+                "bbox": {"x": 0.75, "y": 0.65, "w": 0.1, "h": 0.2},
+            },
+        ]
+        stopped = self.module._tracklet_detections_from_overlap(
+            jumped,
+            jumped[:2],
+            direction="forward",
+            fps=1,
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in stopped],
+            [0, 1],
+        )
+
+    def test_disconnected_overlap_seeds_fail_closed(self):
+        distant = {"x": 0.75, "y": 0.65, "w": 0.1, "h": 0.2}
+        raw = [
+            {
+                "t": float(index),
+                "sample_index": index,
+                "track_id": 7,
+                "bbox": _bbox() if index < 2 else distant,
+                "conf": 0.9,
+            }
+            for index in range(4)
+        ]
+
+        extended = self.module._tracklet_detections_from_overlap(
+            raw,
+            [raw[0], raw[3]],
+            direction="forward",
+            fps=1,
+        )
+
+        self.assertEqual(extended, [])
+
+    def test_manual_anchor_radius_finds_seed_without_truncating_component(self):
+        raw = [
+            {
+                "t": float(index),
+                "sample_index": index,
+                "track_id": 7,
+                "bbox": _bbox(),
+                "conf": 0.9,
+            }
+            for index in range(6)
+        ]
+
+        component = self.module._anchor_tracklet_detections(
+            raw,
+            anchor_time_local=2.0,
+            anchor_bbox=_bbox(),
+            radius_sec=0.1,
+        )
+
+        self.assertEqual(
+            [item["sample_index"] for item in component],
+            [0, 1, 2, 3, 4, 5],
+        )
+        descriptor_component = self.module._anchor_descriptor_detections(
+            raw,
+            anchor_time_local=2.0,
+            anchor_bbox=_bbox(),
+            radius_sec=0.1,
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in descriptor_component],
+            [2],
+        )
+
+    def test_continuous_tracklet_propagates_across_two_window_hops(self):
+        descriptor = AppearanceDescriptor(
+            vector=(1.0, 0.0),
+            sample_count=3,
+            quality=0.9,
+        )
+
+        def raw_track(start, end):
+            return [
+                {
+                    "t": float(local_time),
+                    "sample_index": sample_index,
+                    "track_id": 7,
+                    "bbox": _bbox(),
+                    "conf": 0.9,
+                }
+                for sample_index, local_time in enumerate(range(start, end + 1))
+            ]
+
+        with patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda _path, _track_map, track_ids: {
+                track_id: descriptor for track_id in track_ids
+            },
+        ):
+            first, _ids, _descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window-1.mp4"),
+                {7: raw_track(4, 45)},
+                previous_bboxes=[
+                    {"t": float(time_sec), **_bbox()} for time_sec in (39, 40, 41)
+                ],
+                window_start=35.0,
+                direction="forward",
+                fps=1,
+                strong_overlap_score=0.65,
+            )
+            first_tracklet = first[0].metadata["tracklet_detections"]
+            first_bboxes = [
+                {
+                    "t": 35.0 + float(item["t"]),
+                    **dict(item["bbox"]),
+                }
+                for item in first_tracklet
+            ]
+            second, _ids, _descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window-2.mp4"),
+                {7: raw_track(0, 45)},
+                previous_bboxes=first_bboxes,
+                window_start=70.0,
+                direction="forward",
+                fps=1,
+                strong_overlap_score=0.65,
+            )
+
+        self.assertEqual(
+            first[0].metadata["tracklet_scope"],
+            "MOTION_CONTINUOUS_STRONG_OVERLAP",
+        )
+        self.assertEqual(
+            second[0].metadata["tracklet_scope"],
+            "MOTION_CONTINUOUS_STRONG_OVERLAP",
+        )
+        self.assertEqual(
+            max(item["t"] for item in second[0].metadata["tracklet_detections"]),
+            45.0,
+        )
+
+    def test_autonomous_proof_requires_two_samples_outside_all_anchor_windows(self):
+        anchor = {
+            "direction": "anchor",
+            "window_start": 0.0,
+            "window_end": 45.0,
+            "identity_status": "ACCEPTED",
+            "bboxes": [{"t": 39.0, **_bbox()}, {"t": 40.0, **_bbox()}],
+        }
+        adjacent = {
+            "direction": "forward",
+            "window_start": 35.0,
+            "window_end": 80.0,
+            "identity_status": "ACCEPTED",
+            "bboxes": [{"t": 39.0, **_bbox()}, {"t": 40.0, **_bbox()}],
+        }
+
+        overlap_only = self.module._autonomous_tracking_evidence(
+            [anchor, adjacent],
+            fps=1,
+        )
+        one_new_sample = self.module._autonomous_tracking_evidence(
+            [
+                anchor,
+                {**adjacent, "bboxes": [*adjacent["bboxes"], {"t": 47.0, **_bbox()}]},
+            ],
+            fps=1,
+        )
+        proven = self.module._autonomous_tracking_evidence(
+            [
+                anchor,
+                {
+                    **adjacent,
+                    "bboxes": [
+                        *adjacent["bboxes"],
+                        {"t": 47.0, **_bbox()},
+                        {"t": 48.0, **_bbox()},
+                    ],
+                },
+            ],
+            fps=1,
+        )
+
+        self.assertFalse(overlap_only["proven"])
+        self.assertEqual(overlap_only["bboxes_count"], 0)
+        self.assertFalse(one_new_sample["proven"])
+        self.assertEqual(one_new_sample["bboxes_count"], 1)
+        self.assertTrue(proven["proven"])
+        self.assertEqual(proven["bboxes_count"], 2)
 
     def test_clear_identity_is_linked_across_both_directions(self):
         type(self).track_maps = {
@@ -227,6 +929,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 "S3_ACCESS_KEY": "key",
                 "S3_SECRET_KEY": "secret",
                 "S3_BUCKET": "bucket",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "0",
             },
             clear=False,
         ), patch.object(
@@ -247,8 +950,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertEqual(output["segments_with_player"], 3)
         self.assertEqual(output["reid_summary"]["accepted_associations"], 2)
         identities = {
-            segment["reid"].get("identity_id")
-            for segment in output["segments"]
+            segment["reid"].get("identity_id") for segment in output["segments"]
         }
         self.assertEqual(identities, {"job-job-1-selected-player"})
         self.assertTrue(
@@ -256,6 +958,18 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 segment["identity_status"] == "ACCEPTED"
                 for segment in output["segments"]
             )
+        )
+        self.assertEqual(
+            [segment["window_index"] for segment in output["segments"]],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [segment["parent_window_index"] for segment in output["segments"]],
+            [1, None, 1],
+        )
+        self.assertEqual(
+            [segment["processing_direction"] for segment in output["segments"]],
+            ["backward", "anchor", "forward"],
         )
 
     def test_equal_candidates_abstain_instead_of_switching_identity(self):
@@ -307,8 +1021,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                "AMBIGUOUS_CANDIDATE_MARGIN"
-                in segment["reid"]["reason_codes"]
+                "AMBIGUOUS_CANDIDATE_MARGIN" in segment["reid"]["reason_codes"]
                 for segment in non_anchor
             )
         )
@@ -356,6 +1069,21 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertEqual(output["segments"][1]["identity_status"], "ABSTAINED")
         self.assertEqual(output["segments"][2]["direction"], "anchor")
         self.assertEqual(output["segments"][2]["selected_track_id"], 30)
+        self.assertEqual(
+            [
+                (
+                    segment["window_index"],
+                    segment["parent_window_index"],
+                    segment["processing_direction"],
+                )
+                for segment in output["segments"]
+            ],
+            [
+                (0, None, "anchor"),
+                (1, 0, "forward"),
+                (2, 1, "forward"),
+            ],
+        )
         self.assertEqual(output["anchor_reacquisitions"], 1)
         self.assertEqual(output["anchors_total"], 2)
         self.assertEqual(output["anchors_matched"], 2)
@@ -363,9 +1091,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             [item["status"] for item in output["anchor_matches"]],
             ["MATCHED", "MATCHED"],
         )
-        self.assertEqual(
-            output["reid_summary"]["anchor_reacquisitions"], 1
-        )
+        self.assertEqual(output["reid_summary"]["anchor_reacquisitions"], 1)
 
     def test_two_anchors_in_one_window_stitch_local_track_ids(self):
         left = _bbox()
@@ -531,7 +1257,10 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 detector_model="yolo11n.pt",
             )
 
-        self.assertTrue(output["tracking_success"])
+        self.assertFalse(output["tracking_success"])
+        self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
+        self.assertEqual(output["tracking_scope_status"], "ANCHOR_ONLY")
+        self.assertEqual(output["autonomous_segments_with_player"], 0)
         profiles = {
             item["window_number"]: (item["fps"], item["model"])
             for item in type(self).collection_profiles
@@ -544,8 +1273,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             "yolo11s.pt",
         )
         extraction_profiles = {
-            item["start"]: item["accurate"]
-            for item in type(self).segment_extractions
+            item["start"]: item["accurate"] for item in type(self).segment_extractions
         }
         self.assertTrue(extraction_profiles[35.0])
         self.assertFalse(extraction_profiles[0.0])
@@ -601,7 +1329,8 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 video_duration_sec=115.0,
             )
 
-        self.assertTrue(output["tracking_success"])
+        self.assertFalse(output["tracking_success"])
+        self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
         self.assertEqual(output["anchor_acquisition"]["seed_anchor_id"], 2)
         self.assertEqual(output["anchor_acquisition"]["seed_window_index"], 2)
         self.assertEqual(
@@ -658,10 +1387,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertEqual(fallback_calls, [])
         self.assertNotIn(
             2,
-            {
-                item["window_number"]
-                for item in type(self).collection_profiles
-            },
+            {item["window_number"] for item in type(self).collection_profiles},
         )
 
     def test_anchor_descriptor_error_returns_retry_without_legacy_fallback(self):

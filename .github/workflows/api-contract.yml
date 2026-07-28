@@ -3,16 +3,24 @@ name: API contract
 on:
   pull_request:
     paths:
+      - ".github/workflows/reid-production-regression.yml"
+      - "app/core/analysis_attempt_precondition.py"
       - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
+      - "app/core/tracking_outcome.py"
       - "app/api.py"
       - "app/main.py"
       - "app/player_profile_api.py"
+      - "app/runtime_api.py"
       - "app/schemas.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "app/workers/pipeline.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_anchor_reselection_pipeline.py"
+      - "tests/test_enqueue_and_result_flow.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
@@ -20,21 +28,33 @@ on:
       - "tests/test_multi_anchor_api.py"
       - "tests/test_pick_player_flow.py"
       - "tests/test_player_profile_api.py"
+      - "tests/test_runtime_api.py"
+      - "tests/test_async_report.py"
+      - "tests/reid_production_validator.py"
+      - "tests/test_reid_production_validator_contract.py"
       - ".github/workflows/api-contract.yml"
   push:
     branches:
       - main
     paths:
+      - ".github/workflows/reid-production-regression.yml"
+      - "app/core/analysis_attempt_precondition.py"
       - "app/core/http_errors.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
+      - "app/core/tracking_outcome.py"
       - "app/api.py"
       - "app/main.py"
       - "app/player_profile_api.py"
+      - "app/runtime_api.py"
       - "app/schemas.py"
       - "app/workers/celery_app.py"
       - "app/workers/ai_report.py"
+      - "app/workers/pipeline.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_anchor_reselection_pipeline.py"
+      - "tests/test_enqueue_and_result_flow.py"
       - "tests/test_http_error_contract.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
@@ -42,6 +62,10 @@ on:
       - "tests/test_multi_anchor_api.py"
       - "tests/test_pick_player_flow.py"
       - "tests/test_player_profile_api.py"
+      - "tests/test_runtime_api.py"
+      - "tests/test_async_report.py"
+      - "tests/reid_production_validator.py"
+      - "tests/test_reid_production_validator_contract.py"
       - ".github/workflows/api-contract.yml"
 
 permissions:
@@ -70,21 +94,29 @@ jobs:
           fastapi==0.115.0
           requests==2.32.3
           boto3==1.34.162
+          redis==5.0.8
           openai==1.51.0
 
       - name: Compile changed Python modules
         run: >-
           python -m py_compile
+          app/core/analysis_attempt_precondition.py
           app/core/http_errors.py
           app/core/evaluation_truth.py
           app/core/evaluation_guard.py
           app/core/evaluation_http_guard.py
+          app/core/tracking_outcome.py
           app/api.py
           app/main.py
           app/player_profile_api.py
+          app/runtime_api.py
           app/schemas.py
           app/workers/celery_app.py
           app/workers/ai_report.py
+          app/workers/pipeline.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_anchor_reselection_pipeline.py
+          tests/test_enqueue_and_result_flow.py
           tests/test_http_error_contract.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
@@ -92,14 +124,77 @@ jobs:
           tests/test_multi_anchor_api.py
           tests/test_pick_player_flow.py
           tests/test_player_profile_api.py
+          tests/test_runtime_api.py
+          tests/test_async_report.py
+          tests/reid_production_validator.py
+          tests/test_reid_production_validator_contract.py
 
       - name: Run API and evaluation truth contract tests
-        run: >-
-          python -m unittest
-          tests/test_http_error_contract.py
-          tests/test_evaluation_truth.py
-          tests/test_evaluation_guard.py
-          tests/test_evaluation_report_guard.py
-          tests/test_multi_anchor_api.py
-          tests/test_pick_player_flow.py
-          tests/test_player_profile_api.py
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}"
+          python - <<'PY'
+          import runpy
+          import sys
+          import types
+
+          class Retry(Exception):
+              pass
+
+          celery_package = types.ModuleType("celery")
+          celery_package.__path__ = []
+          celery_exceptions = types.ModuleType("celery.exceptions")
+          celery_exceptions.Retry = Retry
+          sys.modules["celery"] = celery_package
+          sys.modules["celery.exceptions"] = celery_exceptions
+
+          class LightweightCelery:
+              def task(self, *_args, **_kwargs):
+                  return lambda function: function
+
+          sys.modules["app.workers.celery_app"] = types.SimpleNamespace(
+              celery=LightweightCelery()
+          )
+
+          tracking = types.ModuleType("app.workers.tracking")
+
+          class TrackingTimeoutError(RuntimeError):
+              pass
+
+          tracking.TrackingTimeoutError = TrackingTimeoutError
+          for name in (
+              "track_all_players",
+              "track_all_players_from_frames",
+              "track_player",
+              "track_player_windowed",
+          ):
+              setattr(tracking, name, lambda *_args, **_kwargs: None)
+          sys.modules["app.workers.tracking"] = tracking
+
+          runpy.run_path("tests/test_enqueue_and_result_flow.py", run_name="__main__")
+          PY
+          python tests/test_reid_production_validator_contract.py
+          python tests/test_analysis_attempt_pipeline.py
+          python tests/test_anchor_reselection_pipeline.py
+          python tests/test_http_error_contract.py
+          python tests/test_evaluation_truth.py
+          python tests/test_evaluation_guard.py
+          python tests/test_evaluation_report_guard.py
+          python tests/test_multi_anchor_api.py
+          python tests/test_pick_player_flow.py
+          python tests/test_player_profile_api.py
+          python tests/test_runtime_api.py
+          python - <<'PY'
+          import runpy
+          import sys
+          import types
+
+          class LightweightCelery:
+              def task(self, *_args, **_kwargs):
+                  return lambda function: function
+
+          sys.modules["app.workers.celery_app"] = types.SimpleNamespace(
+              celery=LightweightCelery()
+          )
+          runpy.run_path("tests/test_async_report.py", run_name="__main__")
+          PY
