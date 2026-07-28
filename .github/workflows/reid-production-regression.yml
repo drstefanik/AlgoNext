@@ -208,6 +208,7 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         env:
+          WORKFLOW_STATUS: ${{ job.status }}
           TERMINAL_STATUS: ${{ steps.poll.outputs.status || 'NOT_COMPLETED' }}
           GUARD_STATUS: ${{ steps.validate.outputs.guard_status || 'NOT_VALIDATED' }}
           SEGMENTS_WITH_PLAYER: ${{ steps.validate.outputs.segments_with_player || '0' }}
@@ -220,7 +221,7 @@ jobs:
             const lines = [
               '### ReID production regression',
               `- Job: \`${process.env.JOB_ID}\``,
-              `- Workflow: ${job.status}`,
+              `- Workflow: ${process.env.WORKFLOW_STATUS}`,
               `- Stato job: ${process.env.TERMINAL_STATUS}`,
               `- Guard: ${process.env.GUARD_STATUS}`,
               `- Finestre mantenute: ${process.env.SEGMENTS_WITH_PLAYER}`,
