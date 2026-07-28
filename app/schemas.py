@@ -51,7 +51,9 @@ class SelectionBox(BaseModel):
     def normalize_payload(cls, data: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("Missing selection payload")
-        frame_time_sec = data.get("frame_time_sec") or data.get("frameTimeSec")
+        frame_time_sec = data.get("frame_time_sec")
+        if frame_time_sec is None:
+            frame_time_sec = data.get("frameTimeSec")
         if frame_time_sec is None:
             raise ValueError("Missing selection frame_time_sec")
 

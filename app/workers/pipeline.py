@@ -39,6 +39,7 @@ from app.workers.tracking import (
     track_player,
     track_player_windowed,
 )
+from app.workers.multi_anchor import compute_tracking_window
 
 logger = logging.getLogger(__name__)
 
@@ -444,7 +445,10 @@ def _collect_target_times(target: Dict[str, Any] | None) -> List[float]:
     for sel in target.get("selections") or []:
         if not isinstance(sel, dict):
             continue
-        time_val = _normalize_time(sel.get("time_sec") or sel.get("frame_time_sec"))
+        time_value = sel.get("time_sec")
+        if time_value is None:
+            time_value = sel.get("frame_time_sec")
+        time_val = _normalize_time(time_value)
         if time_val is not None:
             times.append(time_val)
     return times
@@ -2536,25 +2540,20 @@ def run_analysis(self, job_id: str):
         tracking_window_after = float(
             os.environ.get("TRACKING_WINDOW_AFTER_SEC", "60") or 60
         )
-        tracking_anchor = (target.get("selection") or {}) if isinstance(target, dict) else {}
-        t0_value = None
-        if isinstance(tracking_anchor, dict):
-            t0_value = tracking_anchor.get("time_sec")
-        if t0_value is None and isinstance(job.player_ref, dict):
-            t0_value = job.player_ref.get("best_time_sec")
-        try:
-            t0 = float(t0_value) if t0_value is not None else 0.0
-        except (TypeError, ValueError):
-            t0 = 0.0
+        anchor_times = _collect_target_times(target)
+        anchor_times.extend(
+            _collect_player_ref_times(job.player_ref or job.anchor or {})
+        )
+        anchor_times = sorted(set(anchor_times))
+        t0 = min(anchor_times) if anchor_times else 0.0
 
         if not full_match_mode:
-            window_start = max(0.0, t0 - tracking_window_before)
-            window_duration = tracking_window_before + tracking_window_after
-            if duration and duration > 0:
-                if window_start >= duration:
-                    window_start = max(0.0, duration - window_duration)
-                max_duration = max(0.0, duration - window_start)
-                window_duration = min(window_duration, max_duration)
+            window_start, window_duration = compute_tracking_window(
+                anchor_times,
+                duration,
+                tracking_window_before,
+                tracking_window_after,
+            )
 
             if window_duration > 0:
                 segment_path = base_dir / "segment.mp4"
@@ -2689,6 +2688,7 @@ def run_analysis(self, job_id: str):
             total_bboxes = sum(len(seg.get("bboxes") or []) for seg in segments)
             tracking_payload = {
                 "mode": tracking_output.get("mode"),
+                "identity_mode": tracking_output.get("identity_mode"),
                 "method": tracking_output.get("method"),
                 "fps": tracking_output.get("fps"),
                 "window_sec": tracking_output.get("window_sec"),
@@ -2696,6 +2696,15 @@ def run_analysis(self, job_id: str):
                 "segments": segments,
                 "segments_total": tracking_output.get("segments_total"),
                 "segments_with_player": tracking_output.get("segments_with_player"),
+                "anchor_reacquisitions": tracking_output.get("anchor_reacquisitions"),
+                "anchors_total": tracking_output.get("anchors_total"),
+                "anchors_matched": tracking_output.get("anchors_matched"),
+                "anchor_matches": tracking_output.get("anchor_matches"),
+                "anchors_used": tracking_output.get("anchors_used"),
+                "reid_summary": tracking_output.get("reid_summary"),
+                "runtime_profile": tracking_output.get("runtime_profile"),
+                "partial": tracking_output.get("partial"),
+                "partial_reason": tracking_output.get("partial_reason"),
                 "coverage_pct_total": tracking_output.get("coverage_pct_total"),
                 "largest_gap_sec": tracking_output.get("largest_gap_sec"),
                 "coverage_pct": tracking_output.get("coverage_pct"),
@@ -2712,6 +2721,7 @@ def run_analysis(self, job_id: str):
                 "coverage_pct": tracking_output.get("coverage_pct"),
                 "bboxes_count": len(tracking_output.get("bboxes") or []),
                 "track_id": tracking_output.get("track_id"),
+                "anchors_used": tracking_output.get("anchors_used"),
                 "lost_segments": tracking_output.get("lost_segments"),
                 "motion_segments": motion_segments,
                 "notes": tracking_output.get("notes"),
