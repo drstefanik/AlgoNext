@@ -9,6 +9,18 @@ _TRACKING_SAMPLE_TARGET = 60.0
 _LOW_COVERAGE_PCT = 45.0
 _LOW_CONTINUITY_PCT = 65.0
 _MIN_TRACKING_SAMPLES = 30
+_TRACKING_FAILURE_STATUSES = {
+    "ANCHOR_ACQUISITION_ERROR",
+    "ANCHOR_NOT_FOUND",
+    "ANCHOR_REJECTED",
+    "ANCHOR_TRACK_EMPTY",
+    "NO_PLAYER_TRACK",
+    "TEAM_COLOR_GUARD_ERROR",
+}
+_TRACKING_INCOMPLETE_STATUSES = {
+    "PARTIAL_TIMEOUT",
+    "TRACKING_TIMEOUT",
+}
 
 _UNVALIDATED_PHYSICAL_METRICS = {
     "distance_covered_m",
@@ -146,6 +158,92 @@ def _collect_lost_segments(tracking: Mapping[str, Any]) -> List[Mapping[str, Any
     ]
 
 
+def _tracking_failure_codes(
+    tracking: Mapping[str, Any],
+    *,
+    observed_samples: int,
+) -> List[str]:
+    summary = _as_mapping(tracking.get("reid_summary"))
+    codes = [
+        str(code).strip()
+        for code in (
+            summary.get("reason_codes")
+            if isinstance(summary.get("reason_codes"), list)
+            else []
+        )
+        if str(code).strip()
+    ]
+    status = str(
+        tracking.get("tracking_status") or summary.get("status") or ""
+    ).strip().upper()
+    partial_reason = str(tracking.get("partial_reason") or "").strip().upper()
+    incomplete_tracking = bool(
+        tracking.get("partial") is True
+        or status in _TRACKING_INCOMPLETE_STATUSES
+        or partial_reason in _TRACKING_INCOMPLETE_STATUSES
+    )
+    explicit_failure = (
+        tracking.get("tracking_success") is False and not incomplete_tracking
+    )
+    anchor_failure = (
+        status in _TRACKING_FAILURE_STATUSES
+        or str(tracking.get("action_required") or "").upper()
+        == "RESELECT_PLAYER"
+        or any(
+            code.startswith("REID_ANCHOR")
+            or code.startswith("REID_ALL_ANCHORS")
+            for code in codes
+        )
+    )
+    segments_total = int(
+        max(0.0, _safe_float(tracking.get("segments_total")) or 0.0)
+    )
+    segments_with_player = int(
+        max(0.0, _safe_float(tracking.get("segments_with_player")) or 0.0)
+    )
+    empty_completed_tracking = (
+        segments_total > 0
+        and segments_with_player == 0
+        and observed_samples == 0
+        and not incomplete_tracking
+    )
+    if not (explicit_failure or anchor_failure or empty_completed_tracking):
+        return []
+    if status and status not in codes:
+        codes.append(status)
+    if empty_completed_tracking and "NO_SELECTED_PLAYER_OBSERVATIONS" not in codes:
+        codes.append("NO_SELECTED_PLAYER_OBSERVATIONS")
+    return codes or ["SELECTED_PLAYER_TRACKING_FAILED"]
+
+
+def _tracking_incomplete_codes(tracking: Mapping[str, Any]) -> List[str]:
+    summary = _as_mapping(tracking.get("reid_summary"))
+    status = str(
+        tracking.get("tracking_status") or summary.get("status") or ""
+    ).strip().upper()
+    partial_reason = str(tracking.get("partial_reason") or "").strip().upper()
+    incomplete = bool(
+        tracking.get("partial") is True
+        or status in _TRACKING_INCOMPLETE_STATUSES
+        or partial_reason in _TRACKING_INCOMPLETE_STATUSES
+    )
+    if not incomplete:
+        return []
+    codes = [
+        str(code).strip()
+        for code in (
+            summary.get("reason_codes")
+            if isinstance(summary.get("reason_codes"), list)
+            else []
+        )
+        if str(code).strip()
+    ]
+    for code in (status, partial_reason):
+        if code and code not in codes:
+            codes.append(code)
+    return codes or ["TRACKING_INCOMPLETE"]
+
+
 def compute_image_motion_metrics(
     tracking: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
@@ -244,28 +342,14 @@ def build_tracking_evaluation(
 ) -> Dict[str, Any]:
     candidate = _as_mapping(candidate_metrics)
     tracking_source = _as_mapping(tracking)
+    has_tracking_contract = isinstance(tracking, Mapping)
     image_motion = compute_image_motion_metrics(tracking_source)
 
-    coverage_pct = _tracking_coverage_percent(tracking_source, candidate)
-
-    continuity_pct = _ratio_or_percent(
-        _first_present(
-            candidate.get("stabilityScore"),
-            candidate.get("stability_score"),
-            tracking_source.get("stability_score"),
-        )
+    coverage_pct = _tracking_coverage_percent(
+        tracking_source,
+        {} if has_tracking_contract else candidate,
     )
-    lost_segments = _collect_lost_segments(tracking_source)
     observed_samples = int(image_motion.get("observed_samples") or 0)
-    if continuity_pct is not None:
-        continuity_source = "reported_stability"
-    elif observed_samples >= 2:
-        continuity_pct = _clamp(100.0 - len(lost_segments) * 12.5)
-        continuity_source = "lost_segments_proxy"
-    else:
-        continuity_pct = 0.0
-        continuity_source = "unavailable"
-
     candidate_samples = _first_number(
         candidate.get("sampleFramesCount"),
         candidate.get("sample_frames_count"),
@@ -275,10 +359,13 @@ def build_tracking_evaluation(
     samples_used = int(
         max(
             0.0,
-            _first_number(
-                candidate_samples,
-                tracking_source.get("bboxes_count"),
-                observed_samples,
+            (
+                _first_number(
+                    tracking_source.get("bboxes_count"),
+                    observed_samples,
+                )
+                if has_tracking_contract
+                else _first_number(candidate_samples, observed_samples)
             )
             or 0.0,
         )
@@ -286,6 +373,34 @@ def build_tracking_evaluation(
     sample_sufficiency_pct = _clamp(
         (samples_used / _TRACKING_SAMPLE_TARGET) * 100.0
     )
+
+    continuity_pct = _ratio_or_percent(
+        _first_present(
+            tracking_source.get("stability_score"),
+            tracking_source.get("stabilityScore"),
+        )
+        if has_tracking_contract
+        else _first_present(
+            candidate.get("stabilityScore"),
+            candidate.get("stability_score"),
+        )
+    )
+    lost_segments = _collect_lost_segments(tracking_source)
+    if continuity_pct is not None:
+        continuity_source = "reported_stability"
+    elif (
+        has_tracking_contract
+        and samples_used >= 2
+        and (
+            "lost_segments" in tracking_source
+            or "segments" in tracking_source
+        )
+    ):
+        continuity_pct = _clamp(100.0 - len(lost_segments) * 12.5)
+        continuity_source = "lost_segments_proxy"
+    else:
+        continuity_pct = 0.0
+        continuity_source = "unavailable"
 
     segments_total = int(
         max(0.0, _safe_float(tracking_source.get("segments_total")) or 0.0)
@@ -302,36 +417,69 @@ def build_tracking_evaluation(
         else None
     )
     largest_gap_sec = _safe_float(tracking_source.get("largest_gap_sec"))
-
-    tracking_quality_index = round(
-        _clamp(
-            coverage_pct * 0.50
-            + continuity_pct * 0.30
-            + sample_sufficiency_pct * 0.20
-        ),
-        1,
+    failure_codes = _tracking_failure_codes(
+        tracking_source,
+        observed_samples=samples_used,
     )
-
-    if (
-        coverage_pct >= 50.0
-        and continuity_pct >= 70.0
-        and samples_used >= 60
-    ):
-        tracking_confidence = "medium"
+    incomplete_codes = _tracking_incomplete_codes(tracking_source)
+    if failure_codes:
+        evaluation_status = "TRACKING_FAILED"
+        score_kind = "tracking_failure"
+        tracking_quality_index = None
+        tracking_confidence = "none"
+        continuity_pct = 0.0
+        continuity_source = "not_applicable"
+        sample_sufficiency_pct = 0.0
+        samples_used = 0
+        largest_gap_sec = None
+        reason_codes = list(dict.fromkeys(failure_codes))
+        if (
+            str(tracking_source.get("action_required") or "").upper()
+            == "RESELECT_PLAYER"
+        ):
+            reason_codes.append("PLAYER_RESELECTION_REQUIRED")
+    elif incomplete_codes:
+        evaluation_status = "TRACKING_INCOMPLETE"
+        score_kind = "tracking_incomplete"
+        tracking_quality_index = None
+        tracking_confidence = "none"
+        continuity_pct = 0.0
+        continuity_source = "not_applicable"
+        sample_sufficiency_pct = 0.0
+        samples_used = 0
+        largest_gap_sec = None
+        reason_codes = list(dict.fromkeys(incomplete_codes))
     else:
-        tracking_confidence = "low"
+        evaluation_status = "TRACKING_ONLY"
+        score_kind = "tracking_quality"
+        tracking_quality_index = round(
+            _clamp(
+                coverage_pct * 0.50
+                + continuity_pct * 0.30
+                + sample_sufficiency_pct * 0.20
+            ),
+            1,
+        )
+        if (
+            coverage_pct >= 50.0
+            and continuity_pct >= 70.0
+            and samples_used >= 60
+        ):
+            tracking_confidence = "medium"
+        else:
+            tracking_confidence = "low"
 
-    reason_codes: List[str] = []
-    if coverage_pct < _LOW_COVERAGE_PCT:
-        reason_codes.append("LOW_TRACKING_COVERAGE")
-    if continuity_source == "unavailable":
-        reason_codes.append("CONTINUITY_NOT_MEASURED")
-    elif continuity_pct < _LOW_CONTINUITY_PCT:
-        reason_codes.append("LOW_TRACKLET_CONTINUITY")
-    if samples_used < _MIN_TRACKING_SAMPLES:
-        reason_codes.append("INSUFFICIENT_TRACKING_SAMPLES")
-    if largest_gap_sec is not None and largest_gap_sec > 30.0:
-        reason_codes.append("LONG_TRACKING_GAPS")
+        reason_codes = []
+        if coverage_pct < _LOW_COVERAGE_PCT:
+            reason_codes.append("LOW_TRACKING_COVERAGE")
+        if continuity_source == "unavailable":
+            reason_codes.append("CONTINUITY_NOT_MEASURED")
+        elif continuity_pct < _LOW_CONTINUITY_PCT:
+            reason_codes.append("LOW_TRACKLET_CONTINUITY")
+        if samples_used < _MIN_TRACKING_SAMPLES:
+            reason_codes.append("INSUFFICIENT_TRACKING_SAMPLES")
+        if largest_gap_sec is not None and largest_gap_sec > 30.0:
+            reason_codes.append("LONG_TRACKING_GAPS")
 
     reason_codes.extend(
         [
@@ -364,8 +512,8 @@ def build_tracking_evaluation(
 
     return {
         "schema_version": EVALUATION_SCHEMA_VERSION,
-        "status": "TRACKING_ONLY",
-        "score_kind": "tracking_quality",
+        "status": evaluation_status,
+        "score_kind": score_kind,
         "player_evaluation_available": False,
         "tracking_quality_index": tracking_quality_index,
         "tracking_confidence": tracking_confidence,
@@ -396,11 +544,16 @@ def build_tracking_evaluation(
         "capabilities": capabilities,
         "limitations": limitations,
         "provenance": {
-            "kind": "tracking_quality",
+            "kind": score_kind,
             "version": TRACKING_QUALITY_VERSION,
             "validated_player_score": False,
             "metric_space": "image_plane_normalized",
             "coverage_unit": "percentage_points",
+            "metrics_scope": (
+                "selected_player"
+                if has_tracking_contract
+                else "preview_candidate"
+            ),
         },
     }
 
@@ -417,7 +570,13 @@ def apply_evaluation_truth_gate(
         evidence_metrics or updated.get("evidence_metrics")
     )
     if candidate_metrics:
-        sanitized_evidence["candidate_metrics"] = dict(candidate_metrics)
+        if isinstance(tracking, Mapping):
+            sanitized_evidence.pop("candidate_metrics", None)
+            sanitized_evidence[
+                "preview_candidate_metrics"
+            ] = dict(candidate_metrics)
+        else:
+            sanitized_evidence["candidate_metrics"] = dict(candidate_metrics)
     if tracking:
         sanitized_evidence["image_motion"] = compute_image_motion_metrics(
             tracking
@@ -486,10 +645,33 @@ def apply_evaluation_truth_gate(
             "reason_codes": evaluation["reason_codes"],
             "evidence_metrics": sanitized_evidence,
             "explain": (
-                "Diagnostica di computer vision: il numero mostrato misura la qualità "
-                "dell'evidenza di tracking, non la qualità calcistica del giocatore. "
-                "La valutazione del calciatore è sospesa finché ReID, calibrazione del "
-                "campo ed eventi palla non saranno validati."
+                (
+                    "Il giocatore selezionato non è stato ritrovato: nessuna metrica "
+                    "di tracking o valutazione è disponibile. Seleziona un riferimento "
+                    "più nitido per riprovare."
+                )
+                if (
+                    evaluation["status"] == "TRACKING_FAILED"
+                    and str(_as_mapping(tracking).get("action_required") or "").upper()
+                    != "RETRY_ANALYSIS"
+                )
+                else (
+                    "Il tracking del giocatore si è interrotto per un errore tecnico. "
+                    "Riprova l'analisi senza cambiare selezione."
+                )
+                if evaluation["status"] == "TRACKING_FAILED"
+                else (
+                    "Il budget operativo del tracking è terminato prima di produrre "
+                    "un risultato completo. Riprova l'analisi; nessuna metrica del "
+                    "giocatore è stata inferita dai dati parziali."
+                )
+                if evaluation["status"] == "TRACKING_INCOMPLETE"
+                else (
+                    "Diagnostica di computer vision: il numero mostrato misura la "
+                    "qualità dell'evidenza di tracking, non la qualità calcistica del "
+                    "giocatore. La valutazione del calciatore è sospesa finché ReID, "
+                    "calibrazione del campo ed eventi palla non saranno validati."
+                )
             ),
         }
     )

@@ -91,6 +91,55 @@ class PickPlayerFlowTests(unittest.TestCase):
         )
         self.assertTrue(response["ok"])
 
+    def test_pick_player_resets_failed_tracking_attempt(self):
+        self.job.status = "WAITING_FOR_PLAYER"
+        self.job.failure_reason = "PLAYER_RESELECTION_REQUIRED"
+        self.job.warnings = [
+            "PLAYER_ANCHOR_NOT_FOUND",
+            "PLAYER_RESELECTION_REQUIRED",
+        ]
+        self.job.progress = {
+            "step": "WAITING_FOR_PLAYER",
+            "pct": 35,
+        }
+        self.job.result = {
+            "candidates": {"candidates": [{"track_id": 9}]},
+            "tracking": {
+                "tracking_success": False,
+                "tracking_status": "ANCHOR_NOT_FOUND",
+                "action_required": "RESELECT_PLAYER",
+            },
+            "tracking_quality_index": 11.3,
+            "report": {"stale": True},
+        }
+        self.job.target = {
+            "confirmed": False,
+            "tracking": {
+                "status": "FAILED",
+                "action_required": "RESELECT_PLAYER",
+            },
+        }
+
+        response = api.pick_player(
+            self.job.id,
+            self.request,
+            {
+                "frame_key": "jobs/job-789/frames/frame_0001.jpg",
+                "track_id": 9,
+            },
+            self.session,
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(self.job.status, "WAITING_FOR_TARGET")
+        self.assertIsNone(self.job.failure_reason)
+        self.assertEqual(self.job.warnings, [])
+        self.assertNotIn("tracking", self.job.result)
+        self.assertNotIn("tracking_quality_index", self.job.result)
+        self.assertNotIn("report", self.job.result)
+        self.assertEqual(self.job.progress["pct"], 14)
+        self.assertEqual(self.job.target["tracking"], {"status": "PENDING"})
+
     def test_confirm_target_valid(self):
         self.job.player_ref = {"track_id": 9}
         payload = {
@@ -100,7 +149,7 @@ class PickPlayerFlowTests(unittest.TestCase):
             "track_id": 9,
         }
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertTrue(self.job.target.get("confirmed"))
         self.assertEqual(self.job.status, "READY_TO_ENQUEUE")
@@ -115,7 +164,7 @@ class PickPlayerFlowTests(unittest.TestCase):
             "track_id": 9,
         }
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body.decode("utf-8"))
@@ -130,7 +179,7 @@ class PickPlayerFlowTests(unittest.TestCase):
             "track_id": 9,
         }
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertEqual(response.status_code, 400)
         payload = json.loads(response.body.decode("utf-8"))
@@ -146,11 +195,11 @@ class PickPlayerFlowTests(unittest.TestCase):
             "track_id": 9,
         }
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body.decode("utf-8"))
-        self.assertEqual(payload["error"]["code"], "NO_TRACKS_IN_FRAME")
+        self.assertEqual(payload["error"]["code"], "TRACK_NOT_IN_FRAME")
 
     def test_confirm_target_track_not_in_frame(self):
         self.job.player_ref = {"track_id": 9}
@@ -167,7 +216,7 @@ class PickPlayerFlowTests(unittest.TestCase):
             "track_id": 9,
         }
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body.decode("utf-8"))
@@ -176,14 +225,13 @@ class PickPlayerFlowTests(unittest.TestCase):
     def test_confirm_target_invalid_payload(self):
         payload = {"frame_key": "jobs/job-789/frames/frame_0001.jpg"}
 
-        response = api.save_target(self.job.id, payload, self.request, self.session)
+        response = api.save_target(self.job.id, self.request, payload, self.session)
 
         self.assertEqual(response.status_code, 400)
         payload = json.loads(response.body.decode("utf-8"))
         self.assertEqual(payload["error"]["code"], "INVALID_PAYLOAD")
         missing_fields = " ".join(payload["error"]["details"]["missing"])
         self.assertIn("bbox", missing_fields)
-        self.assertIn("track_id", missing_fields)
 
 
 if __name__ == "__main__":

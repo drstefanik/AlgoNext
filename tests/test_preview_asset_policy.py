@@ -8,6 +8,7 @@ from app.core.preview_asset_policy import (
     install_preview_asset_policy,
     install_worker_preview_asset_policy,
 )
+from app.core.tracking_outcome import apply_tracking_outcome
 
 
 class ExistingObjectClient:
@@ -201,6 +202,90 @@ class PreviewAssetPolicyTests(unittest.TestCase):
             job.result["preview_asset_integrity"]["selection_refresh_suppressed"]
         )
         self.assertEqual(len(commits), 1)
+
+    def test_fail_closed_recovery_retains_selectable_preview_tracks(self):
+        job_id = "job-reselection"
+        key = f"jobs/{job_id}/frames/frame_0001.jpg"
+        selection_frames = [
+            {
+                "time_sec": 179.751,
+                "bucket": "fnh",
+                "key": key,
+                "tracks": [
+                    {
+                        "track_id": 10,
+                        "bbox": {"x": 0.4, "y": 0.2, "w": 0.02, "h": 0.08},
+                    }
+                ],
+            }
+        ]
+        job = SimpleNamespace(
+            status="RUNNING",
+            preview_frames=copy.deepcopy(selection_frames),
+            result={"candidates": {"candidates": [{"track_id": 10}]}},
+            target={
+                "confirmed": True,
+                "full_match_mode": True,
+                "selection": {"frame_key": key},
+                "selections": [{"frame_key": key}],
+            },
+            player_ref={"track_id": 10},
+            anchor={"t": 179.751},
+            warnings=[],
+            error=None,
+            failure_reason=None,
+            progress={"step": "TRACKING", "pct": 35},
+        )
+        jobs = {job_id: job}
+        pipeline = self.pipeline(jobs, [], [])
+        install_preview_asset_policy(pipeline)
+
+        pipeline.update_job(
+            jobs,
+            job_id,
+            lambda current_job: setattr(
+                current_job,
+                "preview_frames",
+                [
+                    {
+                        "time_sec": 59.751,
+                        "bucket": "fnh",
+                        "key": key,
+                        "tracks": [],
+                    }
+                ],
+            ),
+        )
+        pipeline.update_job(
+            jobs,
+            job_id,
+            lambda current_job: apply_tracking_outcome(
+                current_job,
+                {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_NOT_FOUND",
+                    "action_required": "RESELECT_PLAYER",
+                    "bboxes_count": 0,
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "windows_processed": 1,
+                    "anchors_total": 1,
+                    "anchors_matched": 0,
+                    "reid_summary": {
+                        "reason_codes": ["REID_ANCHORS_NOT_FOUND"],
+                    },
+                },
+                set_progress=lambda current, step, pct, message: setattr(
+                    current,
+                    "progress",
+                    {"step": step, "pct": pct, "message": message},
+                ),
+            ),
+        )
+
+        self.assertEqual(job.status, "WAITING_FOR_PLAYER")
+        self.assertEqual(job.preview_frames, selection_frames)
+        self.assertEqual(job.preview_frames[0]["tracks"][0]["track_id"], 10)
 
     def test_first_selection_frame_upload_is_allowed(self):
         job_id = "job-new"

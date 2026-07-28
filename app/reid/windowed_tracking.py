@@ -566,6 +566,100 @@ def _fallback(
     return output
 
 
+def _anchor_acquisition_profile(
+    *,
+    tracking_fps: int,
+    tracking_detector_model: str,
+) -> tuple[int, str]:
+    """Return the deliberately higher-fidelity manual-anchor profile.
+
+    The full-match CPU budget may reduce long videos to one frame per second
+    and the nano detector. Manual references are the identity root, so the
+    windows that contain them must not inherit that lossy profile.
+    """
+
+    anchor_fps = max(
+        int(tracking_fps),
+        _env_int("PLAYER_REID_ANCHOR_FPS", 5, 1, 15),
+    )
+    anchor_detector_model = (
+        os.environ.get("PLAYER_REID_ANCHOR_DETECTOR_MODEL") or "yolo11s.pt"
+    ).strip() or "yolo11s.pt"
+    return anchor_fps, anchor_detector_model
+
+
+def _anchor_failure_output(
+    *,
+    duration: float,
+    fps: int,
+    window_sec: float,
+    overlap_sec: float,
+    windows_total: int,
+    windows_processed: int,
+    player_ref: Mapping[str, Any],
+    anchors: Sequence[Mapping[str, Any]],
+    anchor_matches: Sequence[Mapping[str, Any]],
+    anchor_fps: int,
+    anchor_detector_model: str,
+    status: str,
+    reason_code: str,
+    action_required: str,
+) -> dict[str, Any]:
+    """Build a terminal tracking diagnostic without fabricating match metrics."""
+
+    anchors_matched = sum(
+        1 for match in anchor_matches if match.get("status") == "MATCHED"
+    )
+    failure_phase = (
+        "manual-anchor acquisition"
+        if status.startswith("ANCHOR_")
+        else "selected-player window processing"
+    )
+    return {
+        "mode": "full_match_windowed",
+        "identity_mode": "appearance_reid_v1",
+        "method": "yolo+bytetrack+appearance_reid",
+        "fps": fps,
+        "window_sec": window_sec,
+        "overlap_sec": overlap_sec,
+        "segments": [],
+        "segments_total": windows_total,
+        "segments_with_player": 0,
+        "windows_processed": windows_processed,
+        "coverage_pct_total": 0.0,
+        "coverage_pct": 0.0,
+        "largest_gap_sec": None,
+        "anchors_total": len(anchors),
+        "anchors_matched": anchors_matched,
+        "anchor_matches": [dict(item) for item in anchor_matches],
+        "anchor_reacquisitions": 0,
+        "anchors_used": {
+            "player_ref": dict(player_ref),
+            "selections": [dict(item) for item in anchors],
+        },
+        "tracking_success": False,
+        "tracking_status": status,
+        "action_required": action_required,
+        "anchor_acquisition": {
+            "fps": anchor_fps,
+            "detector_model": anchor_detector_model,
+            "windows_processed": windows_processed,
+        },
+        "reid_summary": {
+            "status": status,
+            "validated": False,
+            "anchors_total": len(anchors),
+            "anchors_matched": anchors_matched,
+            "anchor_matches": [dict(item) for item in anchor_matches],
+            "reason_codes": [reason_code],
+        },
+        "notes": (
+            f"Full-match processing stopped during {failure_phase}. "
+            "No player tracking or continuity metrics were produced."
+        ),
+    }
+
+
 def track_player_windowed_reid(
     job_id: str,
     input_video_path: str,
@@ -679,59 +773,74 @@ def track_player_windowed_reid(
         else:
             anchors_by_window.setdefault(window_index, []).append(anchor)
 
-    anchor_time = float(player_ref_norm.get("t") or 0.0)
-    anchor_index, forward_indices, backward_indices = processing_order(
-        windows, anchor_time
-    )
     primary_anchor = min(
         anchor_records,
         key=lambda item: _anchor_distance(item, player_ref_norm),
     )
     primary_anchor_id = int(primary_anchor["anchor_id"])
-    if primary_anchor.get("window_index") != anchor_index:
-        return _fallback(
-            fallback,
-            "REID_PRIMARY_ANCHOR_WINDOW_MISMATCH",
-            *original_args,
-            **original_kwargs,
-        )
     thresholds = _association_thresholds()
     timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
     started_at = time.monotonic()
     model = YOLO(detector_model)
+    anchor_fps, anchor_detector_model = _anchor_acquisition_profile(
+        tracking_fps=fps,
+        tracking_detector_model=detector_model,
+    )
+    anchor_model: YOLO | None = None
     windows_dir = Path("/tmp/fnh_jobs") / job_id / "tracking" / "windows"
     windows_dir.mkdir(parents=True, exist_ok=True)
     identity_id = f"job-{job_id}-selected-player"
     window_cache: dict[
         int,
-        tuple[Path, list[dict[str, Any]], dict[int, list[dict[str, Any]]]],
+        tuple[
+            Path,
+            list[dict[str, Any]],
+            dict[int, list[dict[str, Any]]],
+            int,
+        ],
     ] = {}
 
     def collect(
         index: int,
-    ) -> tuple[Path, list[dict[str, Any]], dict[int, list[dict[str, Any]]]]:
+    ) -> tuple[
+        Path,
+        list[dict[str, Any]],
+        dict[int, list[dict[str, Any]]],
+        int,
+    ]:
+        nonlocal anchor_model
         cached = window_cache.get(index)
         if cached is not None:
             return cached
         window_start, window_end = windows[index]
         segment_path = windows_dir / f"window_{index + 1:04d}.mp4"
+        is_anchor_window = index in anchors_by_window
         legacy._extract_segment(
             input_video_path,
             segment_path,
             window_start,
             max(0.0, window_end - window_start),
+            accurate=is_anchor_window,
         )
-        samples, track_map = legacy._collect_window_samples(
-            str(segment_path),
-            fps=fps,
-            model=model,
-            tracker=tracker,
-            job_id=job_id,
-            tracking_started_at=started_at,
-            tracking_timeout_seconds=timeout_seconds,
-        )
-        _reset_tracker(model)
-        collected = (segment_path, samples, track_map)
+        sample_fps = anchor_fps if is_anchor_window else fps
+        selected_model = model
+        if is_anchor_window and anchor_detector_model != detector_model:
+            if anchor_model is None:
+                anchor_model = YOLO(anchor_detector_model)
+            selected_model = anchor_model
+        try:
+            samples, track_map = legacy._collect_window_samples(
+                str(segment_path),
+                fps=sample_fps,
+                model=selected_model,
+                tracker=tracker,
+                job_id=job_id,
+                tracking_started_at=started_at,
+                tracking_timeout_seconds=timeout_seconds,
+            )
+        finally:
+            _reset_tracker(selected_model)
+        collected = (segment_path, samples, track_map, sample_fps)
         window_cache[index] = collected
         return collected
 
@@ -801,11 +910,37 @@ def track_player_windowed_reid(
                 continue
             pending.append((anchor, int(track_id)))
 
-        descriptors = _extract_descriptors_for_tracks(
-            segment_path,
-            track_map,
-            list(dict.fromkeys(track_id for _anchor, track_id in pending)),
-        )
+        try:
+            descriptors = _extract_descriptors_for_tracks(
+                segment_path,
+                track_map,
+                list(dict.fromkeys(track_id for _anchor, track_id in pending)),
+            )
+        except Exception:
+            logger.exception(
+                "Manual-anchor descriptor extraction failed "
+                "job_id=%s window_index=%s",
+                job_id,
+                index,
+            )
+            for anchor, track_id in pending:
+                anchor_id = int(anchor["anchor_id"])
+                anchor_matches_by_id[anchor_id] = {
+                    "anchor_id": anchor_id,
+                    "frame_key": anchor.get("frame_key"),
+                    "time_sec": float(anchor["t"]),
+                    "window_index": index,
+                    "window_start": float(window_start),
+                    "window_end": float(window_end),
+                    "status": "DESCRIPTOR_PROCESSING_FAILED",
+                    "local_track_id": track_id,
+                    "source": (
+                        "primary_player_ref"
+                        if anchor_id == primary_anchor_id
+                        else "selection"
+                    ),
+                }
+            return observations
         for anchor, track_id in pending:
             anchor_id = int(anchor["anchor_id"])
             source = (
@@ -847,49 +982,216 @@ def track_player_windowed_reid(
             }
         return observations
 
-    anchor_start, anchor_end = windows[anchor_index]
-    try:
-        anchor_path, anchor_samples, anchor_track_map = collect(anchor_index)
-    except legacy.TrackingTimeoutError:
-        raise
-    except Exception:
-        logger.exception("ReID anchor window failed job_id=%s", job_id)
-        return _fallback(
-            fallback,
-            "REID_ANCHOR_WINDOW_FAILED",
-            *original_args,
-            **original_kwargs,
+    seed: tuple[
+        dict[str, Any],
+        int,
+        Path,
+        list[dict[str, Any]],
+        dict[int, list[dict[str, Any]]],
+        int,
+        int,
+        AppearanceDescriptor,
+    ] | None = None
+    acquisition_errors = 0
+    seed_candidates = [
+        primary_anchor,
+        *[
+            anchor
+            for anchor in anchor_records
+            if int(anchor["anchor_id"]) != primary_anchor_id
+        ],
+    ]
+    for seed_anchor in seed_candidates:
+        seed_anchor_id = int(seed_anchor["anchor_id"])
+        seed_window_index = seed_anchor.get("window_index")
+        if seed_window_index is None:
+            continue
+        seed_window_index = int(seed_window_index)
+        seed_start, seed_end = windows[seed_window_index]
+        source = (
+            "primary_player_ref"
+            if seed_anchor_id == primary_anchor_id
+            else "selection"
+        )
+        try:
+            (
+                seed_path,
+                seed_samples,
+                seed_track_map,
+                seed_sample_fps,
+            ) = collect(seed_window_index)
+        except legacy.TrackingTimeoutError:
+            raise
+        except Exception:
+            acquisition_errors += 1
+            logger.exception(
+                "ReID anchor acquisition failed job_id=%s anchor_id=%s",
+                job_id,
+                seed_anchor_id,
+            )
+            anchor_matches_by_id[seed_anchor_id] = {
+                "anchor_id": seed_anchor_id,
+                "frame_key": seed_anchor.get("frame_key"),
+                "time_sec": float(seed_anchor["t"]),
+                "window_index": seed_window_index,
+                "window_start": float(seed_start),
+                "window_end": float(seed_end),
+                "status": "WINDOW_PROCESSING_FAILED",
+                "local_track_id": None,
+                "source": source,
+            }
+            continue
+
+        seed_track_id = _select_anchor_track(
+            seed_samples,
+            seed_track_map,
+            anchor_time_local=max(
+                0.0, float(seed_anchor["t"]) - float(seed_start)
+            ),
+            anchor_bbox=seed_anchor,
+        )
+        if seed_track_id is None:
+            anchor_matches_by_id[seed_anchor_id] = {
+                "anchor_id": seed_anchor_id,
+                "frame_key": seed_anchor.get("frame_key"),
+                "time_sec": float(seed_anchor["t"]),
+                "window_index": seed_window_index,
+                "window_start": float(seed_start),
+                "window_end": float(seed_end),
+                "status": "TRACK_NOT_FOUND",
+                "local_track_id": None,
+                "source": source,
+            }
+            continue
+        try:
+            seed_descriptor = _extract_descriptors_for_tracks(
+                seed_path, seed_track_map, [seed_track_id]
+            ).get(seed_track_id)
+        except Exception:
+            acquisition_errors += 1
+            logger.exception(
+                "ReID anchor descriptor acquisition failed "
+                "job_id=%s anchor_id=%s",
+                job_id,
+                seed_anchor_id,
+            )
+            anchor_matches_by_id[seed_anchor_id] = {
+                "anchor_id": seed_anchor_id,
+                "frame_key": seed_anchor.get("frame_key"),
+                "time_sec": float(seed_anchor["t"]),
+                "window_index": seed_window_index,
+                "window_start": float(seed_start),
+                "window_end": float(seed_end),
+                "status": "DESCRIPTOR_PROCESSING_FAILED",
+                "local_track_id": seed_track_id,
+                "source": source,
+            }
+            continue
+        if seed_descriptor is None:
+            anchor_matches_by_id[seed_anchor_id] = {
+                "anchor_id": seed_anchor_id,
+                "frame_key": seed_anchor.get("frame_key"),
+                "time_sec": float(seed_anchor["t"]),
+                "window_index": seed_window_index,
+                "window_start": float(seed_start),
+                "window_end": float(seed_end),
+                "status": "DESCRIPTOR_UNAVAILABLE",
+                "local_track_id": seed_track_id,
+                "source": source,
+            }
+            continue
+        seed = (
+            seed_anchor,
+            seed_window_index,
+            seed_path,
+            seed_samples,
+            seed_track_map,
+            seed_sample_fps,
+            int(seed_track_id),
+            seed_descriptor,
+        )
+        break
+
+    if seed is None:
+        for anchor in anchor_records:
+            anchor_id = int(anchor["anchor_id"])
+            anchor_matches_by_id.setdefault(
+                anchor_id,
+                {
+                    "anchor_id": anchor_id,
+                    "frame_key": anchor.get("frame_key"),
+                    "time_sec": float(anchor["t"]),
+                    "window_index": anchor.get("window_index"),
+                    "status": "NOT_PROCESSED",
+                    "local_track_id": None,
+                    "source": (
+                        "primary_player_ref"
+                        if anchor_id == primary_anchor_id
+                        else "selection"
+                    ),
+                },
+            )
+        anchor_matches = [
+            anchor_matches_by_id[anchor_id]
+            for anchor_id in sorted(anchor_matches_by_id)
+        ]
+        status = (
+            "ANCHOR_ACQUISITION_ERROR"
+            if acquisition_errors > 0
+            else "ANCHOR_NOT_FOUND"
+        )
+        reason_code = (
+            "REID_ANCHOR_ACQUISITION_ERROR"
+            if status == "ANCHOR_ACQUISITION_ERROR"
+            else "REID_ANCHORS_NOT_FOUND"
+        )
+        action_required = (
+            "RETRY_ANALYSIS"
+            if status == "ANCHOR_ACQUISITION_ERROR"
+            else "RESELECT_PLAYER"
+        )
+        output = _anchor_failure_output(
+            duration=duration,
+            fps=fps,
+            window_sec=window_sec,
+            overlap_sec=overlap_sec,
+            windows_total=len(windows),
+            windows_processed=len(window_cache),
+            player_ref=player_ref_norm,
+            anchors=anchor_records,
+            anchor_matches=anchor_matches,
+            anchor_fps=anchor_fps,
+            anchor_detector_model=anchor_detector_model,
+            status=status,
+            reason_code=reason_code,
+            action_required=action_required,
+        )
+        return _persist_tracking_output(
+            job_id,
+            output,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            expires_seconds=expires_seconds,
         )
 
-    anchor_bbox = {
-        "x": float(player_ref_norm.get("x") or 0.0),
-        "y": float(player_ref_norm.get("y") or 0.0),
-        "w": float(player_ref_norm.get("w") or 0.0),
-        "h": float(player_ref_norm.get("h") or 0.0),
-    }
-    anchor_track_id = _select_anchor_track(
+    (
+        seed_anchor,
+        anchor_index,
+        anchor_path,
         anchor_samples,
         anchor_track_map,
-        anchor_time_local=max(0.0, anchor_time - anchor_start),
-        anchor_bbox=anchor_bbox,
+        anchor_sample_fps,
+        anchor_track_id,
+        anchor_descriptor,
+    ) = seed
+    anchor_time = float(seed_anchor["t"])
+    anchor_start, anchor_end = windows[anchor_index]
+    _anchor_index, forward_indices, backward_indices = processing_order(
+        windows, anchor_time
     )
-    if anchor_track_id is None:
-        return _fallback(
-            fallback,
-            "REID_ANCHOR_TRACK_NOT_FOUND",
-            *original_args,
-            **original_kwargs,
-        )
-    anchor_descriptor = _extract_descriptors_for_tracks(
-        anchor_path, anchor_track_map, [anchor_track_id]
-    ).get(anchor_track_id)
-    if anchor_descriptor is None:
-        return _fallback(
-            fallback,
-            "REID_ANCHOR_DESCRIPTOR_UNAVAILABLE",
-            *original_args,
-            **original_kwargs,
-        )
+    if _anchor_index != anchor_index:
+        raise RuntimeError("Canonical seed window does not match processing order")
+    seed_anchor_id = int(seed_anchor["anchor_id"])
 
     anchor_observations = resolve_manual_anchors(
         anchor_index,
@@ -897,7 +1199,7 @@ def track_player_windowed_reid(
         anchor_samples,
         anchor_track_map,
         known={
-            primary_anchor_id: (
+            seed_anchor_id: (
                 anchor_track_id,
                 anchor_descriptor,
             )
@@ -906,15 +1208,35 @@ def track_player_windowed_reid(
     anchor_bboxes, anchor_track_ids = _stitch_manual_anchor_bboxes(
         anchor_observations,
         anchor_samples,
-        fps=fps,
+        fps=anchor_sample_fps,
         window_start=anchor_start,
     )
     if not anchor_bboxes:
-        return _fallback(
-            fallback,
-            "REID_ANCHOR_TRACK_EMPTY",
-            *original_args,
-            **original_kwargs,
+        output = _anchor_failure_output(
+            duration=duration,
+            fps=fps,
+            window_sec=window_sec,
+            overlap_sec=overlap_sec,
+            windows_total=len(windows),
+            windows_processed=len(window_cache),
+            player_ref=player_ref_norm,
+            anchors=anchor_records,
+            anchor_matches=[
+                anchor_matches_by_id[anchor_id]
+                for anchor_id in sorted(anchor_matches_by_id)
+            ],
+            anchor_fps=anchor_fps,
+            anchor_detector_model=anchor_detector_model,
+            status="ANCHOR_TRACK_EMPTY",
+            reason_code="REID_ANCHOR_TRACK_EMPTY",
+            action_required="RESELECT_PLAYER",
+        )
+        return _persist_tracking_output(
+            job_id,
+            output,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            expires_seconds=expires_seconds,
         )
     anchor_coverage = (
         len(anchor_bboxes) / float(max(1, len(anchor_samples))) * 100.0
@@ -929,6 +1251,7 @@ def track_player_windowed_reid(
         "identity_status": "ACCEPTED",
         "reacquire_score": 1.0,
         "coverage_pct": round(anchor_coverage, 2),
+        "sample_fps": anchor_sample_fps,
         "lost_segments": [],
         "bboxes": anchor_bboxes,
         "reid": {
@@ -956,7 +1279,7 @@ def track_player_windowed_reid(
         source="manual_anchor_track",
     )
     for observation in anchor_observations:
-        if int(observation["anchor"]["anchor_id"]) == primary_anchor_id:
+        if int(observation["anchor"]["anchor_id"]) == seed_anchor_id:
             continue
         base_profile = update_identity_profile(
             base_profile, observation["descriptor"]
@@ -980,7 +1303,7 @@ def track_player_windowed_reid(
         for index in indices:
             window_start, window_end = windows[index]
             try:
-                segment_path, samples, track_map = collect(index)
+                segment_path, samples, track_map, sample_fps = collect(index)
             except legacy.TrackingTimeoutError:
                 raise
             except Exception:
@@ -1027,12 +1350,7 @@ def track_player_windowed_reid(
                     samples,
                     track_map,
                 )
-                if len(manual_observations) != len(manual_anchors):
-                    for observation in manual_observations:
-                        anchor_id = int(observation["anchor"]["anchor_id"])
-                        match = anchor_matches_by_id.get(anchor_id)
-                        if match and match.get("status") == "MATCHED":
-                            match["status"] = "MATCHED_NOT_APPLIED"
+                if not manual_observations:
                     abstained_associations += 1
                     segments_by_index[index] = _empty_segment(
                         window_start=window_start,
@@ -1047,7 +1365,7 @@ def track_player_windowed_reid(
                 manual_bboxes, manual_track_ids = _stitch_manual_anchor_bboxes(
                     manual_observations,
                     samples,
-                    fps=fps,
+                    fps=sample_fps,
                     window_start=window_start,
                 )
                 if not manual_bboxes or not manual_track_ids:
@@ -1107,6 +1425,7 @@ def track_player_windowed_reid(
                     "identity_status": "ACCEPTED",
                     "reacquire_score": 1.0,
                     "coverage_pct": round(float(coverage), 2),
+                    "sample_fps": sample_fps,
                     "lost_segments": [],
                     "bboxes": manual_bboxes,
                     "reid": {
@@ -1138,7 +1457,7 @@ def track_player_windowed_reid(
                 previous_bboxes=previous_bboxes,
                 window_start=window_start,
                 direction=direction,
-                fps=fps,
+                fps=sample_fps,
             )
             decision = associate_identity(
                 profile,
@@ -1159,7 +1478,7 @@ def track_player_windowed_reid(
                 bboxes, lost_segments, _ = legacy._build_window_bboxes(
                     samples,
                     selected_track_id,
-                    fps=fps,
+                    fps=sample_fps,
                     time_offset=window_start,
                 )
             else:
@@ -1204,6 +1523,7 @@ def track_player_windowed_reid(
                 "identity_status": identity_status,
                 "reacquire_score": round(float(decision.best_score), 4),
                 "coverage_pct": round(float(coverage), 2),
+                "sample_fps": sample_fps,
                 "lost_segments": lost_segments,
                 "bboxes": bboxes,
                 "reid": reid_payload,
@@ -1217,8 +1537,60 @@ def track_player_windowed_reid(
                     "Tracking player with experimental ReID",
                 )
 
-    process_direction(forward_indices, "forward")
-    process_direction(backward_indices, "backward")
+    try:
+        process_direction(forward_indices, "forward")
+        process_direction(backward_indices, "backward")
+    except legacy.TrackingTimeoutError:
+        raise
+    except Exception:
+        logger.exception(
+            "ReID selected-player window processing failed job_id=%s",
+            job_id,
+        )
+        for anchor in anchor_records:
+            anchor_id = int(anchor["anchor_id"])
+            anchor_matches_by_id.setdefault(
+                anchor_id,
+                {
+                    "anchor_id": anchor_id,
+                    "frame_key": anchor.get("frame_key"),
+                    "time_sec": float(anchor["t"]),
+                    "window_index": anchor.get("window_index"),
+                    "status": "NOT_PROCESSED",
+                    "local_track_id": None,
+                    "source": (
+                        "primary_player_ref"
+                        if anchor_id == primary_anchor_id
+                        else "selection"
+                    ),
+                },
+            )
+        output = _anchor_failure_output(
+            duration=duration,
+            fps=fps,
+            window_sec=window_sec,
+            overlap_sec=overlap_sec,
+            windows_total=len(windows),
+            windows_processed=len(window_cache),
+            player_ref=player_ref_norm,
+            anchors=anchor_records,
+            anchor_matches=[
+                anchor_matches_by_id[anchor_id]
+                for anchor_id in sorted(anchor_matches_by_id)
+            ],
+            anchor_fps=anchor_fps,
+            anchor_detector_model=anchor_detector_model,
+            status="WINDOW_PROCESSING_ERROR",
+            reason_code="REID_WINDOW_PROCESSING_ERROR",
+            action_required="RETRY_ANALYSIS",
+        )
+        return _persist_tracking_output(
+            job_id,
+            output,
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            expires_seconds=expires_seconds,
+        )
     segments = [segments_by_index[index] for index in range(len(windows))]
     segments_with_player = sum(
         1 for segment in segments if segment.get("bboxes")
@@ -1273,6 +1645,7 @@ def track_player_windowed_reid(
         "segments": segments,
         "segments_total": len(segments),
         "segments_with_player": segments_with_player,
+        "windows_processed": len(window_cache),
         "coverage_pct_total": round(coverage_pct, 2),
         "largest_gap_sec": round(largest_gap, 2),
         "coverage_pct": round(coverage_pct, 2),
@@ -1280,6 +1653,41 @@ def track_player_windowed_reid(
         "anchors_matched": anchors_matched,
         "anchor_matches": anchor_matches,
         "anchor_reacquisitions": anchor_reacquisitions,
+        "tracking_success": bool(segments_with_player and anchors_matched),
+        "tracking_status": (
+            "SUCCEEDED"
+            if segments_with_player and anchors_matched
+            else "NO_PLAYER_TRACK"
+        ),
+        "action_required": (
+            None
+            if segments_with_player and anchors_matched
+            else "RESELECT_PLAYER"
+        ),
+        "anchor_acquisition": {
+            "fps": anchor_fps,
+            "detector_model": anchor_detector_model,
+            "windows_processed": sum(
+                1 for index in window_cache if index in anchors_by_window
+            ),
+            "seed_anchor_id": seed_anchor_id,
+            "seed_window_index": anchor_index,
+            "seed_anchor": {
+                key: value
+                for key, value in seed_anchor.items()
+                if key
+                in {
+                    "t",
+                    "x",
+                    "y",
+                    "w",
+                    "h",
+                    "frame_key",
+                    "anchor_id",
+                    "window_index",
+                }
+            },
+        },
         "anchors_used": {
             "player_ref": player_ref_norm,
             "selections": anchors,

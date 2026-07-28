@@ -5,10 +5,12 @@ on:
     paths:
       - "app/reid/full_match_runtime.py"
       - "app/reid/runtime.py"
+      - "app/core/tracking_outcome.py"
       - "app/workers/multi_anchor.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "tests/test_multi_anchor.py"
+      - "tests/test_anchor_reselection_pipeline.py"
       - "tests/test_reid_runtime.py"
       - "docker-compose.yml"
       - "Dockerfile"
@@ -18,10 +20,12 @@ on:
     paths:
       - "app/reid/full_match_runtime.py"
       - "app/reid/runtime.py"
+      - "app/core/tracking_outcome.py"
       - "app/workers/multi_anchor.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "tests/test_multi_anchor.py"
+      - "tests/test_anchor_reselection_pipeline.py"
       - "tests/test_reid_runtime.py"
       - "docker-compose.yml"
       - "Dockerfile"
@@ -51,16 +55,19 @@ jobs:
           python -m py_compile
           app/reid/full_match_runtime.py
           app/reid/runtime.py
+          app/core/tracking_outcome.py
           app/workers/multi_anchor.py
           app/workers/pipeline.py
           app/workers/tracking.py
           tests/test_multi_anchor.py
+          tests/test_anchor_reselection_pipeline.py
           tests/test_reid_runtime.py
 
       - name: Run runtime policy tests
         run: >-
           python -m unittest
           tests/test_multi_anchor.py
+          tests/test_anchor_reselection_pipeline.py
           tests/test_reid_runtime.py
 
       - name: Validate Compose configuration

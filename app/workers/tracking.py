@@ -368,8 +368,22 @@ def _extract_segment(
     output_path: Path,
     start: float,
     duration: float,
+    *,
+    accurate: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if accurate:
+        codec_args = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-an",
+        ]
+    else:
+        codec_args = ["-c", "copy"]
     result = subprocess.run(
         [
             "ffmpeg",
@@ -380,8 +394,7 @@ def _extract_segment(
             input_path,
             "-t",
             f"{duration:.3f}",
-            "-c",
-            "copy",
+            *codec_args,
             str(output_path),
         ],
         stdout=subprocess.PIPE,

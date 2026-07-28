@@ -25,6 +25,7 @@ from app.workers.ai_report import generate_report
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
+from app.core.tracking_outcome import apply_tracking_outcome
 from app.core.scoring import (
     DEFAULT_WEIGHTS,
     ROLE_WEIGHTS,
@@ -749,6 +750,17 @@ def set_progress(job: AnalysisJob, step: str, pct: int, message: str = "") -> No
         "message": message,
         "updated_at": utc_now_iso(),
     }
+
+
+def _apply_tracking_outcome(
+    job: AnalysisJob,
+    tracking_payload: Dict[str, Any],
+) -> bool:
+    return apply_tracking_outcome(
+        job,
+        tracking_payload,
+        set_progress=set_progress,
+    )
 
 
 
@@ -2696,11 +2708,13 @@ def run_analysis(self, job_id: str):
                 "segments": segments,
                 "segments_total": tracking_output.get("segments_total"),
                 "segments_with_player": tracking_output.get("segments_with_player"),
+                "windows_processed": tracking_output.get("windows_processed"),
                 "anchor_reacquisitions": tracking_output.get("anchor_reacquisitions"),
                 "anchors_total": tracking_output.get("anchors_total"),
                 "anchors_matched": tracking_output.get("anchors_matched"),
                 "anchor_matches": tracking_output.get("anchor_matches"),
                 "anchors_used": tracking_output.get("anchors_used"),
+                "anchor_acquisition": tracking_output.get("anchor_acquisition"),
                 "reid_summary": tracking_output.get("reid_summary"),
                 "runtime_profile": tracking_output.get("runtime_profile"),
                 "partial": tracking_output.get("partial"),
@@ -2709,6 +2723,10 @@ def run_analysis(self, job_id: str):
                 "largest_gap_sec": tracking_output.get("largest_gap_sec"),
                 "coverage_pct": tracking_output.get("coverage_pct"),
                 "bboxes_count": total_bboxes,
+                "tracking_success": tracking_output.get("tracking_success"),
+                "tracking_status": tracking_output.get("tracking_status"),
+                "action_required": tracking_output.get("action_required"),
+                "metrics_scope": "selected_player",
                 "lost_segments": [],
                 "motion_segments": [],
                 "notes": tracking_output.get("notes"),
@@ -2722,6 +2740,18 @@ def run_analysis(self, job_id: str):
                 "bboxes_count": len(tracking_output.get("bboxes") or []),
                 "track_id": tracking_output.get("track_id"),
                 "anchors_used": tracking_output.get("anchors_used"),
+                "tracking_success": (
+                    len(tracking_output.get("bboxes") or []) > 0
+                ),
+                "tracking_status": (
+                    "SUCCEEDED"
+                    if tracking_output.get("bboxes")
+                    else "NO_PLAYER_TRACK"
+                ),
+                "action_required": (
+                    None if tracking_output.get("bboxes") else "RESELECT_PLAYER"
+                ),
+                "metrics_scope": "selected_player",
                 "lost_segments": tracking_output.get("lost_segments"),
                 "motion_segments": motion_segments,
                 "notes": tracking_output.get("notes"),
@@ -2730,15 +2760,17 @@ def run_analysis(self, job_id: str):
         update_job(
             db,
             job_id,
-            lambda job: setattr(
-                job,
-                "result",
-                {
-                    **(job.result or {}),
-                    "tracking": tracking_payload,
-                },
-            ),
+            lambda job: _apply_tracking_outcome(job, tracking_payload),
         )
+        if tracking_payload.get("tracking_success") is False:
+            logger.warning(
+                "run_analysis stopped after selected-player tracking failure "
+                "job_id=%s status=%s action=%s",
+                job_id,
+                tracking_payload.get("tracking_status"),
+                tracking_payload.get("action_required"),
+            )
+            return
 
         try:
             preview_candidates = _select_tracking_preview_candidates(
@@ -2918,6 +2950,13 @@ def run_analysis(self, job_id: str):
             ):
                 for key, value in (existing_result.get("evidence_metrics") or {}).items():
                     merged_evidence_metrics.setdefault(key, value)
+            preview_candidate_metrics = merged_evidence_metrics.pop(
+                "candidate_metrics", None
+            )
+            if isinstance(preview_candidate_metrics, dict):
+                merged_evidence_metrics[
+                    "preview_candidate_metrics"
+                ] = preview_candidate_metrics
 
             rating_context = dict(existing_result) if isinstance(existing_result, dict) else {}
             rating_context["evidence_metrics"] = merged_evidence_metrics
@@ -3025,6 +3064,26 @@ def run_analysis(self, job_id: str):
                     },
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
+            existing_outcome = (
+                dict(existing_result.get("analysis_outcome") or {})
+                if isinstance(existing_result, dict)
+                else {}
+            )
+            final_analysis_outcome = {
+                **existing_outcome,
+                "pipeline_state": "DONE",
+                "tracking_state": (
+                    "SUCCEEDED"
+                    if (
+                        isinstance(existing_result, dict)
+                        and isinstance(existing_result.get("tracking"), dict)
+                        and existing_result["tracking"].get("tracking_success")
+                        is True
+                    )
+                    else "UNVERIFIED"
+                ),
+                "metrics_scope": "selected_player",
+            }
 
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
@@ -3064,12 +3123,22 @@ def run_analysis(self, job_id: str):
                 "clips": clip_assets,
                 "clip_extraction_error": clip_extraction_error,
                 "player_runs": player_runs,
+                "analysis_outcome": final_analysis_outcome,
             }
 
             job.warnings = warnings
             job.status = run_status
             job.failure_reason = normalize_failure_reason(None)
-            set_progress(job, "DONE", 100, "Completed")
+            set_progress(
+                job,
+                "DONE",
+                100,
+                (
+                    "Analysis completed"
+                    if run_status == "COMPLETED"
+                    else "Processing finished with partial evidence"
+                ),
+            )
 
         update_job(db, job_id, finalize_job)
 

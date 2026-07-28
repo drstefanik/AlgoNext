@@ -122,6 +122,38 @@ def _tracking_only_warnings(
         derived.append("CROSS_SHOT_IDENTITY_UNVALIDATED")
     if "LONG_TRACKING_GAPS" in reasons:
         derived.append("LONG_TRACKING_GAPS")
+    if result.get("evaluation_status") == "TRACKING_FAILED":
+        tracking = result.get("tracking")
+        tracking_payload = tracking if isinstance(tracking, Mapping) else {}
+        action_required = str(
+            tracking_payload.get("action_required") or ""
+        ).upper()
+        tracking_status = str(
+            tracking_payload.get("tracking_status") or ""
+        ).upper()
+        anchor_acquisition_failure = (
+            tracking_status == "ANCHOR_ACQUISITION_ERROR"
+            or "REID_ANCHOR_ACQUISITION_ERROR" in reasons
+            or "ANCHOR_ACQUISITION_ERROR" in reasons
+        )
+        if anchor_acquisition_failure:
+            derived.append("PLAYER_ANCHOR_ACQUISITION_FAILED")
+        elif action_required == "RETRY_ANALYSIS":
+            derived.append("PLAYER_TRACKING_RETRY_REQUIRED")
+        else:
+            derived.extend(
+                [
+                    "PLAYER_ANCHOR_NOT_FOUND",
+                    "PLAYER_RESELECTION_REQUIRED",
+                ]
+            )
+    elif "PLAYER_RESELECTION_REQUIRED" in reasons:
+        derived.extend(
+            [
+                "PLAYER_ANCHOR_NOT_FOUND",
+                "PLAYER_RESELECTION_REQUIRED",
+            ]
+        )
     if result.get("player_evaluation_available") is not True:
         derived.append("PLAYER_EVALUATION_WITHHELD")
 
