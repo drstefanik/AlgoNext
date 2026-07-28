@@ -118,6 +118,150 @@ class EvaluationGuardTests(unittest.TestCase):
         self.assertEqual(job.warnings, ["MODEL_VALIDATED"])
         self.assertEqual(job.status, "COMPLETED")
 
+    def test_failed_anchor_is_truthful_and_recoverable(self):
+        job = AnalysisJob(
+            id="job-anchor-failed",
+            status="WAITING_FOR_PLAYER",
+            category="U17",
+            role="Midfielder",
+            warnings=["PLAYER_RESELECTION_REQUIRED"],
+            result={
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_NOT_FOUND",
+                    "action_required": "RESELECT_PLAYER",
+                    "coverage_pct_total": 0.0,
+                    "bboxes_count": 0,
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "largest_gap_sec": 5931.775,
+                    "anchors_total": 1,
+                    "anchors_matched": 0,
+                    "reid_summary": {
+                        "status": "ANCHOR_NOT_FOUND",
+                        "reason_codes": ["REID_ANCHORS_NOT_FOUND"],
+                    },
+                },
+                "evidence_metrics": {
+                    "candidate_metrics": {
+                        "coveragePct": 0.125,
+                        "stabilityScore": 0.333,
+                        "sampleFramesCount": 4,
+                    }
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        self.assertEqual(job.status, "WAITING_FOR_PLAYER")
+        self.assertEqual(job.result["evaluation_status"], "TRACKING_FAILED")
+        self.assertIsNone(job.result["tracking_quality_index"])
+        self.assertEqual(job.result["tracking_signals"]["samples_used"], 0)
+        self.assertEqual(
+            job.result["tracking_signals"]["tracklet_continuity_pct"],
+            0.0,
+        )
+        self.assertNotIn(
+            "candidate_metrics",
+            job.result["evidence_metrics"],
+        )
+        self.assertIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+        self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
+    def test_acquisition_error_keeps_retry_semantics(self):
+        job = AnalysisJob(
+            id="job-anchor-infra-error",
+            status="FAILED",
+            category="U17",
+            role="Midfielder",
+            warnings=["PLAYER_ANCHOR_ACQUISITION_FAILED"],
+            result={
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_ACQUISITION_ERROR",
+                    "action_required": "RETRY_ANALYSIS",
+                    "bboxes_count": 0,
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "reid_summary": {
+                        "status": "ANCHOR_ACQUISITION_ERROR",
+                        "reason_codes": ["REID_ANCHOR_ACQUISITION_ERROR"],
+                    },
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        self.assertEqual(job.result["evaluation_status"], "TRACKING_FAILED")
+        self.assertIn("PLAYER_ANCHOR_ACQUISITION_FAILED", job.warnings)
+        self.assertNotIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+        self.assertNotIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
+    def test_partial_timeout_does_not_blame_player_reference(self):
+        job = AnalysisJob(
+            id="job-tracking-timeout",
+            status="PARTIAL",
+            category="U17",
+            role="Midfielder",
+            warnings=["TRACKING_PARTIAL_TIMEOUT"],
+            result={
+                "tracking": {
+                    "partial": True,
+                    "partial_reason": "TRACKING_TIMEOUT",
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "bboxes_count": 0,
+                    "reid_summary": {
+                        "status": "PARTIAL_TIMEOUT",
+                        "reason_codes": ["TRACKING_BUDGET_EXHAUSTED"],
+                    },
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        self.assertEqual(
+            job.result["evaluation_status"],
+            "TRACKING_INCOMPLETE",
+        )
+        self.assertIn("TRACKING_PARTIAL_TIMEOUT", job.warnings)
+        self.assertNotIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+        self.assertNotIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
+    def test_post_anchor_technical_error_requests_retry_without_reselection(self):
+        job = AnalysisJob(
+            id="job-team-guard-error",
+            status="FAILED",
+            category="U17",
+            role="Midfielder",
+            warnings=["PLAYER_TRACKING_RETRY_REQUIRED"],
+            result={
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "TEAM_COLOR_GUARD_ERROR",
+                    "action_required": "RETRY_ANALYSIS",
+                    "bboxes_count": 0,
+                    "segments_total": 108,
+                    "segments_with_player": 0,
+                    "anchors_total": 1,
+                    "anchors_matched": 1,
+                    "reid_summary": {
+                        "status": "TEAM_COLOR_GUARD_ERROR",
+                        "reason_codes": ["TEAM_COLOR_GUARD_ERROR"],
+                    },
+                },
+            },
+        )
+
+        sanitize_analysis_job(job)
+
+        self.assertIn("PLAYER_TRACKING_RETRY_REQUIRED", job.warnings)
+        self.assertNotIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+        self.assertNotIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -478,7 +478,16 @@ def apply_team_color_guard(
         owned_reader = _VideoReader(input_video_path)
         frame_reader = owned_reader.read
     try:
-        anchor = _anchor_signature(frame_reader, player_ref)
+        acquisition = (
+            output.get("anchor_acquisition")
+            if isinstance(output.get("anchor_acquisition"), Mapping)
+            else {}
+        )
+        seed_anchor = acquisition.get("seed_anchor")
+        guard_anchor = (
+            seed_anchor if isinstance(seed_anchor, Mapping) else player_ref
+        )
+        anchor = _anchor_signature(frame_reader, guard_anchor)
         segments = [dict(item) if isinstance(item, Mapping) else {} for item in raw_segments]
         accepted_indices: list[int] = []
         for index, segment in enumerate(segments):
@@ -492,7 +501,9 @@ def apply_team_color_guard(
                 accepted_indices.append(index)
 
         try:
-            anchor_time = float(player_ref.get("t", player_ref.get("best_time_sec")))
+            anchor_time = float(
+                guard_anchor.get("t", guard_anchor.get("best_time_sec"))
+            )
         except (TypeError, ValueError):
             anchor_time = -1.0
         anchor_indices = [
@@ -512,7 +523,11 @@ def apply_team_color_guard(
         decisions: list[dict[str, Any]] = []
         anchor_failed = False
         reason_codes = ["TEAM_COLOR_GUARD_EXPERIMENTAL"]
-        anchor_geometry = _anchor_geometry_evidence(segments, anchor_indices, player_ref)
+        anchor_geometry = _anchor_geometry_evidence(
+            segments,
+            anchor_indices,
+            guard_anchor,
+        )
         if not anchor_geometry["passed"]:
             anchor_failed = True
             reason_codes.extend(anchor_geometry["reason_codes"])
@@ -562,6 +577,7 @@ def apply_team_color_guard(
             "status": "ANCHOR_REJECTED" if anchor_failed else "APPLIED",
             "validated": False,
             "anchor_signature": anchor.to_payload() if anchor is not None else None,
+            "seed_anchor_id": acquisition.get("seed_anchor_id"),
             "anchor_geometry": anchor_geometry,
             "segments_checked": len(accepted_indices),
             "segments_rejected": max(0, len(accepted_indices) - segments_with_player),
@@ -574,6 +590,7 @@ def apply_team_color_guard(
         summary["reason_codes"] = list(
             dict.fromkeys([*(summary.get("reason_codes") or []), *reason_codes])
         )
+        tracking_failed = bool(anchor_failed or segments_with_player == 0)
 
         guarded.update(
             {
@@ -582,7 +599,22 @@ def apply_team_color_guard(
                 "segments_with_player": segments_with_player,
                 "coverage_pct_total": round(coverage, 2),
                 "coverage_pct": round(coverage, 2),
-                "largest_gap_sec": round(largest_gap, 2),
+                "largest_gap_sec": (
+                    None if tracking_failed else round(largest_gap, 2)
+                ),
+                "tracking_success": not tracking_failed,
+                "tracking_status": (
+                    "ANCHOR_REJECTED"
+                    if anchor_failed
+                    else (
+                        "NO_PLAYER_TRACK"
+                        if segments_with_player == 0
+                        else "SUCCEEDED"
+                    )
+                ),
+                "action_required": (
+                    "RESELECT_PLAYER" if tracking_failed else None
+                ),
                 "reid_summary": summary,
             }
         )
@@ -631,6 +663,8 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
         output = implementation(*args, **kwargs)
         if not team_color_guard_enabled() or not isinstance(output, Mapping):
             return output
+        if output.get("tracking_success") is False:
+            return output
         if not isinstance(output.get("segments"), list):
             return output
         if len(args) < 3 or not isinstance(args[2], Mapping):
@@ -664,6 +698,10 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
             corrected["segments_with_player"] = 0
             corrected["coverage_pct"] = 0.0
             corrected["coverage_pct_total"] = 0.0
+            corrected["largest_gap_sec"] = None
+            corrected["tracking_success"] = False
+            corrected["tracking_status"] = "TEAM_COLOR_GUARD_ERROR"
+            corrected["action_required"] = "RETRY_ANALYSIS"
             summary = dict(output.get("reid_summary") or {})
             summary.update(
                 {

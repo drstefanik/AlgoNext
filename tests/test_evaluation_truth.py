@@ -70,6 +70,107 @@ class EvaluationTruthTests(unittest.TestCase):
         self.assertIn("CONTINUITY_NOT_MEASURED", evaluation["reason_codes"])
         self.assertIn("INSUFFICIENT_TRACKING_SAMPLES", evaluation["reason_codes"])
 
+    def test_failed_selected_tracking_never_inherits_preview_candidate_metrics(self):
+        candidate_metrics = {
+            "coveragePct": 0.125,
+            "stabilityScore": 0.333,
+            "sampleFramesCount": 4,
+        }
+        tracking = {
+            "tracking_success": False,
+            "tracking_status": "ANCHOR_NOT_FOUND",
+            "action_required": "RESELECT_PLAYER",
+            "coverage_pct_total": 0.0,
+            "bboxes_count": 0,
+            "segments_total": 108,
+            "segments_with_player": 0,
+            "largest_gap_sec": 5931.775,
+            "anchors_total": 1,
+            "anchors_matched": 0,
+            "reid_summary": {
+                "status": "ANCHOR_NOT_FOUND",
+                "reason_codes": ["REID_ANCHORS_NOT_FOUND"],
+            },
+        }
+
+        evaluation = build_tracking_evaluation(
+            candidate_metrics=candidate_metrics,
+            tracking=tracking,
+        )
+
+        self.assertEqual(evaluation["status"], "TRACKING_FAILED")
+        self.assertIsNone(evaluation["tracking_quality_index"])
+        self.assertEqual(evaluation["signals"]["coverage_pct"], 0.0)
+        self.assertEqual(evaluation["signals"]["tracklet_continuity_pct"], 0.0)
+        self.assertEqual(evaluation["signals"]["samples_used"], 0)
+        self.assertIsNone(evaluation["signals"]["largest_gap_sec"])
+        self.assertIn("REID_ANCHORS_NOT_FOUND", evaluation["reason_codes"])
+        self.assertIn("PLAYER_RESELECTION_REQUIRED", evaluation["reason_codes"])
+
+        result = apply_evaluation_truth_gate(
+            {"evidence_metrics": {"candidate_metrics": candidate_metrics}},
+            candidate_metrics=candidate_metrics,
+            tracking=tracking,
+        )
+        self.assertNotIn("candidate_metrics", result["evidence_metrics"])
+        self.assertEqual(
+            result["evidence_metrics"]["preview_candidate_metrics"],
+            candidate_metrics,
+        )
+
+    def test_anchor_acquisition_error_requests_retry_not_reselection(self):
+        tracking = {
+            "tracking_success": False,
+            "tracking_status": "ANCHOR_ACQUISITION_ERROR",
+            "action_required": "RETRY_ANALYSIS",
+            "bboxes_count": 0,
+            "segments_total": 108,
+            "segments_with_player": 0,
+            "reid_summary": {
+                "status": "ANCHOR_ACQUISITION_ERROR",
+                "reason_codes": ["REID_ANCHOR_ACQUISITION_ERROR"],
+            },
+        }
+
+        result = apply_evaluation_truth_gate({}, tracking=tracking)
+
+        self.assertEqual(result["evaluation_status"], "TRACKING_FAILED")
+        self.assertIn("Riprova l'analisi", result["explain"])
+        self.assertNotIn("Seleziona un riferimento", result["explain"])
+        self.assertNotIn(
+            "PLAYER_RESELECTION_REQUIRED",
+            result["reason_codes"],
+        )
+
+    def test_partial_timeout_is_incomplete_not_anchor_failure(self):
+        tracking = {
+            "partial": True,
+            "partial_reason": "TRACKING_TIMEOUT",
+            "segments_total": 108,
+            "segments_with_player": 0,
+            "bboxes_count": 0,
+            "largest_gap_sec": 5931.775,
+            "reid_summary": {
+                "status": "PARTIAL_TIMEOUT",
+                "reason_codes": ["TRACKING_BUDGET_EXHAUSTED"],
+            },
+        }
+
+        evaluation = build_tracking_evaluation(tracking=tracking)
+
+        self.assertEqual(evaluation["status"], "TRACKING_INCOMPLETE")
+        self.assertIsNone(evaluation["tracking_quality_index"])
+        self.assertEqual(evaluation["signals"]["samples_used"], 0)
+        self.assertIsNone(evaluation["signals"]["largest_gap_sec"])
+        self.assertIn(
+            "TRACKING_BUDGET_EXHAUSTED",
+            evaluation["reason_codes"],
+        )
+        self.assertNotIn(
+            "PLAYER_RESELECTION_REQUIRED",
+            evaluation["reason_codes"],
+        )
+
     def test_truth_gate_removes_legacy_player_scores(self):
         legacy_result = {
             "match_rating_10": 7.4,

@@ -57,6 +57,10 @@ class DummyJob:
     progress: dict = field(
         default_factory=lambda: {"step": "WAITING_FOR_TARGET", "pct": 14}
     )
+    result: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
+    error: str | None = None
+    failure_reason: str | None = None
     preview_frames: list = field(
         default_factory=lambda: [
             {
@@ -206,6 +210,67 @@ class MultiAnchorApiTests(unittest.TestCase):
             SelectionPayload.model_validate(
                 {"selections": [_selection(index) for index in range(6)]}
             )
+
+    def test_new_player_pick_clears_failed_tracking_attempt(self):
+        job = DummyJob(
+            status="WAITING_FOR_PLAYER",
+            result={
+                "candidates": {"candidates": [{"track_id": 9}]},
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_NOT_FOUND",
+                    "action_required": "RESELECT_PLAYER",
+                },
+                "tracking_quality_index": 11.3,
+                "report": {"stale": True},
+            },
+            warnings=[
+                "PLAYER_ANCHOR_NOT_FOUND",
+                "PLAYER_RESELECTION_REQUIRED",
+            ],
+            failure_reason="PLAYER_RESELECTION_REQUIRED",
+        )
+
+        reset = api._reset_failed_tracking_attempt(job)
+
+        self.assertTrue(reset)
+        self.assertEqual(
+            job.result,
+            {"candidates": {"candidates": [{"track_id": 9}]}},
+        )
+        self.assertEqual(job.warnings, [])
+        self.assertIsNone(job.error)
+        self.assertIsNone(job.failure_reason)
+        self.assertNotIn("tracking", job.target)
+
+    def test_acquisition_error_cannot_be_converted_to_reselection(self):
+        job = DummyJob(
+            status="FAILED",
+            result={
+                "tracking": {
+                    "tracking_success": False,
+                    "tracking_status": "ANCHOR_ACQUISITION_ERROR",
+                    "action_required": "RETRY_ANALYSIS",
+                    "reid_summary": {
+                        "status": "ANCHOR_ACQUISITION_ERROR",
+                        "reason_codes": ["REID_ANCHOR_ACQUISITION_ERROR"],
+                    },
+                },
+            },
+            warnings=["PLAYER_ANCHOR_ACQUISITION_FAILED"],
+            failure_reason="PLAYER_ANCHOR_ACQUISITION_FAILED",
+        )
+        original_result = job.result
+
+        reset = api._reset_failed_tracking_attempt(job)
+
+        self.assertFalse(reset)
+        self.assertIs(job.result, original_result)
+        self.assertEqual(job.status, "FAILED")
+        self.assertEqual(
+            job.failure_reason,
+            "PLAYER_ANCHOR_ACQUISITION_FAILED",
+        )
 
 
 if __name__ == "__main__":

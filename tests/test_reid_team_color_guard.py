@@ -182,6 +182,35 @@ class TeamColorGuardTests(unittest.TestCase):
         self.assertEqual(result["segments_with_player"], 1)
         self.assertEqual(result["segments"][1]["identity_status"], "ABSTAINED")
 
+    def test_guard_uses_the_resolved_secondary_seed_anchor(self):
+        output = output_with_segments([78.0, 79.0], [90.0, 91.0])
+        output["segments"][0]["window_start"] = 70.0
+        output["segments"][0]["window_end"] = 115.0
+        output["segments"][1]["window_start"] = 80.0
+        output["segments"][1]["window_end"] = 125.0
+        output["anchor_acquisition"] = {
+            "seed_anchor_id": 2,
+            "seed_anchor": {"t": 78.0, **BBOX},
+        }
+
+        result = self.run_guard(
+            output,
+            {78.0: RED, 79.0: RED, 90.0: RED, 91.0: RED},
+            player_ref={"t": 1.0, **BBOX},
+        )
+
+        self.assertEqual(result["segments_with_player"], 2)
+        self.assertTrue(result["tracking_success"])
+        self.assertEqual(
+            result["reid_summary"]["team_color_guard"]["seed_anchor_id"],
+            2,
+        )
+        self.assertTrue(
+            result["reid_summary"]["team_color_guard"]["anchor_geometry"][
+                "passed"
+            ]
+        )
+
     def test_disabled_wrapper_returns_original_output_without_persistence(self):
         original = {
             "segments": [
@@ -202,6 +231,57 @@ class TeamColorGuardTests(unittest.TestCase):
                 guarded("job", "video.mp4", {"t": 1.0, **BBOX}),
                 original,
             )
+
+    def test_wrapper_preserves_structured_anchor_failure(self):
+        original = {
+            "tracking_success": False,
+            "tracking_status": "ANCHOR_NOT_FOUND",
+            "action_required": "RESELECT_PLAYER",
+            "segments": [],
+            "largest_gap_sec": None,
+        }
+
+        def implementation(*_args, **_kwargs):
+            return original
+
+        guarded = guard_windowed_reid(implementation)
+        with patch.dict(
+            os.environ,
+            {"PLAYER_REID_TEAM_COLOR_GUARD_ENABLED": "1"},
+            clear=False,
+        ):
+            self.assertIs(
+                guarded("job", "video.mp4", {"t": 1.0, **BBOX}),
+                original,
+            )
+
+    def test_guard_exception_fails_closed_with_retry_not_reselection(self):
+        original = output_with_segments([1.0, 2.0], [3.0, 4.0])
+
+        def implementation(*_args, **_kwargs):
+            return original
+
+        guarded = guard_windowed_reid(implementation)
+        with patch.dict(
+            os.environ,
+            {"PLAYER_REID_TEAM_COLOR_GUARD_ENABLED": "1"},
+            clear=False,
+        ), patch(
+            "app.reid.team_color_guard.apply_team_color_guard",
+            side_effect=RuntimeError("frame read failed"),
+        ), patch(
+            "app.reid.team_color_guard._repersist_guarded_output",
+            side_effect=lambda output, _job_id: output,
+        ):
+            result = guarded("job", "video.mp4", {"t": 1.0, **BBOX})
+
+        self.assertFalse(result["tracking_success"])
+        self.assertEqual(result["tracking_status"], "TEAM_COLOR_GUARD_ERROR")
+        self.assertEqual(result["action_required"], "RETRY_ANALYSIS")
+        self.assertEqual(result["segments_with_player"], 0)
+        self.assertTrue(
+            all(segment.get("bboxes") == [] for segment in result["segments"])
+        )
 
 
 if __name__ == "__main__":

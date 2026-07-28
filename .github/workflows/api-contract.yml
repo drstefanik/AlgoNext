@@ -18,6 +18,7 @@ on:
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
       - "tests/test_multi_anchor_api.py"
+      - "tests/test_pick_player_flow.py"
       - "tests/test_player_profile_api.py"
       - ".github/workflows/api-contract.yml"
   push:
@@ -39,6 +40,7 @@ on:
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
       - "tests/test_multi_anchor_api.py"
+      - "tests/test_pick_player_flow.py"
       - "tests/test_player_profile_api.py"
       - ".github/workflows/api-contract.yml"
 
@@ -88,6 +90,7 @@ jobs:
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
           tests/test_multi_anchor_api.py
+          tests/test_pick_player_flow.py
           tests/test_player_profile_api.py
 
       - name: Run API and evaluation truth contract tests
@@ -98,4 +101,5 @@ jobs:
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
           tests/test_multi_anchor_api.py
+          tests/test_pick_player_flow.py
           tests/test_player_profile_api.py

@@ -1522,6 +1522,89 @@ def _normalize_preview_frames(preview_frames: list) -> list:
         )
     return normalized_frames
 
+
+def _reset_failed_tracking_attempt(job: AnalysisJob) -> bool:
+    result = job.result if isinstance(job.result, dict) else {}
+    tracking = (
+        result.get("tracking")
+        if isinstance(result.get("tracking"), dict)
+        else {}
+    )
+    summary = (
+        tracking.get("reid_summary")
+        if isinstance(tracking.get("reid_summary"), dict)
+        else {}
+    )
+    reason_codes = summary.get("reason_codes")
+    action_required = str(tracking.get("action_required") or "").upper()
+    tracking_status = str(
+        tracking.get("tracking_status") or summary.get("status") or ""
+    ).upper()
+    normalized_reason_codes = (
+        {
+            str(code).strip().upper()
+            for code in reason_codes
+            if str(code).strip()
+        }
+        if isinstance(reason_codes, list)
+        else set()
+    )
+    acquisition_failure = (
+        action_required == "RETRY_ANALYSIS"
+        or tracking_status == "ANCHOR_ACQUISITION_ERROR"
+        or any(
+            "ACQUISITION_ERROR" in code or "PROCESSING_FAILED" in code
+            for code in normalized_reason_codes
+        )
+    )
+    deterministic_anchor_failure = any(
+        code in {
+            "REID_ANCHORS_NOT_FOUND",
+            "REID_ALL_ANCHORS_NOT_FOUND",
+            "REID_ANCHOR_TRACK_NOT_FOUND",
+            "REID_ANCHOR_REJECTED",
+            "REID_ANCHOR_TRACK_EMPTY",
+        }
+        for code in normalized_reason_codes
+    )
+    failed_reid = (
+        not acquisition_failure
+        and (
+            action_required == "RESELECT_PLAYER"
+            or tracking_status
+            in {"ANCHOR_NOT_FOUND", "ANCHOR_REJECTED", "ANCHOR_TRACK_EMPTY"}
+            or deterministic_anchor_failure
+            or job.failure_reason == "PLAYER_RESELECTION_REQUIRED"
+        )
+    )
+    if not failed_reid:
+        return False
+
+    preserved = {
+        key: result[key]
+        for key in (
+            "candidates",
+            "framesProcessed",
+            "totalTracks",
+            "rawTracks",
+            "primaryCount",
+            "secondaryCount",
+        )
+        if key in result
+    }
+    assets = result.get("assets")
+    if isinstance(assets, dict) and isinstance(assets.get("input_video"), dict):
+        preserved["assets"] = {"input_video": dict(assets["input_video"])}
+    job.result = preserved
+    target = dict(job.target or {})
+    target.pop("tracking", None)
+    job.target = target
+    job.warnings = []
+    job.error = None
+    job.failure_reason = None
+    return True
+
+
 def _bbox_iou(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
     try:
         ax1 = float(box_a.get("x", 0.0))
@@ -1591,6 +1674,7 @@ def select_track(
             detail=error_detail("TRACK_NOT_FOUND", "Track not found"),
         )
 
+    recovery_reset = _reset_failed_tracking_attempt(job)
     player_ref_payload: Dict[str, Any] = {
         "track_id": candidate.get("track_id", normalized_payload.track_id),
         "tier": candidate.get("tier") or "UNKNOWN",
@@ -1632,7 +1716,7 @@ def select_track(
     job.updated_at = datetime.now(timezone.utc)
 
     progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
+    current_pct = 0 if recovery_reset else (progress.get("pct") or 0)
     try:
         current_pct = int(current_pct)
     except (TypeError, ValueError):
@@ -1725,6 +1809,7 @@ def pick_player(
             ),
         )
 
+    recovery_reset = _reset_failed_tracking_attempt(job)
     frame_key = selected_frame.get("key") or selected_frame.get("s3_key")
     time_sec = selected_frame.get("time_sec")
     bbox = selected_track.get("bbox") or {}
@@ -1750,6 +1835,7 @@ def pick_player(
 
     target_payload = {**(job.target or {})}
     target_payload["confirmed"] = False
+    target_payload["tracking"] = {"status": "PENDING"}
     target_payload["selection"] = {
         "frame_key": frame_key,
         "time_sec": float(time_sec) if time_sec is not None else None,
@@ -1760,7 +1846,7 @@ def pick_player(
     job.updated_at = datetime.now(timezone.utc)
 
     progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
+    current_pct = 0 if recovery_reset else (progress.get("pct") or 0)
     try:
         current_pct = int(current_pct)
     except (TypeError, ValueError):
@@ -2396,7 +2482,7 @@ def _confirm_target_selection(
         target_payload["confirmed"] = True
         target_payload["selection"] = selection_payload
         target_payload["selections"] = selections_payload
-        target_payload.setdefault("tracking", {"status": "PENDING"})
+        target_payload["tracking"] = {"status": "PENDING"}
         job.target = target_payload
         job.status = "READY_TO_ENQUEUE"
         job.updated_at = datetime.now(timezone.utc)
