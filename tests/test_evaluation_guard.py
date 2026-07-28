@@ -79,9 +79,7 @@ class EvaluationGuardTests(unittest.TestCase):
         self.assertAlmostEqual(signals["coverage_pct"], 0.49)
         self.assertAlmostEqual(signals["coverage_ratio"], 0.0049)
         self.assertAlmostEqual(job.result["tracking"]["coverage_ratio"], 0.0049)
-        self.assertAlmostEqual(
-            job.result["tracking"]["coverage_ratio_total"], 0.0049
-        )
+        self.assertAlmostEqual(job.result["tracking"]["coverage_ratio_total"], 0.0049)
         self.assertAlmostEqual(job.result["tracking_quality_index"], 9.9, places=1)
         self.assertEqual(
             job.warnings,
@@ -168,6 +166,48 @@ class EvaluationGuardTests(unittest.TestCase):
         )
         self.assertIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
         self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
+
+    def test_matched_anchor_rejection_preserves_real_reason(self):
+        cases = (
+            ("ANCHOR_REJECTED", "ANCHOR_TRACK_COLOR_UNVERIFIED"),
+            ("ANCHOR_ONLY", "AUTONOMOUS_REID_NOT_PROVEN"),
+        )
+        for tracking_status, reason_code in cases:
+            with self.subTest(tracking_status=tracking_status):
+                job = AnalysisJob(
+                    id=f"job-{tracking_status.lower()}",
+                    status="WAITING_FOR_PLAYER",
+                    category="U17",
+                    role="Midfielder",
+                    warnings=["PLAYER_ANCHOR_NOT_FOUND"],
+                    result={
+                        "tracking": {
+                            "tracking_success": False,
+                            "tracking_status": tracking_status,
+                            "action_required": "RESELECT_PLAYER",
+                            "bboxes_count": 0,
+                            "segments_total": 108,
+                            "segments_with_player": 0,
+                            "anchors_total": 2,
+                            "anchors_matched": 2,
+                            "reid_summary": {
+                                "status": tracking_status,
+                                "reason_codes": [reason_code],
+                            },
+                        },
+                    },
+                )
+
+                sanitize_analysis_job(job)
+
+                self.assertEqual(
+                    job.result["evaluation_status"],
+                    "TRACKING_FAILED",
+                )
+                self.assertNotIn("PLAYER_ANCHOR_NOT_FOUND", job.warnings)
+                self.assertIn(reason_code, job.warnings)
+                self.assertIn(tracking_status, job.warnings)
+                self.assertIn("PLAYER_RESELECTION_REQUIRED", job.warnings)
 
     def test_acquisition_error_keeps_retry_semantics(self):
         job = AnalysisJob(

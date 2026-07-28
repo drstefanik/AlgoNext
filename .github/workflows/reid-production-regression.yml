@@ -4,85 +4,389 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: Preserved AlgoNext job to force-retry
+        description: Preserved AlgoNext job to enqueue
         required: true
         default: 6520b68b-8de6-43b7-88d2-41375bded0a0
-        type: string
-      api_base:
-        description: Public AlgoNext API base, without /jobs
-        required: true
-        default: https://algonext-frontend.vercel.app/api/backend
         type: string
   push:
     branches:
       - main
     paths:
       - ".github/workflows/reid-production-regression.yml"
-      - "app/reid/full_match_runtime.py"
-      - "app/reid/team_color_guard.py"
-      - "app/reid/windowed_tracking.py"
+      - ".github/workflows/deploy.yml"
+      - "Dockerfile"
+      - "requirements*.txt"
+      - "alembic/**"
+      - "migrations/**"
+      - "app/reid/**"
+      - "app/api.py"
+      - "app/runtime_api.py"
+      - "app/core/**"
+      - "app/main.py"
+      - "app/schemas.py"
+      - "app/workers/**"
       - "docker-compose.yml"
+      - "tests/reid_production_validator.py"
 
 permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: reid-production-regression-${{ inputs.job_id || '6520b68b-8de6-43b7-88d2-41375bded0a0' }}
+  cancel-in-progress: false
+
 jobs:
   regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 135
+    timeout-minutes: 180
     env:
       JOB_ID: ${{ inputs.job_id || '6520b68b-8de6-43b7-88d2-41375bded0a0' }}
-      API_BASE: ${{ inputs.api_base || 'https://algonext-frontend.vercel.app/api/backend' }}
-      HEALTH_URL: https://algonext-frontend.vercel.app/api/health
+      API_BASE: https://algonext-frontend.vercel.app/api/backend
+      API_TARGET_HOST: algonext-frontend.vercel.app
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Wait until production runs this exact revision
+      - name: Wait until the exercised API runs this exact revision
+        id: pre_attest
+        timeout-minutes: 20
         run: |
           set -euo pipefail
+          test "${API_BASE%/}" = \
+            "https://algonext-frontend.vercel.app/api/backend"
+          runtime_url="${API_BASE%/}/runtime"
           for attempt in $(seq 1 150); do
-            payload="$(curl -sS --max-time 15 "$HEALTH_URL" || true)"
-            ready="$(jq -r '.ok // false' <<<"$payload" 2>/dev/null || echo false)"
-            api_revision="$(jq -r '.backend.revision // empty' <<<"$payload" 2>/dev/null || true)"
-            worker_revision="$(jq -r '.backend.worker.revision // empty' <<<"$payload" 2>/dev/null || true)"
-            echo "[$attempt/150] ready=$ready api=$api_revision worker=$worker_revision expected=$GITHUB_SHA"
-            if [ "$ready" = "true" ] && [ "$api_revision" = "$GITHUB_SHA" ] && [ "$worker_revision" = "$GITHUB_SHA" ]; then
-              printf '%s\n' "$payload" > /tmp/runtime-health.json
+            curl_status=0
+            curl -fsS --max-time 15 "$runtime_url" \
+              > /tmp/runtime-health-candidate.json \
+              2> /tmp/reid-pre-attest-error.log || curl_status=$?
+            if [ "$curl_status" -eq 0 ] && python tests/reid_production_validator.py \
+              attest-runtime \
+              --payload /tmp/runtime-health-candidate.json \
+              --expected-revision "$GITHUB_SHA" \
+              --output /tmp/runtime-health-attestation.json \
+              2> /tmp/reid-pre-attest-error.log; then
+              cp /tmp/runtime-health-candidate.json /tmp/runtime-health.json
+              echo "[$attempt/150] API and worker ready on $GITHUB_SHA"
+              echo "outcome=PASSED" >> "$GITHUB_OUTPUT"
+              echo "failure_reason=" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            reason="$(tail -n 1 /tmp/reid-pre-attest-error.log 2>/dev/null || true)"
+            echo "[$attempt/150] runtime=$runtime_url expected=$GITHUB_SHA reason=$reason"
             sleep 5
           done
-          echo "Production did not converge to revision $GITHUB_SHA" >&2
+          failure_reason="The exercised API did not converge to revision $GITHUB_SHA"
+          echo "outcome=FAILED" >> "$GITHUB_OUTPUT"
+          {
+            echo "failure_reason<<PRE_ATTEST_EOF"
+            echo "$failure_reason"
+            echo "PRE_ATTEST_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "$failure_reason" >&2
           exit 1
 
-      - name: Force-retry preserved job
+      - name: Restore canonical fixture anchors and enqueue
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           curl -fsS --retry 4 --retry-all-errors --max-time 60 \
+            "$API_BASE/jobs/$JOB_ID?view=full" > /tmp/fixture-before.json
+          fixture_status="$(jq -r '.data.status // empty' /tmp/fixture-before.json)"
+          case "$fixture_status" in
+            QUEUED|RUNNING|PROCESSING)
+              echo "Regression fixture is already active: $fixture_status" >&2
+              exit 1
+              ;;
+          esac
+          input_bucket="$(jq -r '.data.result.assets.input_video.bucket // empty' /tmp/fixture-before.json)"
+          input_key="$(jq -r '.data.result.assets.input_video.key // empty' /tmp/fixture-before.json)"
+          input_url="$(jq -r '.data.result.assets.input_video.signed_url // .data.result.assets.input_video.url // empty' /tmp/fixture-before.json)"
+          expected_input_key="jobs/${JOB_ID}/input.mp4"
+          test "$input_bucket" = "fnh"
+          test "$input_key" = "$expected_input_key"
+          test -n "$input_url"
+          curl -fsS --max-time 60 \
+            -H 'Range: bytes=0-65535' \
+            -D /tmp/input-video-range-headers.txt \
+            -o /tmp/input-video-range.bin \
+            "$input_url"
+          range_status="$(
+            awk '/^HTTP[/]/{status=$2} END{print status}' \
+              /tmp/input-video-range-headers.txt
+          )"
+          content_range="$(
+            awk 'tolower($0) ~ /^content-range:/{sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' \
+              /tmp/input-video-range-headers.txt
+          )"
+          input_etag="$(
+            awk 'tolower($0) ~ /^etag:/{sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' \
+              /tmp/input-video-range-headers.txt
+          )"
+          input_size="$(wc -c < /tmp/input-video-range.bin | tr -d '[:space:]')"
+          input_sha256="$(sha256sum /tmp/input-video-range.bin | awk '{print $1}')"
+          test "$range_status" = "206"
+          test "$content_range" = "bytes 0-65535/2179028557"
+          test "$input_etag" = '"2e5c54ec42f3f79e989983ac133197f2-260"'
+          test "$input_size" = "65536"
+          test "$input_sha256" = "0b9ad260c2a404a60496e14da6cb3fce3003004d36d6a218d3dbbe0a29e1f8ea"
+          jq -n \
+            --arg bucket "$input_bucket" \
+            --arg key "$input_key" \
+            --arg etag "$input_etag" \
+            --arg content_range "$content_range" \
+            --arg sha256_first_65536 "$input_sha256" \
+            --argjson bytes_total 2179028557 \
+            --argjson range_bytes "$input_size" \
+            '{
+              bucket: $bucket,
+              key: $key,
+              etag: $etag,
+              content_range: $content_range,
+              bytes_total: $bytes_total,
+              range_bytes: $range_bytes,
+              sha256_first_65536: $sha256_first_65536
+            }' > /tmp/input-video-attestation.json
+          unset input_url
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          envelope = json.loads(Path('/tmp/fixture-before.json').read_text())
+          job = envelope.get('data') or envelope
+          job_id = os.environ['JOB_ID']
+          if str(job.get('job_id') or job.get('id') or '') != job_id:
+              raise SystemExit('Regression fixture job id changed')
+          frames = job.get('preview_frames') or job.get('previewFrames') or []
+          immutable_key = re.compile(
+              rf'^jobs/{re.escape(job_id)}/frames/frame_[0-9]{{4}}[.](?:jpg|jpeg|png)$'
+          )
+          expected = [
+              (
+                  719.003,
+                  {'x': 0.58125, 'y': 0.463888889, 'w': 0.11875, 'h': 0.536111111},
+              ),
+              (
+                  2157.009,
+                  {'x': 0.278125, 'y': 0.2875, 'w': 0.03125, 'h': 0.151388889},
+              ),
+          ]
+          candidates = [
+              frame for frame in frames
+              if isinstance(frame, dict)
+              and (frame.get('key') or frame.get('s3_key'))
+              and frame.get('time_sec') is not None
+          ]
+          if not candidates:
+              raise SystemExit('Regression fixture selection frames are unavailable')
+          selections = []
+          for timestamp, bbox in expected:
+              frame = min(
+                  candidates,
+                  key=lambda item: abs(float(item['time_sec']) - timestamp),
+              )
+              canonical_time = float(frame['time_sec'])
+              if abs(canonical_time - timestamp) > 0.01:
+                  raise SystemExit(
+                      f'Regression fixture frame {timestamp} is unavailable; '
+                      f'nearest={canonical_time}'
+                  )
+              canonical_key = str(frame.get('key') or frame.get('s3_key') or '')
+              if not immutable_key.fullmatch(canonical_key):
+                  raise SystemExit(
+                      'Regression fixture frame is outside immutable namespace: '
+                      f'{canonical_key}'
+                  )
+              selections.append({
+                  'frameTimeSec': canonical_time,
+                  'frameKey': canonical_key,
+                  'bbox': bbox,
+              })
+          if len({item['frameKey'] for item in selections}) != len(selections):
+              raise SystemExit('Regression fixture anchors resolved to the same frame')
+          Path('/tmp/regression-selection.json').write_text(
+              json.dumps({'selections': selections}, ensure_ascii=False) + '\n'
+          )
+          primary = selections[0]
+          Path('/tmp/regression-player-ref.json').write_text(
+              json.dumps(
+                  {
+                      'frameTimeSec': primary['frameTimeSec'],
+                      'bbox_xywh': primary['bbox'],
+                  },
+                  ensure_ascii=False,
+              )
+              + '\n'
+          )
+          PY
+          fixture_attempt_id="$(
+            jq -r \
+              '.data.target.analysis_attempt_id // .data.target.analysisAttemptId // empty' \
+              /tmp/fixture-before.json
+          )"
+          player_ref_attempt_header=()
+          if [ -n "$fixture_attempt_id" ]; then
+            player_ref_attempt_header=(
+              -H "X-Analysis-Attempt-Id: $fixture_attempt_id"
+            )
+          fi
+          curl -fsS --max-time 60 \
             -X POST \
             -H 'Accept: application/json' \
             -H 'Content-Type: application/json' \
-            --data '{"force":true}' \
-            "$API_BASE/jobs/$JOB_ID/retry" \
-            | tee /tmp/retry-response.json
-          status="$(jq -r '.data.status // empty' /tmp/retry-response.json)"
-          test "$status" = "QUEUED" -o "$status" = "RUNNING"
+            "${player_ref_attempt_header[@]}" \
+            --data @/tmp/regression-player-ref.json \
+            "$API_BASE/jobs/$JOB_ID/player-ref" \
+            > /tmp/player-ref-response.json
+          player_ref_attempt_id="$(
+            jq -r '.data.analysis_attempt_id // empty' \
+              /tmp/player-ref-response.json
+          )"
+          test -n "$player_ref_attempt_id"
+          curl -fsS --max-time 60 \
+            -X POST \
+            -H 'Accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -H "X-Analysis-Attempt-Id: $player_ref_attempt_id" \
+            --data @/tmp/regression-selection.json \
+            "$API_BASE/jobs/$JOB_ID/selection" \
+            > /tmp/selection-response.json
+          ready_status="$(jq -r '.data.status // empty' /tmp/selection-response.json)"
+          test "$ready_status" = "READY_TO_ENQUEUE"
+          selection_attempt_id="$(
+            jq -r '.data.analysis_attempt_id // empty' \
+              /tmp/selection-response.json
+          )"
+          test -n "$selection_attempt_id"
+          curl -fsS --retry 4 --retry-all-errors --max-time 60 \
+            "$API_BASE/jobs/$JOB_ID?view=full" > /tmp/fixture-ready.json
+          python - <<'PY'
+          import json
+          import math
+          from pathlib import Path
+
+          envelope = json.loads(Path('/tmp/fixture-ready.json').read_text())
+          job = envelope.get('data') or envelope
+          target = job.get('target') or {}
+          if target.get('confirmed') is not True:
+              raise SystemExit('Regression fixture target was not confirmed')
+          if target.get('full_match_mode') is not True:
+              raise SystemExit('Regression fixture lost full_match_mode=true')
+          if (target.get('tracking') or {}).get('status') != 'PENDING':
+              raise SystemExit('Regression fixture tracking state is not PENDING')
+          expected = sorted(
+              json.loads(
+                  Path('/tmp/regression-selection.json').read_text()
+              ).get('selections') or [],
+              key=lambda item: float(item['frameTimeSec']),
+          )
+          actual = sorted(
+              target.get('selections') or [],
+              key=lambda item: float(item.get('frame_time_sec')),
+          )
+          if len(actual) != len(expected):
+              raise SystemExit('Regression fixture selection count changed')
+          for saved, requested in zip(actual, expected):
+              if not math.isclose(
+                  float(saved.get('frame_time_sec')),
+                  float(requested['frameTimeSec']),
+                  abs_tol=0.01,
+              ):
+                  raise SystemExit('Regression fixture timestamp changed')
+              if saved.get('frame_key') != requested['frameKey']:
+                  raise SystemExit('Regression fixture frame key changed')
+              for key, expected_value in requested['bbox'].items():
+                  if not math.isclose(
+                      float(saved.get(key)),
+                      float(expected_value),
+                      abs_tol=1e-9,
+                  ):
+                      raise SystemExit(
+                          f'Regression fixture bbox changed: {key}'
+                      )
+          primary = expected[0]
+          player_ref = job.get('player_ref') or {}
+          for key, expected_value in {
+              't': primary['frameTimeSec'],
+              **primary['bbox'],
+          }.items():
+              if not math.isclose(
+                  float(player_ref.get(key)),
+                  float(expected_value),
+                  abs_tol=1e-9,
+              ):
+                  raise SystemExit(f'Regression fixture player_ref changed: {key}')
+          primary_selection = target.get('selection') or {}
+          if primary_selection.get('frame_key') != primary['frameKey']:
+              raise SystemExit('Primary selection frame key changed')
+          if not math.isclose(
+              float(primary_selection.get('time_sec')),
+              float(primary['frameTimeSec']),
+              abs_tol=0.01,
+          ):
+              raise SystemExit('Primary selection timestamp changed')
+          for key, expected_value in primary['bbox'].items():
+              if not math.isclose(
+                  float((primary_selection.get('bbox') or {}).get(key)),
+                  float(expected_value),
+                  abs_tol=1e-9,
+              ):
+                  raise SystemExit(f'Primary selection bbox changed: {key}')
+          PY
+          curl -fsS --max-time 60 \
+            -X POST \
+            -H 'Accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -H "X-Analysis-Attempt-Id: $selection_attempt_id" \
+            --data '{}' \
+            "$API_BASE/jobs/$JOB_ID/enqueue" \
+            | tee /tmp/enqueue-response.json
+          status="$(jq -r '.data.status // empty' /tmp/enqueue-response.json)"
+          test "$status" = "QUEUED"
+          python - <<'PY'
+          import json
+          import uuid
+          from pathlib import Path
+
+          enqueue = json.loads(Path('/tmp/enqueue-response.json').read_text())
+          enqueue_data = enqueue.get('data') or enqueue
+          attempt_id = str(enqueue_data.get('analysis_attempt_id') or '')
+          if str(uuid.UUID(attempt_id)) != attempt_id.lower():
+              raise SystemExit('Enqueue returned a non-canonical attempt UUID')
+          before = json.loads(Path('/tmp/fixture-before.json').read_text())
+          before = before.get('data') or before
+          before_target = before.get('target') or {}
+          before_result = before.get('result') or {}
+          previous = {
+              str(value)
+              for value in (
+                  before_target.get('analysis_attempt_id'),
+                  before_result.get('analysis_attempt_id'),
+              )
+              if value
+          }
+          if attempt_id in previous:
+              raise SystemExit('Enqueue reused a previous analysis attempt')
+          Path('/tmp/enqueue-attempt-id.txt').write_text(attempt_id + '\n')
+          PY
 
       - name: Poll analysis to a terminal state
         id: poll
+        timeout-minutes: 105
         run: |
           set -euo pipefail
           terminal=""
           for attempt in $(seq 1 180); do
             curl -fsS --retry 4 --retry-all-errors --max-time 60 \
-              "$API_BASE/jobs/$JOB_ID" > /tmp/job-latest.json
-            status="$(jq -r '.data.status // "UNKNOWN"' /tmp/job-latest.json)"
-            step="$(jq -r '.data.progress.step // "UNKNOWN"' /tmp/job-latest.json)"
-            pct="$(jq -r '.data.progress.pct // 0' /tmp/job-latest.json)"
-            updated="$(jq -r '.data.progress.updated_at // .data.updated_at // "unknown"' /tmp/job-latest.json)"
-            windows="$(jq -r '(.data.progress.stats.windows_completed // 0 | tostring) + "/" + (.data.progress.stats.windows_total // 0 | tostring)' /tmp/job-latest.json)"
+              "$API_BASE/jobs/$JOB_ID/status" > /tmp/job-status-latest.json
+            status="$(jq -r '.data.status // "UNKNOWN"' /tmp/job-status-latest.json)"
+            step="$(jq -r '.data.progress.step // "UNKNOWN"' /tmp/job-status-latest.json)"
+            pct="$(jq -r '.data.progress.pct // 0' /tmp/job-status-latest.json)"
+            updated="$(jq -r '.data.progress.updated_at // .data.updated_at // "unknown"' /tmp/job-status-latest.json)"
+            windows="$(jq -r '(.data.progress.stats.windows_completed // 0 | tostring) + "/" + (.data.progress.stats.windows_total // 0 | tostring)' /tmp/job-status-latest.json)"
             echo "[$attempt/180] status=$status step=$step pct=$pct windows=$windows updated=$updated"
             case "$status" in
               COMPLETED|PARTIAL|DONE|FAILED|WAITING_FOR_PLAYER)
@@ -96,102 +400,215 @@ jobs:
             echo "Analysis did not reach a terminal state" >&2
             exit 1
           fi
-          cp /tmp/job-latest.json /tmp/job-final.json
+          curl -fsS --retry 4 --retry-all-errors --max-time 60 \
+            "$API_BASE/jobs/$JOB_ID?view=full" > /tmp/job-final.json
+          final_status="$(jq -r '.data.status // "UNKNOWN"' /tmp/job-final.json)"
+          test "$final_status" = "$terminal"
           echo "status=$terminal" >> "$GITHUB_OUTPUT"
           test "$terminal" != "FAILED"
 
       - name: Validate truthful guarded result
         id: validate
+        timeout-minutes: 5
         run: |
+          set +e
+          python tests/reid_production_validator.py validate-result \
+            --job-final /tmp/job-final.json \
+            --selection /tmp/regression-selection.json \
+            --enqueue /tmp/enqueue-response.json \
+            --fixture-before /tmp/fixture-before.json \
+            --summary /tmp/reid-regression-summary.json \
+            2> /tmp/reid-validation-error.log
+          validation_status=$?
+          set -e
+          if [ "$validation_status" -ne 0 ]; then
+            cat /tmp/reid-validation-error.log >&2
+            failure_reason="$(tail -n 1 /tmp/reid-validation-error.log)"
+            attempt_id="$(cat /tmp/enqueue-attempt-id.txt 2>/dev/null || true)"
+            jq -n \
+              --arg outcome "FAILED" \
+              --arg failure_reason "$failure_reason" \
+              --arg analysis_attempt_id "$attempt_id" \
+              --arg api_target "algonext-production" \
+              --arg api_host "$API_TARGET_HOST" \
+              '{
+                outcome: $outcome,
+                failure_reason: $failure_reason,
+                analysis_attempt_id: $analysis_attempt_id,
+                api_target: $api_target,
+                api_host: $api_host
+              }' > /tmp/reid-regression-summary.json
+            {
+              echo "outcome=FAILED"
+              echo "analysis_attempt_id=$attempt_id"
+              echo "failure_reason<<VALIDATION_EOF"
+              echo "$failure_reason"
+              echo "VALIDATION_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit "$validation_status"
+          fi
+          jq \
+            --arg api_target "algonext-production" \
+            --arg api_host "$API_TARGET_HOST" \
+            '. + {api_target: $api_target, api_host: $api_host}' \
+            /tmp/reid-regression-summary.json \
+            > /tmp/reid-regression-summary.with-target.json
+          mv /tmp/reid-regression-summary.with-target.json \
+            /tmp/reid-regression-summary.json
+          {
+            echo "outcome=PASSED"
+            echo "failure_reason="
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Re-attest the exercised API revision
+        id: reattest
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set +e
+          runtime_url="${API_BASE%/}/runtime"
+          curl -fsS --retry 4 --retry-all-errors --max-time 60 \
+            "$runtime_url" \
+            > /tmp/runtime-health-final.json \
+            2> /tmp/reid-reattest-error.log
+          curl_status=$?
+          outcome="FAILED"
+          failure_reason=""
+          if [ "$curl_status" -ne 0 ]; then
+            curl_error="$(tail -n 1 /tmp/reid-reattest-error.log)"
+            failure_reason="Final runtime request failed (curl=$curl_status): $curl_error"
+          elif python tests/reid_production_validator.py attest-runtime \
+            --payload /tmp/runtime-health-final.json \
+            --expected-revision "$GITHUB_SHA" \
+            --output /tmp/reid-final-attestation.json \
+            2> /tmp/reid-reattest-error.log; then
+            outcome="PASSED"
+          else
+            failure_reason="$(tail -n 1 /tmp/reid-reattest-error.log)"
+          fi
+          if [ ! -f /tmp/reid-final-attestation.json ]; then
+            jq -n \
+              --arg outcome "$outcome" \
+              --arg failure_reason "$failure_reason" \
+              --arg expected_revision "$GITHUB_SHA" \
+              --arg runtime_url "$runtime_url" \
+              --arg api_target "algonext-production" \
+              --arg api_host "$API_TARGET_HOST" \
+              --argjson curl_status "$curl_status" \
+              '{
+                outcome: $outcome,
+                failure_reason: $failure_reason,
+                expected_revision: $expected_revision,
+                runtime_url: $runtime_url,
+                api_target: $api_target,
+                api_host: $api_host,
+                curl_status: $curl_status
+              }' > /tmp/reid-final-attestation.json
+          fi
+          jq \
+            --arg api_target "algonext-production" \
+            --arg api_host "$API_TARGET_HOST" \
+            '. + {api_target: $api_target, api_host: $api_host}' \
+            /tmp/reid-final-attestation.json \
+            > /tmp/reid-final-attestation.with-target.json
+          mv /tmp/reid-final-attestation.with-target.json \
+            /tmp/reid-final-attestation.json
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+          {
+            echo "failure_reason<<REATTEST_EOF"
+            echo "$failure_reason"
+            echo "REATTEST_EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$outcome" != "PASSED" ]; then
+            cat /tmp/reid-reattest-error.log >&2
+            echo "$failure_reason" >&2
+            exit 1
+          fi
+
+      - name: Prepare sanitized regression evidence
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import json
-          import os
+          import shutil
+          import sys
           from pathlib import Path
 
-          envelope = json.loads(Path('/tmp/job-final.json').read_text())
-          job = envelope.get('data') or envelope
-          result = job.get('result') or {}
-          tracking = result.get('tracking') or {}
-          summary = tracking.get('reid_summary') or {}
-          guard = summary.get('team_color_guard') or {}
-          tracking_success = tracking.get('tracking_success')
-          anchors_matched = int(tracking.get('anchors_matched') or 0)
-          bboxes_count = int(tracking.get('bboxes_count') or 0)
-
-          if job.get('status') == 'WAITING_FOR_PLAYER':
-              raise SystemExit('Regression stopped for player reselection')
-          if tracking_success is not True:
-              raise SystemExit(f'Selected-player tracking did not succeed: {tracking_success!r}')
-          if anchors_matched < 1:
-              raise SystemExit(f'No manual anchor matched: {anchors_matched}')
-          if bboxes_count < 1:
-              raise SystemExit(f'No selected-player observations produced: {bboxes_count}')
-
-          forbidden_scores = {
-              'match_rating_10': result.get('match_rating_10'),
-              'impact_100': result.get('impact_100'),
-              'overall_score': result.get('overall_score'),
-              'role_score': result.get('role_score'),
-          }
-          if any(value is not None for value in forbidden_scores.values()):
-              raise SystemExit(f'Unvalidated score leaked: {forbidden_scores}')
-          if guard.get('version') != 'kit-color-guard-v1':
-              raise SystemExit(f'Missing kit-colour guard evidence: {guard}')
-          if guard.get('validated') is not False:
-              raise SystemExit('Experimental guard must never be marked validated')
-
-          segments = tracking.get('segments') or []
-          accepted = [segment for segment in segments if segment.get('bboxes')]
-          if not accepted:
-              raise SystemExit('No full-match window retained the selected player')
-          cross_window = [
-              segment
-              for segment in accepted
-              if str(segment.get('direction') or '').lower() != 'anchor'
-          ]
-          if not cross_window:
-              raise SystemExit(
-                  'Only the manual-anchor window was retained; cross-window ReID was not proven'
-              )
-          rejected = int(guard.get('segments_rejected') or 0)
-          status = str(guard.get('status') or summary.get('status') or 'UNKNOWN')
-          coverage = float(tracking.get('coverage_pct') or 0.0)
-          if status == 'ANCHOR_REJECTED' and accepted:
-              raise SystemExit('Anchor rejection must clear every accepted identity link')
-          for segment in accepted:
-              segment_guard = (segment.get('reid') or {}).get('kit_color_guard')
-              if segment_guard and segment_guard.get('passed') is not True:
-                  raise SystemExit('A retained segment has a failed kit-colour guard')
-
-          report = {
-              'job_id': job.get('job_id') or job.get('id'),
-              'status': job.get('status'),
-              'guard_status': status,
-              'segments_total': tracking.get('segments_total'),
-              'segments_with_player': len(accepted),
-              'cross_window_segments': len(cross_window),
-              'segments_rejected': rejected,
-              'anchors_matched': anchors_matched,
-              'bboxes_count': bboxes_count,
-              'coverage_pct': coverage,
-              'anchor_geometry': guard.get('anchor_geometry'),
-              'anchor_signature': guard.get('anchor_signature'),
-              'warnings': job.get('warnings') or [],
-              'scores_withheld': True,
-          }
-          Path('/tmp/reid-regression-summary.json').write_text(
-              json.dumps(report, indent=2, ensure_ascii=False) + '\n'
+          sys.path.insert(0, str(Path.cwd() / 'tests'))
+          from reid_production_validator import (
+              assert_sanitized_artifact,
+              sanitize_artifact_value,
           )
-          with Path(os.environ['GITHUB_OUTPUT']).open('a') as handle:
-              handle.write(f"guard_status={status}\n")
-              handle.write(f"segments_with_player={len(accepted)}\n")
-              handle.write(f"segments_rejected={rejected}\n")
-              handle.write(f"coverage_pct={coverage}\n")
-          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
-              handle.write('## ReID production regression\n\n')
-              handle.write('```json\n')
-              handle.write(json.dumps(report, indent=2, ensure_ascii=False))
-              handle.write('\n```\n')
+
+          destination = Path('/tmp/reid-regression-artifacts')
+          staging = Path('/tmp/reid-regression-artifacts-staging')
+          for path in (destination, staging):
+              if path.exists():
+                  shutil.rmtree(path)
+          staging.mkdir(parents=True)
+          json_sources = [
+              'runtime-health.json',
+              'runtime-health-attestation.json',
+              'runtime-health-final.json',
+              'fixture-before.json',
+              'input-video-attestation.json',
+              'regression-player-ref.json',
+              'player-ref-response.json',
+              'regression-selection.json',
+              'selection-response.json',
+              'fixture-ready.json',
+              'enqueue-response.json',
+              'job-status-latest.json',
+              'job-final.json',
+              'reid-regression-summary.json',
+              'reid-final-attestation.json',
+          ]
+          text_sources = [
+              'enqueue-attempt-id.txt',
+              'reid-pre-attest-error.log',
+              'reid-validation-error.log',
+              'reid-reattest-error.log',
+          ]
+
+          for name in json_sources:
+              source = Path('/tmp') / name
+              if not source.is_file():
+                  continue
+              try:
+                  payload = json.loads(source.read_text())
+              except (OSError, json.JSONDecodeError) as exc:
+                  message = (
+                      f'Unable to sanitize {name}: {type(exc).__name__}\n'
+                  )
+                  assert_sanitized_artifact(message, path=name)
+                  (staging / f'{name}.sanitization-error.txt').write_text(message)
+                  continue
+              cleaned = sanitize_artifact_value(payload)
+              assert_sanitized_artifact(cleaned, path=name)
+              artifact = staging / name
+              artifact.write_text(
+                  json.dumps(cleaned, indent=2, ensure_ascii=False) + '\n'
+              )
+              assert_sanitized_artifact(
+                  json.loads(artifact.read_text()),
+                  path=f'{name}.post_write',
+              )
+          for name in text_sources:
+              source = Path('/tmp') / name
+              if source.is_file():
+                  content = sanitize_artifact_value(
+                      source.read_text(errors='replace')
+                  )
+                  assert_sanitized_artifact(content, path=name)
+                  artifact = staging / name
+                  artifact.write_text(content)
+                  assert_sanitized_artifact(
+                      artifact.read_text(errors='strict'),
+                      path=f'{name}.post_write',
+                  )
+          staging.rename(destination)
           PY
 
       - name: Upload regression evidence
@@ -200,11 +617,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reid-regression-${{ env.JOB_ID }}-${{ github.sha }}
-          path: |
-            /tmp/runtime-health.json
-            /tmp/retry-response.json
-            /tmp/job-final.json
-            /tmp/reid-regression-summary.json
+          path: /tmp/reid-regression-artifacts/
           if-no-files-found: warn
           retention-days: 30
 
@@ -214,26 +627,62 @@ jobs:
         env:
           WORKFLOW_STATUS: ${{ job.status }}
           TERMINAL_STATUS: ${{ steps.poll.outputs.status || 'NOT_COMPLETED' }}
+          PRE_ATTEST_OUTCOME: ${{ steps.pre_attest.outputs.outcome || 'NOT_RUN' }}
+          PRE_ATTEST_FAILURE_REASON: ${{ steps.pre_attest.outputs.failure_reason || '' }}
+          VALIDATION_OUTCOME: ${{ steps.validate.outputs.outcome || 'NOT_RUN' }}
+          VALIDATION_FAILURE_REASON: ${{ steps.validate.outputs.failure_reason || '' }}
+          REATTEST_OUTCOME: ${{ steps.reattest.outputs.outcome || 'NOT_RUN' }}
+          REATTEST_FAILURE_REASON: ${{ steps.reattest.outputs.failure_reason || '' }}
           GUARD_STATUS: ${{ steps.validate.outputs.guard_status || 'NOT_VALIDATED' }}
           SEGMENTS_WITH_PLAYER: ${{ steps.validate.outputs.segments_with_player || '0' }}
           SEGMENTS_REJECTED: ${{ steps.validate.outputs.segments_rejected || '0' }}
           COVERAGE_PCT: ${{ steps.validate.outputs.coverage_pct || '0' }}
+          ANALYSIS_ATTEMPT_ID: ${{ steps.validate.outputs.analysis_attempt_id || 'UNKNOWN' }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url || '' }}
+          API_TARGET_HOST: ${{ env.API_TARGET_HOST }}
         with:
           script: |
             const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const releasePassed =
+              process.env.WORKFLOW_STATUS === 'success' &&
+              process.env.PRE_ATTEST_OUTCOME === 'PASSED' &&
+              process.env.VALIDATION_OUTCOME === 'PASSED' &&
+              process.env.REATTEST_OUTCOME === 'PASSED';
             const lines = [
               '### ReID production regression',
               `- Job: \`${process.env.JOB_ID}\``,
+              `- Attempt: \`${process.env.ANALYSIS_ATTEMPT_ID}\``,
+              `- Endpoint: \`algonext-production (${process.env.API_TARGET_HOST})\``,
               `- Workflow: ${process.env.WORKFLOW_STATUS}`,
               `- Stato job: ${process.env.TERMINAL_STATUS}`,
-              `- Guard: ${process.env.GUARD_STATUS}`,
-              `- Finestre mantenute: ${process.env.SEGMENTS_WITH_PLAYER}`,
-              `- Finestre rifiutate: ${process.env.SEGMENTS_REJECTED}`,
-              `- Copertura: ${process.env.COVERAGE_PCT}%`,
-              `- Run: ${runUrl}`,
+              `- Esito: ${releasePassed ? 'PASSED' : 'FAILED'}`,
+              `- Attestazione iniziale: ${process.env.PRE_ATTEST_OUTCOME}`,
+              `- Validazione: ${process.env.VALIDATION_OUTCOME}`,
+              `- Re-attestazione: ${process.env.REATTEST_OUTCOME}`,
             ];
-            if (process.env.ARTIFACT_URL) lines.push(`- Artifact: ${process.env.ARTIFACT_URL}`);
+            if (releasePassed) {
+              lines.push(
+                `- Guard: ${process.env.GUARD_STATUS}`,
+                `- Finestre mantenute: ${process.env.SEGMENTS_WITH_PLAYER}`,
+                `- Finestre rifiutate: ${process.env.SEGMENTS_REJECTED}`,
+                `- Copertura: ${process.env.COVERAGE_PCT}%`,
+              );
+            } else {
+              const failures = [
+                ['Attestazione iniziale', process.env.PRE_ATTEST_OUTCOME, process.env.PRE_ATTEST_FAILURE_REASON],
+                ['Validazione', process.env.VALIDATION_OUTCOME, process.env.VALIDATION_FAILURE_REASON],
+                ['Re-attestazione', process.env.REATTEST_OUTCOME, process.env.REATTEST_FAILURE_REASON],
+              ].filter(([, outcome]) => outcome !== 'PASSED');
+              for (const [phase, outcome, reason] of failures) {
+                lines.push(
+                  `- ${phase}: ${reason || `${outcome}: gate non completato`}`,
+                );
+              }
+            }
+            lines.push(`- Run: ${runUrl}`);
+            if (process.env.ARTIFACT_URL) {
+              lines.push(`- Artifact: ${process.env.ARTIFACT_URL}`);
+            }
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,

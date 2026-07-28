@@ -3,6 +3,7 @@ import math
 import traceback
 import time
 import json
+import re
 import shutil
 import subprocess
 import logging
@@ -18,6 +19,8 @@ import requests
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from celery.exceptions import Retry
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.workers.celery_app import celery
@@ -25,7 +28,10 @@ from app.workers.ai_report import generate_report
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
-from app.core.tracking_outcome import apply_tracking_outcome
+from app.core.tracking_outcome import (
+    StaleAnalysisAttemptError,
+    apply_tracking_outcome,
+)
 from app.core.scoring import (
     DEFAULT_WEIGHTS,
     ROLE_WEIGHTS,
@@ -66,6 +72,15 @@ def _cleanup_workdir(base_dir: Optional[Path]) -> None:
     shutil.rmtree(base_dir, ignore_errors=True)
 
 
+def _safe_namespace_component(value: Any, *, fallback: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or fallback))
+    return normalized[:128] or fallback
+
+
+def _attempt_namespace(analysis_attempt_id: str | None) -> str:
+    return _safe_namespace_component(analysis_attempt_id, fallback="legacy")
+
+
 def _preview_frame_count() -> int:
     try:
         preview_count = int(os.environ.get("PREVIEW_FRAME_COUNT", "32"))
@@ -90,7 +105,9 @@ def _preview_time_epsilon_from_fps(fps: float | None) -> float:
     return max(0.25, 1.5 / float(fps))
 
 
-def _collect_tracking_bboxes(tracking_output: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+def _collect_tracking_bboxes(
+    tracking_output: Dict[str, Any] | None,
+) -> List[Dict[str, Any]]:
     if not isinstance(tracking_output, dict):
         return []
     if tracking_output.get("segments"):
@@ -106,7 +123,9 @@ def _collect_tracking_bboxes(tracking_output: Dict[str, Any] | None) -> List[Dic
     return [bbox for bbox in bboxes if isinstance(bbox, dict)]
 
 
-def _collect_lost_segments(tracking_output: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+def _collect_lost_segments(
+    tracking_output: Dict[str, Any] | None,
+) -> List[Dict[str, Any]]:
     if not isinstance(tracking_output, dict):
         return []
     if tracking_output.get("segments"):
@@ -134,7 +153,11 @@ def _compute_evidence_metrics(tracking_output: Dict[str, Any] | None) -> Dict[st
     fps = None
     if isinstance(tracking_output, dict):
         try:
-            fps = float(tracking_output.get("fps")) if tracking_output.get("fps") else None
+            fps = (
+                float(tracking_output.get("fps"))
+                if tracking_output.get("fps")
+                else None
+            )
         except (TypeError, ValueError):
             fps = None
 
@@ -605,6 +628,7 @@ def _select_tracking_preview_candidates(
 def _generate_tracking_preview_frames(
     *,
     job_id: str,
+    analysis_attempt_id: str | None = None,
     input_path: Path,
     frames_dir: Path,
     s3_internal: Any,
@@ -643,7 +667,10 @@ def _generate_tracking_preview_frames(
             continue
 
         width, height = probe_image_dimensions(frame_path)
-        frame_key = f"jobs/{job_id}/frames/{frame_name}"
+        frame_key = (
+            f"jobs/{job_id}/attempts/{_attempt_namespace(analysis_attempt_id)}"
+            f"/tracking_frames/{frame_name}"
+        )
         upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
         preview_frames.append(
             {
@@ -655,6 +682,12 @@ def _generate_tracking_preview_frames(
                 "has_player": bool(candidate.get("has_player")),
                 "is_target": bool(candidate.get("is_target")),
                 "tracks": [],
+                "asset_kind": "tracking_review_frame",
+                **(
+                    {"analysis_attempt_id": analysis_attempt_id}
+                    if analysis_attempt_id is not None
+                    else {}
+                ),
             }
         )
     return preview_frames
@@ -707,16 +740,187 @@ def safe_commit(db: Session) -> None:
 
 
 def reload_job(db: Session, job_id: str) -> Optional[AnalysisJob]:
-    return db.get(AnalysisJob, job_id)
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
 
 
-def update_job(db: Session, job_id: str, updater: Callable[[AnalysisJob], None]) -> bool:
+def _load_job_for_update(db: Session, job_id: str) -> Optional[AnalysisJob]:
+    execute = getattr(db, "execute", None)
+    if callable(execute):
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execute(statement).scalar_one_or_none()
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
+
+
+def update_job(
+    db: Session, job_id: str, updater: Callable[[AnalysisJob], None]
+) -> bool:
     job = reload_job(db, job_id)
     if not job:
         return False
     updater(job)
     safe_commit(db)
     return True
+
+
+def update_analysis_job(
+    db: Session,
+    job_id: str,
+    expected_analysis_attempt_id: str | None,
+    updater: Callable[[AnalysisJob], None],
+) -> bool:
+    """Lock and mutate only the analysis attempt that owns this worker."""
+
+    job = _load_job_for_update(db, job_id)
+    if not job:
+        return False
+    _validate_task_analysis_attempt(
+        job.target if isinstance(job.target, dict) else {},
+        expected_analysis_attempt_id,
+    )
+    _validate_task_analysis_state(job)
+    updater(job)
+    safe_commit(db)
+    return True
+
+
+_PREANALYSIS_MUTABLE_STATUSES = frozenset({"CREATED", "WAITING_FOR_SELECTION"})
+_PREVIEW_PROGRESS_STEPS = frozenset(
+    {"CREATED", "WAITING_FOR_SELECTION", "EXTRACTING_PREVIEWS"}
+)
+_CANDIDATE_PROGRESS_STEPS = frozenset(
+    {"PREVIEWS_READY", "TRACKING_CANDIDATES", "TRACKING"}
+)
+
+
+def _validate_preanalysis_task_state(job: AnalysisJob) -> str:
+    """Reject preview/candidate deliveries once selection or analysis advanced."""
+
+    status = str(getattr(job, "status", "") or "").upper()
+    if status not in _PREANALYSIS_MUTABLE_STATUSES:
+        raise StaleAnalysisAttemptError(
+            "Pre-analysis task cannot mutate the current job state: "
+            f"status={status or '<missing>'}"
+        )
+    return status
+
+
+def _claim_preanalysis_task(
+    db: Session,
+    job_id: str,
+    expected_analysis_attempt_id: str | None,
+) -> tuple[AnalysisJob | None, str | None]:
+    """Validate a pre-analysis delivery against an authoritative locked row."""
+
+    job = _load_job_for_update(db, job_id)
+    if job is None:
+        return None, None
+    analysis_attempt_id = _validate_task_analysis_attempt(
+        job.target if isinstance(job.target, dict) else {},
+        expected_analysis_attempt_id,
+    )
+    _validate_preanalysis_task_state(job)
+    safe_commit(db)
+    return job, analysis_attempt_id
+
+
+def update_preanalysis_job(
+    db: Session,
+    job_id: str,
+    expected_analysis_attempt_id: str | None,
+    updater: Callable[[AnalysisJob], None],
+    *,
+    allowed_progress_steps: frozenset[str],
+) -> bool:
+    """Lock and mutate only the preview/candidate delivery that owns the row."""
+
+    job = _load_job_for_update(db, job_id)
+    if job is None:
+        return False
+    _validate_task_analysis_attempt(
+        job.target if isinstance(job.target, dict) else {},
+        expected_analysis_attempt_id,
+    )
+    _validate_preanalysis_task_state(job)
+    progress = job.progress if isinstance(job.progress, dict) else {}
+    current_step = str(progress.get("step") or "").upper()
+    if current_step not in allowed_progress_steps:
+        raise StaleAnalysisAttemptError(
+            "Pre-analysis task no longer owns the current job phase: "
+            f"step={current_step or '<missing>'}"
+        )
+    updater(job)
+    safe_commit(db)
+    return True
+
+
+def _claim_analysis_task(
+    db: Session,
+    job_id: str,
+    expected_analysis_attempt_id: str | None,
+    *,
+    task_id: str | None,
+    retry_number: int,
+) -> tuple[AnalysisJob | None, str | None]:
+    """Atomically admit one worker delivery, plus strictly newer Celery retries."""
+
+    job = _load_job_for_update(db, job_id)
+    if job is None:
+        return None, None
+    analysis_attempt_id = _validate_task_analysis_attempt(
+        job.target if isinstance(job.target, dict) else {},
+        expected_analysis_attempt_id,
+    )
+    status = str(job.status or "").upper()
+    incoming_task_id = str(task_id or "").strip() or None
+    incoming_retry = max(0, int(retry_number or 0))
+    progress = dict(job.progress or {})
+    claimed_task_id = str(progress.get("analysis_task_id") or "").strip() or None
+    try:
+        claimed_retry = max(0, int(progress.get("analysis_task_retry") or 0))
+    except (TypeError, ValueError):
+        claimed_retry = 0
+
+    if status == "QUEUED":
+        pass
+    elif status in {"RUNNING", "PROCESSING"}:
+        if (
+            incoming_task_id is None
+            or incoming_task_id != claimed_task_id
+            or incoming_retry <= claimed_retry
+        ):
+            raise StaleAnalysisAttemptError(
+                "Analysis task delivery is duplicate or does not own the claim: "
+                f"status={status} retry={incoming_retry}"
+            )
+    else:
+        raise StaleAnalysisAttemptError(
+            "Analysis task cannot claim a non-active job: "
+            f"status={status or '<missing>'}"
+        )
+
+    job.status = "RUNNING"
+    job.error = None
+    job.failure_reason = normalize_failure_reason(None)
+    job.warnings = []
+    set_progress(job, "STARTING", 1, "Job started")
+    job.progress = {
+        **(job.progress or {}),
+        "analysis_task_id": incoming_task_id,
+        "analysis_task_retry": incoming_retry,
+    }
+    safe_commit(db)
+    return job, analysis_attempt_id
 
 
 def _normalize_player_ref(player_ref: Dict[str, Any]) -> Dict[str, float] | None:
@@ -744,12 +948,21 @@ def _normalize_player_ref(player_ref: Dict[str, Any]) -> Dict[str, float] | None
 
 def set_progress(job: AnalysisJob, step: str, pct: int, message: str = "") -> None:
     pct = max(0, min(100, int(pct)))
-    job.progress = {
+    progress = {
         "step": step,
         "pct": pct,
         "message": message,
         "updated_at": utc_now_iso(),
     }
+    target = job.target if isinstance(job.target, dict) else {}
+    analysis_attempt_id = str(target.get("analysis_attempt_id") or "").strip()
+    if analysis_attempt_id:
+        progress["analysis_attempt_id"] = analysis_attempt_id
+    previous_progress = job.progress if isinstance(job.progress, dict) else {}
+    for key in ("analysis_task_id", "analysis_task_retry"):
+        if key in previous_progress:
+            progress[key] = previous_progress[key]
+    job.progress = progress
 
 
 def _apply_tracking_outcome(
@@ -763,6 +976,65 @@ def _apply_tracking_outcome(
     )
 
 
+def _bind_analysis_attempt_id(
+    tracking_payload: Dict[str, Any],
+    target: Dict[str, Any] | None,
+) -> str | None:
+    """Bind worker evidence to the enqueue attempt that selected the target."""
+
+    source = target if isinstance(target, dict) else {}
+    analysis_attempt_id = str(source.get("analysis_attempt_id") or "").strip() or None
+    payload_attempt_id = (
+        str(tracking_payload.get("analysis_attempt_id") or "").strip() or None
+    )
+    if payload_attempt_id is not None and payload_attempt_id != analysis_attempt_id:
+        raise StaleAnalysisAttemptError(
+            "Tracking payload attempt differs from the loaded target"
+        )
+    if analysis_attempt_id is not None:
+        tracking_payload["analysis_attempt_id"] = analysis_attempt_id
+    return analysis_attempt_id
+
+
+def _validate_task_analysis_attempt(
+    target: Dict[str, Any] | None,
+    expected_analysis_attempt_id: str | None,
+) -> str | None:
+    """Reject a delayed task that belongs to a superseded enqueue attempt.
+
+    ``None`` is accepted only for a truly legacy target that has no attempt
+    nonce. A delayed one-argument task must never adopt a newer attempt.
+    """
+
+    source = target if isinstance(target, dict) else {}
+    current_attempt_id = str(source.get("analysis_attempt_id") or "").strip() or None
+    if expected_analysis_attempt_id is None:
+        if current_attempt_id is not None:
+            raise StaleAnalysisAttemptError(
+                "Analysis task is missing the current job target attempt: "
+                f"target={current_attempt_id}"
+            )
+        return None
+    expected_attempt_id = str(expected_analysis_attempt_id).strip() or None
+    if expected_attempt_id is None or expected_attempt_id != current_attempt_id:
+        raise StaleAnalysisAttemptError(
+            "Analysis task attempt differs from the current job target: "
+            f"task={expected_attempt_id or '<missing>'} "
+            f"target={current_attempt_id or '<missing>'}"
+        )
+    return current_attempt_id
+
+
+def _validate_task_analysis_state(job: AnalysisJob) -> str:
+    """Reject delayed or duplicate workers after the job stopped being active."""
+
+    status = str(getattr(job, "status", "") or "").upper()
+    if status not in {"QUEUED", "RUNNING", "PROCESSING"}:
+        raise StaleAnalysisAttemptError(
+            "Analysis task cannot mutate a non-active job: "
+            f"status={status or '<missing>'}"
+        )
+    return status
 
 
 # ----------------------------
@@ -859,7 +1131,9 @@ def download_video(
     if _is_http_url(source):
         _ensure_public_url(source)
         if _is_shared_object_url(source):
-            raise RuntimeError("Shared object URLs are not supported for video download.")
+            raise RuntimeError(
+                "Shared object URLs are not supported for video download."
+            )
 
         log_every_bytes = 100 * 1024 * 1024
         bytes_downloaded = 0
@@ -1173,7 +1447,9 @@ def _normalize_selection_payload(selection: Dict[str, Any] | None) -> Dict[str, 
     }
 
 
-def _normalize_player_ref_selection(player_ref: Dict[str, Any] | None) -> Dict[str, Any]:
+def _normalize_player_ref_selection(
+    player_ref: Dict[str, Any] | None,
+) -> Dict[str, Any]:
     player_ref_norm = _normalize_player_ref(player_ref or {})
     if not player_ref_norm:
         return {"frame_time_sec": 0.0, "bbox_xywh": [0.0, 0.0, 0.0, 0.0]}
@@ -1217,7 +1493,7 @@ def _build_report_v1(
     tracked_span_seconds = 0.0
     if isinstance(tracking_output, dict):
         times = []
-        for b in (tracking_output.get("bboxes") or []):
+        for b in tracking_output.get("bboxes") or []:
             try:
                 times.append(float(b.get("t", 0.0)))
             except Exception:
@@ -1325,7 +1601,9 @@ def _build_report_v1(
         coverage_total = float(source.get("coverage_pct_total") or 0.0)
         window_total = float(source.get("segments_total") or 0.0)
         window_with_player = float(source.get("segments_with_player") or 0.0)
-        window_ratio = (window_with_player / window_total) * 100.0 if window_total else 0.0
+        window_ratio = (
+            (window_with_player / window_total) * 100.0 if window_total else 0.0
+        )
         if coverage_total >= 70.0 and window_ratio >= 70.0:
             confidence_level = "high"
         elif coverage_total >= 45.0:
@@ -1503,7 +1781,9 @@ def build_motion_segments(
             last_time = t
             last_center = center
             continue
-        dist = ((center[0] - last_center[0]) ** 2 + (center[1] - last_center[1]) ** 2) ** 0.5
+        dist = (
+            (center[0] - last_center[0]) ** 2 + (center[1] - last_center[1]) ** 2
+        ) ** 0.5
         speed = dist / dt
         if speed >= speed_threshold:
             if active_start is None:
@@ -1523,12 +1803,10 @@ def build_motion_segments(
 # Helpers: S3/MinIO (upload + signed urls)
 # ----------------------------
 REGION = os.getenv("AWS_REGION") or os.getenv("S3_REGION", "us-east-1")
-S3_ENDPOINT_URL = (
-    os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
-)
-S3_PUBLIC_ENDPOINT_URL = (
-    os.getenv("S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com").strip()
-)
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000").strip()
+S3_PUBLIC_ENDPOINT_URL = os.getenv(
+    "S3_PUBLIC_ENDPOINT_URL", "https://s3.nextgroupintl.com"
+).strip()
 
 
 def make_s3(endpoint_url: str):
@@ -1617,13 +1895,83 @@ def presign_get_object(
     )
 
 
+def _publish_tracking_artifact(
+    db: Session,
+    *,
+    job_id: str,
+    expected_analysis_attempt_id: str | None,
+    s3_internal: Any,
+    s3_bucket: str,
+    tracking_output: Dict[str, Any],
+) -> str | None:
+    """Publish an attempt-owned tracking object to the canonical key under lock."""
+
+    payload_attempt_id = (
+        str(tracking_output.get("analysis_attempt_id") or "").strip() or None
+    )
+    normalized_expected = str(expected_analysis_attempt_id or "").strip() or None
+    if payload_attempt_id != normalized_expected:
+        raise StaleAnalysisAttemptError(
+            "Tracking artifact payload attempt differs from the running analysis: "
+            f"payload={payload_attempt_id or '<missing>'} "
+            f"expected={normalized_expected or '<missing>'}"
+        )
+
+    source_key = str(tracking_output.get("tracking_key") or "").strip()
+    if not source_key:
+        return None
+    attempt_component = _attempt_namespace(normalized_expected)
+    expected_source_key = (
+        f"jobs/{job_id}/attempts/{attempt_component}/tracking/tracking.json"
+    )
+    if source_key != expected_source_key:
+        raise StaleAnalysisAttemptError(
+            "Tracking artifact is outside the current attempt namespace: "
+            f"source={source_key!r} expected={expected_source_key!r}"
+        )
+
+    job = _load_job_for_update(db, job_id)
+    if job is None:
+        return None
+    _validate_task_analysis_attempt(
+        job.target if isinstance(job.target, dict) else {},
+        normalized_expected,
+    )
+    _validate_task_analysis_state(job)
+
+    canonical_key = f"jobs/{job_id}/tracking/tracking.json"
+    s3_internal.copy_object(
+        Bucket=s3_bucket,
+        CopySource={"Bucket": s3_bucket, "Key": source_key},
+        Key=canonical_key,
+        ContentType="application/json",
+        MetadataDirective="REPLACE",
+    )
+    tracking_url = presign_get_object(
+        s3_bucket,
+        canonical_key,
+        int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600")),
+    )
+    safe_commit(db)
+    tracking_output["tracking_attempt_key"] = source_key
+    tracking_output["tracking_key"] = canonical_key
+    tracking_output["tracking_url"] = tracking_url
+    tracking_output["analysis_attempt_id"] = normalized_expected
+    return canonical_key
+
+
 # ----------------------------
 # Celery task
 # ----------------------------
 @celery.task(name="app.workers.pipeline.extract_preview_frames", bind=True)
-def extract_preview_frames(self, job_id: str) -> None:
+def extract_preview_frames(
+    self,
+    job_id: str,
+    expected_analysis_attempt_id: str | None = None,
+) -> None:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
+    analysis_attempt_id: str | None = None
 
     s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
@@ -1632,30 +1980,51 @@ def extract_preview_frames(self, job_id: str) -> None:
 
     max_retries = int(os.environ.get("PREVIEW_TASK_RETRIES", "2"))
     try:
-        job = reload_job(db, job_id)
+        job, analysis_attempt_id = _claim_preanalysis_task(
+            db,
+            job_id,
+            expected_analysis_attempt_id,
+        )
         if not job:
             return {}
 
         if job.preview_frames:
             return
 
-        if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
+        if (
+            not s3_endpoint_url
+            or not s3_bucket
+            or not s3_access_key
+            or not s3_secret_key
+        ):
             raise RuntimeError(
                 "Missing S3 env vars: S3_ENDPOINT_URL, S3_ACCESS_KEY, "
                 "S3_SECRET_KEY, S3_BUCKET"
             )
 
-        update_job(
+        update_preanalysis_job(
             db,
             job_id,
+            analysis_attempt_id,
             lambda job: set_progress(
                 job, "EXTRACTING_PREVIEWS", 15, "Extracting preview frames"
             ),
+            allowed_progress_steps=_PREVIEW_PROGRESS_STEPS,
         )
 
         ensure_ffmpeg_available()
 
-        base_dir = Path("/tmp/fnh_jobs_previews") / job_id
+        task_id = str(getattr(self.request, "id", "") or "").strip() or "unidentified"
+        retry_number = int(getattr(self.request, "retries", 0) or 0)
+        base_dir = (
+            Path("/tmp/fnh_jobs_previews")
+            / _safe_namespace_component(job_id, fallback="job")
+            / _attempt_namespace(analysis_attempt_id)
+            / (
+                f"{_safe_namespace_component(task_id, fallback='unidentified')}"
+                f"-retry-{retry_number}"
+            )
+        )
         if base_dir.exists():
             _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -1722,35 +2091,53 @@ def extract_preview_frames(self, job_id: str) -> None:
                     "width": width,
                     "height": height,
                     "tracks": [],
+                    **(
+                        {"analysis_attempt_id": analysis_attempt_id}
+                        if analysis_attempt_id is not None
+                        else {}
+                    ),
                 }
             )
 
         if preview_frames:
-            update_job(
+            update_preanalysis_job(
                 db,
                 job_id,
+                analysis_attempt_id,
                 lambda job: (
                     setattr(job, "preview_frames", preview_frames),
                     set_progress(job, "PREVIEWS_READY", 20, "Preview frames ready"),
                 ),
+                allowed_progress_steps=_PREVIEW_PROGRESS_STEPS,
             )
             logger.info("Preview frames generated for job %s", job_id)
             try:
-                extract_candidates.delay(job_id)
+                extract_candidates.delay(job_id, analysis_attempt_id)
             except Exception:
                 logger.exception(
                     "Failed to enqueue candidates extraction after previews job_id=%s",
                     job_id,
                 )
+    except StaleAnalysisAttemptError as exc:
+        db.rollback()
+        logger.warning(
+            "extract_preview_frames ignored stale delivery job_id=%s reason=%s",
+            job_id,
+            exc,
+        )
+        return
+    except Retry:
+        raise
     except Exception as exc:
         logger.exception("Failed to generate preview frames for job %s", job_id)
         if self.request.retries < max_retries:
-            raise self.retry(exc=exc, countdown=5 * (2 ** self.request.retries))
+            raise self.retry(exc=exc, countdown=5 * (2**self.request.retries))
         try:
             error_message = f"PREVIEW_FRAMES_FAILED: {exc}"
-            update_job(
+            update_preanalysis_job(
                 db,
                 job_id,
+                analysis_attempt_id,
                 lambda job: (
                     setattr(job, "status", "FAILED"),
                     setattr(job, "error", error_message),
@@ -1759,9 +2146,14 @@ def extract_preview_frames(self, job_id: str) -> None:
                         "failure_reason",
                         normalize_failure_reason("preview_generation_failed"),
                     ),
-                    set_progress(job, "PREVIEWS_FAILED", 20, "Preview generation failed"),
+                    set_progress(
+                        job, "PREVIEWS_FAILED", 20, "Preview generation failed"
+                    ),
                 ),
+                allowed_progress_steps=_PREVIEW_PROGRESS_STEPS,
             )
+        except StaleAnalysisAttemptError:
+            db.rollback()
         except Exception:
             db.rollback()
     finally:
@@ -1771,10 +2163,29 @@ def extract_preview_frames(self, job_id: str) -> None:
 
 @celery.task(name="app.workers.pipeline.kickoff_job", bind=True)
 def kickoff_job(self, job_id: str) -> None:
+    db: Session = SessionLocal()
     try:
-        extract_preview_frames.delay(job_id)
+        job = _load_job_for_update(db, job_id)
+        if job is None:
+            return
+        target = job.target if isinstance(job.target, dict) else {}
+        analysis_attempt_id = (
+            str(target.get("analysis_attempt_id") or "").strip() or None
+        )
+        _validate_preanalysis_task_state(job)
+        safe_commit(db)
+        extract_preview_frames.delay(job_id, analysis_attempt_id)
+    except StaleAnalysisAttemptError as exc:
+        db.rollback()
+        logger.warning(
+            "kickoff_job ignored stale state job_id=%s reason=%s",
+            job_id,
+            exc,
+        )
     except Exception:
         logger.exception("kickoff_job failed to enqueue tasks job_id=%s", job_id)
+    finally:
+        db.close()
 
 
 def _truncate_stack(stack: str, limit: int = 2000) -> str:
@@ -1832,9 +2243,15 @@ def _normalize_bbox_xywh(bbox: Dict[str, Any]) -> Dict[str, float]:
 
 
 @celery.task(name="app.workers.pipeline.extract_candidates", bind=True)
-def extract_candidates(self, job_id: str) -> Dict[str, Any]:
+def extract_candidates(
+    self,
+    job_id: str,
+    expected_analysis_attempt_id: str | None = None,
+) -> Dict[str, Any]:
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
+    analysis_attempt_id: str | None = None
+    preview_frames_for_failure: List[Dict[str, Any]] = []
 
     s3_endpoint_url = S3_ENDPOINT_URL
     s3_public_endpoint_url = S3_PUBLIC_ENDPOINT_URL
@@ -1844,7 +2261,11 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
 
     max_retries = int(os.environ.get("CANDIDATES_TASK_RETRIES", "2"))
     try:
-        job = reload_job(db, job_id)
+        job, analysis_attempt_id = _claim_preanalysis_task(
+            db,
+            job_id,
+            expected_analysis_attempt_id,
+        )
         if not job:
             return {}
 
@@ -1864,7 +2285,17 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 "S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET"
             )
 
-        base_dir = Path("/tmp/fnh_jobs_candidates") / job_id
+        task_id = str(getattr(self.request, "id", "") or "").strip() or "unidentified"
+        retry_number = int(getattr(self.request, "retries", 0) or 0)
+        base_dir = (
+            Path("/tmp/fnh_jobs_candidates")
+            / _safe_namespace_component(job_id, fallback="job")
+            / _attempt_namespace(analysis_attempt_id)
+            / (
+                f"{_safe_namespace_component(task_id, fallback='unidentified')}"
+                f"-retry-{retry_number}"
+            )
+        )
         if base_dir.exists():
             _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -1873,6 +2304,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
         ensure_bucket_exists(s3_internal, s3_bucket)
 
         preview_frames = list(job.preview_frames or [])
+        preview_frames_for_failure = list(preview_frames)
         if not preview_frames:
             if self.request.retries < max_retries:
                 raise self.retry(countdown=5)
@@ -1897,12 +2329,14 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 except (TypeError, ValueError):
                     continue
 
-        update_job(
+        update_preanalysis_job(
             db,
             job_id,
+            analysis_attempt_id,
             lambda job: set_progress(
                 job, "TRACKING_CANDIDATES", 18, "Tracking all players"
             ),
+            allowed_progress_steps=_CANDIDATE_PROGRESS_STEPS,
         )
 
         preview_inputs: List[Dict[str, Any]] = []
@@ -1928,10 +2362,12 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                         "key": frame_key,
                     }
                 )
-            candidates_output = track_all_players_from_frames(job_id, preview_inputs)
-            logger.info(
-                "extract_candidates: preview_inputs=%d", len(preview_inputs)
+            candidates_output = track_all_players_from_frames(
+                job_id,
+                preview_inputs,
+                analysis_attempt_id=analysis_attempt_id,
             )
+            logger.info("extract_candidates: preview_inputs=%d", len(preview_inputs))
             logger.info(
                 "extract_candidates: candidates_output type=%s",
                 type(candidates_output),
@@ -1942,9 +2378,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     list(candidates_output.keys()),
                 )
             except Exception:
-                logger.info(
-                    "extract_candidates: candidates_output is not dict-like"
-                )
+                logger.info("extract_candidates: candidates_output is not dict-like")
             logger.info(
                 "extract_candidates: candidates_output preview=%s",
                 str(candidates_output)[:1200],
@@ -1953,39 +2387,38 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             input_path = base_dir / "input.mp4"
             video_source, source_bucket = resolve_job_video_source(job, s3_bucket)
             download_video(video_source, input_path, s3_internal, source_bucket)
-            candidates_output = track_all_players(job_id, str(input_path))
+            candidates_output = track_all_players(
+                job_id,
+                str(input_path),
+                analysis_attempt_id=analysis_attempt_id,
+            )
         if isinstance(candidates_output, dict):
             candidates_list = list(candidates_output.get("candidates") or [])
-            frames_processed = (
-                candidates_output.get("framesProcessed")
-                or candidates_output.get("frames_processed")
-            )
+            frames_processed = candidates_output.get(
+                "framesProcessed"
+            ) or candidates_output.get("frames_processed")
             if frames_processed is None:
                 frames_processed = len(preview_inputs)
             total_tracks = candidates_output.get("totalTracks")
             if total_tracks is None:
-                total_tracks = (
-                    (candidates_output.get("autodetection") or {}).get("totalTracks")
-                    or (len(candidates_list) if candidates_list else 0)
-                )
+                total_tracks = (candidates_output.get("autodetection") or {}).get(
+                    "totalTracks"
+                ) or (len(candidates_list) if candidates_list else 0)
             raw_tracks = candidates_output.get("rawTracks")
             if raw_tracks is None:
-                raw_tracks = (
-                    (candidates_output.get("autodetection") or {}).get("rawTracks")
-                    or total_tracks
-                )
+                raw_tracks = (candidates_output.get("autodetection") or {}).get(
+                    "rawTracks"
+                ) or total_tracks
             primary_count = candidates_output.get("primaryCount")
             if primary_count is None:
-                primary_count = (
-                    (candidates_output.get("autodetection") or {}).get("primaryCount")
-                    or 0
-                )
+                primary_count = (candidates_output.get("autodetection") or {}).get(
+                    "primaryCount"
+                ) or 0
             secondary_count = candidates_output.get("secondaryCount")
             if secondary_count is None:
-                secondary_count = (
-                    (candidates_output.get("autodetection") or {}).get("secondaryCount")
-                    or 0
-                )
+                secondary_count = (candidates_output.get("autodetection") or {}).get(
+                    "secondaryCount"
+                ) or 0
         else:
             candidates_list = list(candidates_output or [])
             frames_processed = len(preview_inputs)
@@ -2001,7 +2434,9 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 return None
             closest = min(
                 frames,
-                key=lambda item: abs(float(item.get("time_sec") or 0.0) - float(time_sec)),
+                key=lambda item: abs(
+                    float(item.get("time_sec") or 0.0) - float(time_sec)
+                ),
             )
             return closest.get("key") or closest.get("s3_key")
 
@@ -2018,7 +2453,9 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                 return 0.5
             return max(0.25, min(diffs) / 2.0)
 
-        def _preview_frame_for_time(time_sec: Optional[float]) -> Optional[Dict[str, Any]]:
+        def _preview_frame_for_time(
+            time_sec: Optional[float],
+        ) -> Optional[Dict[str, Any]]:
             if time_sec is None or not preview_time_index:
                 return None
             try:
@@ -2149,10 +2586,12 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                         }
                     )
         if preview_frames:
-            update_job(
+            update_preanalysis_job(
                 db,
                 job_id,
+                analysis_attempt_id,
                 lambda job: setattr(job, "preview_frames", preview_frames),
+                allowed_progress_steps=_CANDIDATE_PROGRESS_STEPS,
             )
         error_detail = None
         if len(preview_inputs) == 0:
@@ -2163,6 +2602,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             "READY" if primary_count > 0 and not error_detail else "LOW_COVERAGE"
         )
         candidates_payload = {
+            "analysis_attempt_id": analysis_attempt_id,
             "candidates": candidates_list,
             "framesProcessed": frames_processed,
             "autodetection": {
@@ -2194,9 +2634,10 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
             "Score computed from candidate tracking stability + coverage + presence. "
             "No ball/event data yet."
         )
-        update_job(
+        update_preanalysis_job(
             db,
             job_id,
+            analysis_attempt_id,
             lambda job: (
                 setattr(job, "status", "WAITING_FOR_SELECTION"),
                 setattr(
@@ -2210,6 +2651,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                         "rawTracks": raw_tracks,
                         "primaryCount": primary_count,
                         "secondaryCount": secondary_count,
+                        "analysis_attempt_id": analysis_attempt_id,
                     },
                 ),
                 _update_candidate_score_fields(
@@ -2219,33 +2661,38 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     evidence_metrics,
                     explain_text,
                 ),
-                set_progress(
-                    job, "CANDIDATES_READY", 22, "Candidate tracks ready"
-                ),
+                set_progress(job, "CANDIDATES_READY", 22, "Candidate tracks ready"),
             ),
+            allowed_progress_steps=_CANDIDATE_PROGRESS_STEPS,
         )
         return {
+            "analysis_attempt_id": analysis_attempt_id,
             "framesProcessed": frames_processed,
             "totalTracks": total_tracks,
             "primaryCount": primary_count,
         }
+    except StaleAnalysisAttemptError as exc:
+        db.rollback()
+        logger.warning(
+            "extract_candidates ignored stale delivery job_id=%s reason=%s",
+            job_id,
+            exc,
+        )
+        return {}
+    except Retry:
+        raise
     except Exception as exc:
         logger.exception("extract_candidates failed job_id=%s", job_id)
-        if max_retries > 0:
-            try:
-                raise self.retry(exc=exc, countdown=15, max_retries=max_retries)
-            except Exception:
-                pass
-        try:
-            job = reload_job(db, job_id)
-            preview_frames = list(job.preview_frames or []) if job else []
-        except Exception:
-            preview_frames = []
+        if self.request.retries < max_retries:
+            raise self.retry(exc=exc, countdown=15, max_retries=max_retries)
+        preview_frames = preview_frames_for_failure
         error_detail = _build_candidates_error_detail(exc)
+
         def _update_failed(job: AnalysisJob) -> None:
             warnings = list({*(job.warnings or []), "CANDIDATES_FAILED"})
             setattr(job, "warnings", warnings)
             candidates_payload = {
+                "analysis_attempt_id": analysis_attempt_id,
                 "candidates": [],
                 "framesProcessed": 0,
                 "autodetection": {
@@ -2255,7 +2702,9 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     "secondaryCount": 0,
                     "thresholdPct": 0.05,
                     "minHits": int(os.environ.get("CANDIDATE_MIN_HITS", "2")),
-                    "minSeconds": float(os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0),
+                    "minSeconds": float(
+                        os.environ.get("CANDIDATE_MIN_SECONDS", "0") or 0
+                    ),
                     "topN": int(os.environ.get("CANDIDATE_TOP_N", "5")),
                 },
                 "autodetection_status": "FAILED",
@@ -2272,6 +2721,7 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     "rawTracks": 0,
                     "primaryCount": 0,
                     "secondaryCount": 0,
+                    "analysis_attempt_id": analysis_attempt_id,
                 },
             )
             if preview_frames:
@@ -2281,8 +2731,19 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
                     20,
                     "Waiting for player selection",
                 )
-        update_job(db, job_id, lambda job: _update_failed(job))
+
+        try:
+            update_preanalysis_job(
+                db,
+                job_id,
+                analysis_attempt_id,
+                lambda job: _update_failed(job),
+                allowed_progress_steps=_CANDIDATE_PROGRESS_STEPS,
+            )
+        except StaleAnalysisAttemptError:
+            db.rollback()
         return {
+            "analysis_attempt_id": analysis_attempt_id,
             "framesProcessed": 0,
             "totalTracks": 0,
             "primaryCount": 0,
@@ -2293,7 +2754,11 @@ def extract_candidates(self, job_id: str) -> Dict[str, Any]:
 
 
 @celery.task(name="app.workers.pipeline.run_analysis", bind=True)
-def run_analysis(self, job_id: str):
+def run_analysis(
+    self,
+    job_id: str,
+    expected_analysis_attempt_id: str | None = None,
+):
     db: Session = SessionLocal()
     base_dir: Optional[Path] = None
     video_features: Optional[Dict[str, Any]] = None
@@ -2308,10 +2773,34 @@ def run_analysis(self, job_id: str):
 
     max_retries = int(os.environ.get("ANALYSIS_TASK_RETRIES", "2"))
     try:
-        job = reload_job(db, job_id)
+        task_id = str(getattr(self.request, "id", "") or "").strip() or None
+        retry_number = int(getattr(self.request, "retries", 0) or 0)
+        job, analysis_attempt_id = _claim_analysis_task(
+            db,
+            job_id,
+            expected_analysis_attempt_id,
+            task_id=task_id,
+            retry_number=retry_number,
+        )
         if not job:
             logger.warning("run_analysis early-exit: job_not_found job_id=%s", job_id)
             return
+
+        target = job.target or {}
+
+        def update_current_attempt(
+            current_db: Session,
+            current_job_id: str,
+            updater: Callable[[AnalysisJob], None],
+        ) -> bool:
+            if current_db is not db or current_job_id != job_id:
+                raise RuntimeError("Analysis attempt mutator changed job scope")
+            return update_analysis_job(
+                current_db,
+                current_job_id,
+                analysis_attempt_id,
+                updater,
+            )
 
         logger.info(
             "run_analysis loaded job_id=%s status=%s role=%s category=%s",
@@ -2324,7 +2813,6 @@ def run_analysis(self, job_id: str):
         role = job.role
         category = job.category
 
-        target = job.target or {}
         selections = target.get("selections") or []
         logger.info(
             "run_analysis target job_id=%s selections_len=%s target_keys=%s",
@@ -2337,7 +2825,7 @@ def run_analysis(self, job_id: str):
             logger.warning(
                 "run_analysis early-exit: waiting_for_selection job_id=%s", job_id
             )
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -2352,7 +2840,7 @@ def run_analysis(self, job_id: str):
                 ),
             )
             try:
-                extract_preview_frames.delay(job_id)
+                extract_preview_frames.delay(job_id, analysis_attempt_id)
             except Exception:
                 logger.exception(
                     "run_analysis failed to enqueue preview job_id=%s",
@@ -2360,22 +2848,15 @@ def run_analysis(self, job_id: str):
                 )
             return
 
-        # RUNNING
-        update_job(
-            db,
-            job_id,
-            lambda job: (
-                setattr(job, "status", "RUNNING"),
-                setattr(job, "error", None),
-                setattr(job, "failure_reason", normalize_failure_reason(None)),
-                setattr(job, "warnings", []),
-                set_progress(job, "STARTING", 1, "Job started"),
-            ),
-        )
         logger.info("run_analysis status set RUNNING job_id=%s", job_id)
 
         # Preconditions
-        if not s3_endpoint_url or not s3_bucket or not s3_access_key or not s3_secret_key:
+        if (
+            not s3_endpoint_url
+            or not s3_bucket
+            or not s3_access_key
+            or not s3_secret_key
+        ):
             raise RuntimeError(
                 "Missing S3 env vars: S3_ENDPOINT_URL, S3_ACCESS_KEY, "
                 "S3_SECRET_KEY, S3_BUCKET"
@@ -2391,7 +2872,21 @@ def run_analysis(self, job_id: str):
         logger.info("run_analysis ffmpeg ok job_id=%s", job_id)
 
         # Prepare workspace
-        base_dir = Path("/tmp/fnh_jobs") / job_id
+        safe_job_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(job_id))[:128]
+        safe_attempt_id = re.sub(
+            r"[^A-Za-z0-9_.-]",
+            "_",
+            str(analysis_attempt_id or "legacy"),
+        )[:128]
+        safe_task_id = re.sub(
+            r"[^A-Za-z0-9_.-]",
+            "_",
+            str(task_id or "unidentified"),
+        )[:128]
+        delivery_namespace = f"{safe_task_id}-retry-{retry_number}"
+        base_dir = (
+            Path("/tmp/fnh_jobs") / safe_job_id / safe_attempt_id / delivery_namespace
+        )
         if base_dir.exists():
             _cleanup_workdir(base_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -2415,7 +2910,7 @@ def run_analysis(self, job_id: str):
         logger.info("run_analysis bucket ok job_id=%s bucket=%s", job_id, s3_bucket)
 
         # Download
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "DOWNLOADING", 10, "Downloading video"),
@@ -2427,7 +2922,7 @@ def run_analysis(self, job_id: str):
             if download_pct >= 18:
                 return
             download_pct = min(18, download_pct + 5)
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: set_progress(
@@ -2445,7 +2940,7 @@ def run_analysis(self, job_id: str):
         )
 
         # Probe meta
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "PROBING", 20, "Probing video metadata"),
@@ -2453,10 +2948,14 @@ def run_analysis(self, job_id: str):
         video_meta = probe_video_meta(input_path) or {}
         if not video_meta:
             raise AnalysisError("Insufficient video signal to compute score")
-        update_job(db, job_id, lambda job: setattr(job, "video_meta", video_meta))
+        update_current_attempt(
+            db,
+            job_id,
+            lambda job: setattr(job, "video_meta", video_meta),
+        )
 
         # Upload input (so UI can always access it, even if we pause)
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(
@@ -2465,10 +2964,13 @@ def run_analysis(self, job_id: str):
         )
         input_key = f"jobs/{job_id}/input.mp4"
         upload_file(s3_internal, s3_bucket, input_path, input_key, "video/mp4")
+
         # Persist input asset into result early (so frontend can show it immediately)
         def store_input_asset(job: AnalysisJob) -> None:
             existing = job.result or {}
-            assets = (existing.get("assets") or {}) if isinstance(existing, dict) else {}
+            assets = (
+                (existing.get("assets") or {}) if isinstance(existing, dict) else {}
+            )
             assets = dict(assets)
             assets.pop("input_video_url", None)
             assets["input_video"] = {
@@ -2477,10 +2979,10 @@ def run_analysis(self, job_id: str):
             }
             job.result = {**existing, "assets": assets}
 
-        update_job(db, job_id, store_input_asset)
+        update_current_attempt(db, job_id, store_input_asset)
 
         # Extract preview frames for UI selection
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(
@@ -2534,7 +3036,7 @@ def run_analysis(self, job_id: str):
             )
 
         if preview_frames:
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -2596,7 +3098,7 @@ def run_analysis(self, job_id: str):
             return
         existing_candidates = (job.result or {}).get("candidates")
         if not existing_candidates:
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: set_progress(
@@ -2606,8 +3108,9 @@ def run_analysis(self, job_id: str):
             candidates_output = track_all_players(
                 job_id,
                 str(tracking_input_path),
+                analysis_attempt_id=analysis_attempt_id,
             )
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: setattr(
@@ -2626,7 +3129,7 @@ def run_analysis(self, job_id: str):
             return
         player_ref = _normalize_player_ref(job.player_ref or job.anchor or {})
         if player_ref is None:
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -2643,7 +3146,7 @@ def run_analysis(self, job_id: str):
             return
 
         # Tracking
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "TRACKING", 35, "Tracking selected player"),
@@ -2680,6 +3183,7 @@ def run_analysis(self, job_id: str):
                 overlap_sec=10.0,
                 fps=5,
                 max_windows=max_windows,
+                analysis_attempt_id=analysis_attempt_id,
             )
         else:
             tracking_output = track_player(
@@ -2687,8 +3191,18 @@ def run_analysis(self, job_id: str):
                 str(tracking_input_path),
                 tracking_player_ref,
                 tracking_selections,
+                analysis_attempt_id=analysis_attempt_id,
             )
+        _publish_tracking_artifact(
+            db,
+            job_id=job_id,
+            expected_analysis_attempt_id=analysis_attempt_id,
+            s3_internal=s3_internal,
+            s3_bucket=s3_bucket,
+            tracking_output=tracking_output,
+        )
         tracking_asset = {
+            "analysis_attempt_id": analysis_attempt_id,
             "bucket": s3_bucket,
             "key": tracking_output.get("tracking_key"),
             "url": tracking_output.get("tracking_url"),
@@ -2708,6 +3222,13 @@ def run_analysis(self, job_id: str):
                 "segments": segments,
                 "segments_total": tracking_output.get("segments_total"),
                 "segments_with_player": tracking_output.get("segments_with_player"),
+                "autonomous_segments_with_player": tracking_output.get(
+                    "autonomous_segments_with_player"
+                ),
+                "autonomous_bboxes_count": tracking_output.get(
+                    "autonomous_bboxes_count"
+                ),
+                "tracking_scope_status": tracking_output.get("tracking_scope_status"),
                 "windows_processed": tracking_output.get("windows_processed"),
                 "anchor_reacquisitions": tracking_output.get("anchor_reacquisitions"),
                 "anchors_total": tracking_output.get("anchors_total"),
@@ -2733,23 +3254,34 @@ def run_analysis(self, job_id: str):
                 "asset": tracking_asset,
             }
         else:
+            legacy_bboxes = tracking_output.get("bboxes") or []
+            explicit_tracking_success = tracking_output.get("tracking_success")
+            legacy_tracking_success = (
+                explicit_tracking_success
+                if isinstance(explicit_tracking_success, bool)
+                else len(legacy_bboxes) > 0
+            )
             tracking_payload = {
                 "method": tracking_output.get("method"),
                 "fps": tracking_output.get("fps"),
                 "coverage_pct": tracking_output.get("coverage_pct"),
-                "bboxes_count": len(tracking_output.get("bboxes") or []),
+                "bboxes_count": len(legacy_bboxes),
                 "track_id": tracking_output.get("track_id"),
                 "anchors_used": tracking_output.get("anchors_used"),
-                "tracking_success": (
-                    len(tracking_output.get("bboxes") or []) > 0
-                ),
+                "reid_summary": tracking_output.get("reid_summary"),
+                "partial": tracking_output.get("partial"),
+                "partial_reason": tracking_output.get("partial_reason"),
+                "tracking_scope_status": tracking_output.get("tracking_scope_status"),
+                "windows_processed": tracking_output.get("windows_processed"),
+                "tracking_success": legacy_tracking_success,
                 "tracking_status": (
-                    "SUCCEEDED"
-                    if tracking_output.get("bboxes")
-                    else "NO_PLAYER_TRACK"
+                    tracking_output.get("tracking_status")
+                    or ("SUCCEEDED" if legacy_tracking_success else "NO_PLAYER_TRACK")
                 ),
                 "action_required": (
-                    None if tracking_output.get("bboxes") else "RESELECT_PLAYER"
+                    tracking_output.get("action_required")
+                    if tracking_output.get("action_required") is not None
+                    else None if legacy_tracking_success else "RESELECT_PLAYER"
                 ),
                 "metrics_scope": "selected_player",
                 "lost_segments": tracking_output.get("lost_segments"),
@@ -2757,7 +3289,12 @@ def run_analysis(self, job_id: str):
                 "notes": tracking_output.get("notes"),
                 "asset": tracking_asset,
             }
-        update_job(
+        bound_attempt_id = _bind_analysis_attempt_id(tracking_payload, target)
+        if bound_attempt_id != analysis_attempt_id:
+            raise RuntimeError(
+                "Analysis attempt changed while building tracking output"
+            )
+        update_current_attempt(
             db,
             job_id,
             lambda job: _apply_tracking_outcome(job, tracking_payload),
@@ -2774,7 +3311,9 @@ def run_analysis(self, job_id: str):
 
         try:
             preview_candidates = _select_tracking_preview_candidates(
-                tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
+                tracking_output=(
+                    tracking_output if isinstance(tracking_output, dict) else None
+                ),
                 player_ref=player_ref if isinstance(player_ref, dict) else None,
                 target=target if isinstance(target, dict) else None,
                 max_frames=_preview_frame_count(),
@@ -2786,6 +3325,7 @@ def run_analysis(self, job_id: str):
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 preview_frames = _generate_tracking_preview_frames(
                     job_id=job_id,
+                    analysis_attempt_id=analysis_attempt_id,
                     input_path=input_path,
                     frames_dir=frames_dir,
                     s3_internal=s3_internal,
@@ -2793,11 +3333,13 @@ def run_analysis(self, job_id: str):
                     candidates=preview_candidates,
                 )
                 if preview_frames:
-                    update_job(
+                    update_current_attempt(
                         db,
                         job_id,
                         lambda job: setattr(job, "preview_frames", preview_frames),
                     )
+        except StaleAnalysisAttemptError:
+            raise
         except Exception:
             logger.exception(
                 "Failed to update tracking-based preview frames job_id=%s",
@@ -2805,7 +3347,7 @@ def run_analysis(self, job_id: str):
             )
 
         # Extract visual features for scoring
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(
@@ -2820,7 +3362,7 @@ def run_analysis(self, job_id: str):
                 "features": video_features,
             },
         )
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: setattr(
@@ -2834,12 +3376,14 @@ def run_analysis(self, job_id: str):
         )
 
         # Extract clips
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "EXTRACTING", 55, "Extracting clips"),
         )
-        target_time_sec = _extract_target_time_sec(job.target if isinstance(job.target, dict) else None)
+        target_time_sec = _extract_target_time_sec(
+            job.target if isinstance(job.target, dict) else None
+        )
         player_ref_time_sec = _extract_player_ref_time_sec(
             job.player_ref if isinstance(job.player_ref, dict) else None
         )
@@ -2851,7 +3395,7 @@ def run_analysis(self, job_id: str):
         )
 
         # Upload clips + signed
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(
@@ -2862,7 +3406,10 @@ def run_analysis(self, job_id: str):
         clips_out: List[Dict[str, Any]] = []
         for i, c in enumerate(extracted, start=1):
             clip_path: Path = c["file"]
-            clip_key = f"jobs/{job_id}/clips/{clip_path.name}"
+            clip_key = (
+                f"jobs/{job_id}/attempts/{_attempt_namespace(analysis_attempt_id)}"
+                f"/clips/{clip_path.name}"
+            )
             upload_file(s3_internal, s3_bucket, clip_path, clip_key, "video/mp4")
             clip_start = c["start"]
             clip_end = c["end"]
@@ -2875,11 +3422,12 @@ def run_analysis(self, job_id: str):
                     "bucket": s3_bucket,
                     "key": clip_key,
                     "type": c.get("type"),
+                    "analysis_attempt_id": analysis_attempt_id,
                 }
             )
 
         # Analysis output from visual features
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "ANALYZING", 85, "Running analysis"),
@@ -2908,7 +3456,12 @@ def run_analysis(self, job_id: str):
         weight_sum = float(evaluation.get("weight_sum") or 0.0)
         radar = evaluation.get("radar") or {}
         if not radar:
-            radar = {"tracking_quality": 0.0, "activity_proxy": 0.0, "visibility": 0.0, "consistency": 0.0}
+            radar = {
+                "tracking_quality": 0.0,
+                "activity_proxy": 0.0,
+                "visibility": 0.0,
+                "consistency": 0.0,
+            }
         explain_text = _build_explain_text(
             role,
             radar,
@@ -2917,14 +3470,23 @@ def run_analysis(self, job_id: str):
         )
 
         # Final result
-        update_job(
+        update_current_attempt(
             db,
             job_id,
             lambda job: set_progress(job, "FINALIZING", 95, "Saving results"),
         )
 
         def finalize_job(job: AnalysisJob) -> None:
-            existing_result = job.result or {}
+            existing_result = dict(job.result or {})
+            for preview_only_key in (
+                "candidates",
+                "framesProcessed",
+                "totalTracks",
+                "rawTracks",
+                "primaryCount",
+                "secondaryCount",
+            ):
+                existing_result.pop(preview_only_key, None)
             candidate_overall = None
             if isinstance(existing_result, dict):
                 candidate_overall = (
@@ -2948,23 +3510,32 @@ def run_analysis(self, job_id: str):
             if isinstance(existing_result, dict) and isinstance(
                 existing_result.get("evidence_metrics"), dict
             ):
-                for key, value in (existing_result.get("evidence_metrics") or {}).items():
+                for key, value in (
+                    existing_result.get("evidence_metrics") or {}
+                ).items():
                     merged_evidence_metrics.setdefault(key, value)
-            preview_candidate_metrics = merged_evidence_metrics.pop(
-                "candidate_metrics", None
-            )
-            if isinstance(preview_candidate_metrics, dict):
-                merged_evidence_metrics[
-                    "preview_candidate_metrics"
-                ] = preview_candidate_metrics
+            # Candidate-preview diagnostics are not selected-player evidence.
+            # They must not survive into a completed analysis result, including
+            # under a renamed/nested key that a client could render by mistake.
+            for legacy_candidate_key in (
+                "candidate_metrics",
+                "candidateMetrics",
+                "preview_candidate_metrics",
+                "previewCandidateMetrics",
+            ):
+                merged_evidence_metrics.pop(legacy_candidate_key, None)
 
-            rating_context = dict(existing_result) if isinstance(existing_result, dict) else {}
+            rating_context = (
+                dict(existing_result) if isinstance(existing_result, dict) else {}
+            )
             rating_context["evidence_metrics"] = merged_evidence_metrics
             job.result = rating_context
             match_rating_payload = compute_match_rating(job)
             match_rating_10 = match_rating_payload.get("match_rating_10")
             impact_100 = match_rating_payload.get("impact_100")
-            explain_text_final = match_rating_payload.get("explain") or explain_text_final
+            explain_text_final = (
+                match_rating_payload.get("explain") or explain_text_final
+            )
 
             existing_assets = (
                 (existing_result.get("assets") or {})
@@ -2987,11 +3558,13 @@ def run_analysis(self, job_id: str):
                     "end_sec": clip["end_sec"],
                     "bucket": clip["bucket"],
                     "key": clip["key"],
+                    "analysis_attempt_id": analysis_attempt_id,
                 }
                 for clip in clips_out
             ]
 
             warnings: List[str] = list(job.warnings or [])
+
             def add_warning(code: str) -> None:
                 if code not in warnings:
                     warnings.append(code)
@@ -3031,7 +3604,9 @@ def run_analysis(self, job_id: str):
                 overall_score=final_overall,
                 warnings=warnings,
                 video_features=video_features,
-                tracking_output=tracking_output if isinstance(tracking_output, dict) else None,
+                tracking_output=(
+                    tracking_output if isinstance(tracking_output, dict) else None
+                ),
             )
             if match_rating_10 is not None:
                 report.setdefault("scores", {})
@@ -3071,16 +3646,31 @@ def run_analysis(self, job_id: str):
             )
             final_analysis_outcome = {
                 **existing_outcome,
+                "analysis_attempt_id": analysis_attempt_id,
                 "pipeline_state": "DONE",
                 "tracking_state": (
-                    "SUCCEEDED"
+                    "INCOMPLETE"
                     if (
                         isinstance(existing_result, dict)
                         and isinstance(existing_result.get("tracking"), dict)
-                        and existing_result["tracking"].get("tracking_success")
-                        is True
+                        and (
+                            existing_result["tracking"].get("partial") is True
+                            or str(
+                                existing_result["tracking"].get("tracking_status") or ""
+                            ).upper()
+                            == "SPARSE_CROSS_WINDOW_EVIDENCE"
+                        )
                     )
-                    else "UNVERIFIED"
+                    else (
+                        "SUCCEEDED"
+                        if (
+                            isinstance(existing_result, dict)
+                            and isinstance(existing_result.get("tracking"), dict)
+                            and existing_result["tracking"].get("tracking_success")
+                            is True
+                        )
+                        else "UNVERIFIED"
+                    )
                 ),
                 "metrics_scope": "selected_player",
             }
@@ -3088,6 +3678,7 @@ def run_analysis(self, job_id: str):
             # keep existing assets/preview_frames/tracking if already present
             job.result = {
                 **existing_result,
+                "analysis_attempt_id": analysis_attempt_id,
                 "schema_version": "1.3",
                 "summary": {
                     "player_role": role,
@@ -3140,7 +3731,7 @@ def run_analysis(self, job_id: str):
                 ),
             )
 
-        update_job(db, job_id, finalize_job)
+        update_current_attempt(db, job_id, finalize_job)
 
         try:
             job_after = reload_job(db, job_id)
@@ -3148,13 +3739,28 @@ def run_analysis(self, job_id: str):
                 is_done_step = (job_after.progress or {}).get("step") == "DONE"
                 is_ready_status = job_after.status in {"DONE", "COMPLETED", "PARTIAL"}
                 if is_done_step or is_ready_status:
-                    generate_report.delay(job_id)
+                    _validate_task_analysis_attempt(
+                        job_after.target if isinstance(job_after.target, dict) else {},
+                        analysis_attempt_id,
+                    )
+                    generate_report.delay(job_id, analysis_attempt_id)
         except Exception:
-            logger.exception("AI report auto-generation enqueue failed job_id=%s", job_id)
+            logger.exception(
+                "AI report auto-generation enqueue failed job_id=%s", job_id
+            )
 
+    except StaleAnalysisAttemptError as exc:
+        # A superseded worker must not mutate, fail, or retry the newer attempt.
+        db.rollback()
+        logger.warning(
+            "run_analysis ignored stale attempt job_id=%s reason=%s",
+            job_id,
+            exc,
+        )
+        return
     except TrackingTimeoutError:
         try:
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -3165,7 +3771,11 @@ def run_analysis(self, job_id: str):
                         "failure_reason",
                         normalize_failure_reason("TRACKING_TIMEOUT"),
                     ),
-                    setattr(job, "warnings", list({*(job.warnings or []), "TRACKING_TIMEOUT"})),
+                    setattr(
+                        job,
+                        "warnings",
+                        list({*(job.warnings or []), "TRACKING_TIMEOUT"}),
+                    ),
                     set_progress(job, "FAILED", 100, "Tracking timeout"),
                 ),
             )
@@ -3174,7 +3784,7 @@ def run_analysis(self, job_id: str):
         return
     except AnalysisError as e:
         try:
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -3192,10 +3802,10 @@ def run_analysis(self, job_id: str):
             db.rollback()
         return
     except Exception as e:
+        if self.request.retries < max_retries:
+            raise self.retry(exc=e, countdown=10 * (2**self.request.retries))
         try:
-            if self.request.retries < max_retries:
-                raise self.retry(exc=e, countdown=10 * (2 ** self.request.retries))
-            update_job(
+            update_current_attempt(
                 db,
                 job_id,
                 lambda job: (
@@ -3204,6 +3814,8 @@ def run_analysis(self, job_id: str):
                     set_progress(job, "FAILED", 100, f"Failed: {str(e)}"),
                 ),
             )
+        except StaleAnalysisAttemptError:
+            db.rollback()
         except Exception:
             db.rollback()
         return

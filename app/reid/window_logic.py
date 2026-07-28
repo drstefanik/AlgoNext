@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Sequence
+import os
+from typing import Any, Callable, Mapping, Sequence
 
 BBox = Mapping[str, Any]
 Detection = Mapping[str, Any]
@@ -29,9 +30,11 @@ def bbox_iou(first: BBox, second: BBox) -> float:
     inter_x2 = min(ax2, bx2)
     inter_y2 = min(ay2, by2)
     intersection = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
-    union = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1) + max(
-        0.0, bx2 - bx1
-    ) * max(0.0, by2 - by1) - intersection
+    union = (
+        max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        + max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        - intersection
+    )
     return intersection / union if union > 0 else 0.0
 
 
@@ -226,3 +229,211 @@ def largest_tracking_gap_sec(
     )
     gaps.append(max(0.0, float(duration_sec) - times[-1]))
     return max(gaps, default=0.0)
+
+
+def autonomous_tracking_evidence(
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    fps: float,
+    require_retained_chain: bool = False,
+) -> dict[str, Any]:
+    """Measure evidence outside the union of all manual-anchor windows."""
+
+    anchor_windows = [
+        (
+            float(segment.get("window_start") or 0.0),
+            float(segment.get("window_end") or 0.0),
+        )
+        for segment in segments
+        if str(segment.get("direction") or "").lower() == "anchor"
+    ]
+    boundary_tolerance = max(1e-6, 1.0 / max(1e-9, float(fps)))
+    try:
+        minimum_samples = int(os.environ.get("PLAYER_REID_MIN_AUTONOMOUS_SAMPLES", "2"))
+    except (TypeError, ValueError):
+        minimum_samples = 2
+    minimum_samples = max(2, min(20, minimum_samples))
+    empty = {
+        "proven": False,
+        "segments_with_player": 0,
+        "bboxes_count": 0,
+        "minimum_samples": minimum_samples,
+        "boundary_tolerance_sec": round(boundary_tolerance, 6),
+        "segment_counts": {},
+        "anchor_windows": anchor_windows,
+    }
+    if not anchor_windows:
+        return empty
+
+    retained_chain_indices: set[int] | None = None
+    if require_retained_chain:
+        retained_chain_indices = retained_autonomous_chain_indices(segments)
+
+    unique_times: set[float] = set()
+    segment_counts: dict[int, int] = {}
+    for index, segment in enumerate(segments):
+        if (
+            str(segment.get("direction") or "").lower() == "anchor"
+            or str(segment.get("identity_status") or "").upper() != "ACCEPTED"
+            or (
+                retained_chain_indices is not None
+                and index not in retained_chain_indices
+            )
+        ):
+            continue
+        outside_times: set[float] = set()
+        for bbox in segment.get("bboxes") or []:
+            if not isinstance(bbox, Mapping) or bbox.get("t") is None:
+                continue
+            try:
+                timestamp = float(bbox["t"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(timestamp):
+                continue
+            if all(
+                timestamp < start - boundary_tolerance
+                or timestamp > end + boundary_tolerance
+                for start, end in anchor_windows
+            ):
+                outside_times.add(round(timestamp, 6))
+        if outside_times:
+            segment_counts[index] = len(outside_times)
+            unique_times.update(outside_times)
+    return {
+        **empty,
+        "proven": len(unique_times) >= minimum_samples,
+        "segments_with_player": len(segment_counts),
+        "bboxes_count": len(unique_times),
+        "segment_counts": segment_counts,
+    }
+
+
+def retained_autonomous_chain_indices(
+    segments: Sequence[Mapping[str, Any]],
+) -> set[int]:
+    """Return guarded links still connected to a retained manual anchor."""
+
+    def retained(segment: Mapping[str, Any]) -> bool:
+        reid = segment.get("reid") if isinstance(segment.get("reid"), Mapping) else {}
+        identity_status = str(
+            reid.get("status") or segment.get("identity_status") or ""
+        ).upper()
+        return bool(segment.get("bboxes")) and identity_status == "ACCEPTED"
+
+    explicit_graph = any(
+        "window_index" in segment or "parent_window_index" in segment
+        for segment in segments
+    )
+    if explicit_graph:
+        return _explicit_retained_autonomous_chain_indices(segments, retained)
+
+    reachable: set[int] = set()
+    orders = {
+        "forward": range(len(segments)),
+        "backward": range(len(segments) - 1, -1, -1),
+    }
+    for processing_direction, indices in orders.items():
+        chain_retained = False
+        for index in indices:
+            segment = segments[index]
+            direction = str(segment.get("direction") or "").lower()
+            explicit_processing_direction = str(
+                segment.get("processing_direction") or ""
+            ).lower()
+
+            if direction == "anchor":
+                if explicit_processing_direction not in {
+                    "",
+                    "anchor",
+                    processing_direction,
+                }:
+                    continue
+                chain_retained = retained(segment)
+                continue
+
+            effective_direction = explicit_processing_direction or direction
+            if effective_direction != processing_direction:
+                continue
+            if not retained(segment):
+                chain_retained = False
+                continue
+            if chain_retained:
+                reachable.add(index)
+
+    return reachable
+
+
+def _explicit_retained_autonomous_chain_indices(
+    segments: Sequence[Mapping[str, Any]],
+    retained: Callable[[Mapping[str, Any]], bool],
+) -> set[int]:
+    """Traverse production parent links; malformed explicit graphs fail closed."""
+
+    segment_by_window: dict[int, int] = {}
+    duplicate_windows: set[int] = set()
+    for segment_index, segment in enumerate(segments):
+        try:
+            window_index = int(segment["window_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if window_index in duplicate_windows:
+            continue
+        if window_index in segment_by_window:
+            segment_by_window.pop(window_index, None)
+            duplicate_windows.add(window_index)
+            continue
+        segment_by_window[window_index] = segment_index
+
+    reachable: set[int] = set()
+    for segment_index, segment in enumerate(segments):
+        direction = str(segment.get("direction") or "").lower()
+        if direction == "anchor" or not retained(segment):
+            continue
+        processing_direction = str(
+            segment.get("processing_direction") or direction
+        ).lower()
+        if processing_direction not in {"forward", "backward"}:
+            continue
+
+        current_index = segment_index
+        visited: set[int] = set()
+        while current_index not in visited:
+            visited.add(current_index)
+            current = segments[current_index]
+            current_direction = str(current.get("direction") or "").lower()
+            if not retained(current):
+                break
+            if current_direction == "anchor":
+                anchor_processing_direction = str(
+                    current.get("processing_direction") or ""
+                ).lower()
+                if anchor_processing_direction in {
+                    "",
+                    "anchor",
+                    processing_direction,
+                }:
+                    reachable.add(segment_index)
+                break
+
+            current_processing_direction = str(
+                current.get("processing_direction") or current_direction
+            ).lower()
+            if current_processing_direction != processing_direction:
+                break
+            try:
+                current_window_index = int(current["window_index"])
+                parent_window_index = int(current["parent_window_index"])
+            except (KeyError, TypeError, ValueError):
+                break
+            expected_parent = current_window_index + (
+                -1 if processing_direction == "forward" else 1
+            )
+            if parent_window_index != expected_parent:
+                break
+            parent_index = segment_by_window.get(parent_window_index)
+            if parent_index is None:
+                break
+            current_index = parent_index
+
+    return reachable

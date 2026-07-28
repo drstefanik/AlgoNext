@@ -1,6 +1,7 @@
 import unittest
 
 from app.reid.window_logic import (
+    autonomous_tracking_evidence,
     choose_descriptor_detections,
     geometry_similarity,
     largest_tracking_gap_sec,
@@ -92,6 +93,96 @@ class ReIDWindowLogicTests(unittest.TestCase):
             largest_tracking_gap_sec(segments, duration_sec=10.0),
             6.0,
         )
+
+    def test_guarded_autonomous_chain_stops_at_abstention(self):
+        accepted = {
+            "identity_status": "ACCEPTED",
+            "reid": {"status": "ACCEPTED"},
+        }
+        segments = [
+            {
+                **accepted,
+                "direction": "anchor",
+                "window_start": 0.0,
+                "window_end": 2.0,
+                "bboxes": [{"t": 1.0}],
+            },
+            {
+                "direction": "forward",
+                "window_start": 1.5,
+                "window_end": 3.5,
+                "identity_status": "ABSTAINED",
+                "reid": {"status": "ABSTAINED"},
+                "bboxes": [],
+            },
+            {
+                **accepted,
+                "direction": "forward",
+                "window_start": 3.0,
+                "window_end": 5.0,
+                "bboxes": [{"t": 4.0}, {"t": 4.5}],
+            },
+        ]
+
+        evidence = autonomous_tracking_evidence(
+            segments,
+            fps=4.0,
+            require_retained_chain=True,
+        )
+
+        self.assertFalse(evidence["proven"])
+        self.assertEqual(evidence["segments_with_player"], 0)
+        self.assertEqual(evidence["bboxes_count"], 0)
+        self.assertEqual(evidence["segment_counts"], {})
+
+    def test_later_manual_anchor_reseeds_guarded_autonomous_chain(self):
+        accepted = {
+            "identity_status": "ACCEPTED",
+            "reid": {"status": "ACCEPTED"},
+        }
+        segments = [
+            {
+                **accepted,
+                "direction": "anchor",
+                "window_start": 0.0,
+                "window_end": 2.0,
+                "bboxes": [{"t": 1.0}],
+            },
+            {
+                "direction": "forward",
+                "window_start": 1.5,
+                "window_end": 3.5,
+                "identity_status": "ABSTAINED",
+                "reid": {"status": "ABSTAINED"},
+                "bboxes": [],
+            },
+            {
+                **accepted,
+                "direction": "anchor",
+                "processing_direction": "forward",
+                "window_start": 3.0,
+                "window_end": 5.0,
+                "bboxes": [{"t": 4.0}],
+            },
+            {
+                **accepted,
+                "direction": "forward",
+                "window_start": 4.5,
+                "window_end": 6.5,
+                "bboxes": [{"t": 5.5}, {"t": 6.0}],
+            },
+        ]
+
+        evidence = autonomous_tracking_evidence(
+            segments,
+            fps=4.0,
+            require_retained_chain=True,
+        )
+
+        self.assertTrue(evidence["proven"])
+        self.assertEqual(evidence["segments_with_player"], 1)
+        self.assertEqual(evidence["bboxes_count"], 2)
+        self.assertEqual(evidence["segment_counts"], {3: 2})
 
 
 if __name__ == "__main__":

@@ -138,7 +138,20 @@ class PickPlayerFlowTests(unittest.TestCase):
         self.assertNotIn("tracking_quality_index", self.job.result)
         self.assertNotIn("report", self.job.result)
         self.assertEqual(self.job.progress["pct"], 14)
-        self.assertEqual(self.job.target["tracking"], {"status": "PENDING"})
+        selection_revision = self.job.target["analysis_attempt_id"]
+        self.assertEqual(self.job.target["tracking"]["status"], "PENDING")
+        self.assertEqual(
+            self.job.target["tracking"]["analysis_attempt_id"],
+            selection_revision,
+        )
+        self.assertEqual(
+            self.job.progress["analysis_attempt_id"],
+            selection_revision,
+        )
+        self.assertEqual(
+            self.job.result["analysis_attempt_id"],
+            selection_revision,
+        )
 
     def test_confirm_target_valid(self):
         self.job.player_ref = {"track_id": 9}

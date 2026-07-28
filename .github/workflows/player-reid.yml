@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - "app/reid/**"
+      - "app/core/preview_asset_policy.py"
+      - "app/workers/pipeline.py"
+      - "app/workers/tracking.py"
       - "docker-compose.yml"
       - "tests/test_reid_appearance.py"
       - "tests/test_reid_association.py"
@@ -11,13 +14,20 @@ on:
       - "tests/test_reid_team_color_guard.py"
       - "tests/test_reid_window_logic.py"
       - "tests/test_reid_runtime.py"
+      - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_windowed_tracking.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_preview_asset_policy.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - ".github/workflows/player-reid.yml"
   push:
     branches:
       - main
     paths:
       - "app/reid/**"
+      - "app/core/preview_asset_policy.py"
+      - "app/workers/pipeline.py"
+      - "app/workers/tracking.py"
       - "docker-compose.yml"
       - "tests/test_reid_appearance.py"
       - "tests/test_reid_association.py"
@@ -25,7 +35,11 @@ on:
       - "tests/test_reid_team_color_guard.py"
       - "tests/test_reid_window_logic.py"
       - "tests/test_reid_runtime.py"
+      - "tests/test_reid_progress_reporting.py"
       - "tests/test_reid_windowed_tracking.py"
+      - "tests/test_analysis_attempt_pipeline.py"
+      - "tests/test_preview_asset_policy.py"
+      - "tests/test_tracking_attempt_fencing.py"
       - ".github/workflows/player-reid.yml"
 
 permissions:
@@ -60,15 +74,23 @@ jobs:
           app/reid/team_color_guard.py
           app/reid/window_logic.py
           app/reid/full_match_runtime.py
+          app/reid/progress_reporting.py
           app/reid/runtime.py
           app/reid/windowed_tracking.py
+          app/core/preview_asset_policy.py
+          app/workers/pipeline.py
+          app/workers/tracking.py
           tests/test_reid_appearance.py
           tests/test_reid_association.py
           tests/test_reid_benchmark_evidence.py
           tests/test_reid_team_color_guard.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
+          tests/test_reid_progress_reporting.py
           tests/test_reid_windowed_tracking.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_preview_asset_policy.py
+          tests/test_tracking_attempt_fencing.py
 
       - name: Run ReID foundation and activation tests
         run: >-
@@ -79,7 +101,11 @@ jobs:
           tests/test_reid_team_color_guard.py
           tests/test_reid_window_logic.py
           tests/test_reid_runtime.py
+          tests/test_reid_progress_reporting.py
           tests/test_reid_windowed_tracking.py
+          tests/test_analysis_attempt_pipeline.py
+          tests/test_preview_asset_policy.py
+          tests/test_tracking_attempt_fencing.py
 
       - name: Validate Compose kill-switch configuration
         run: |

@@ -5,12 +5,15 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.analysis_attempt_precondition import require_analysis_attempt
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 
 router = APIRouter()
+ACTIVE_ANALYSIS_STATUSES = frozenset({"QUEUED", "RUNNING", "PROCESSING"})
 
 
 class PlayerProfilePayload(BaseModel):
@@ -65,6 +68,44 @@ def _has_visual_selection(player_ref: object) -> bool:
     return isinstance(sample_frames, list) and len(sample_frames) > 0
 
 
+def _load_job_for_update(db: Session, job_id: str) -> AnalysisJob | None:
+    execute = getattr(db, "execute", None)
+    if callable(execute):
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execute(statement).scalar_one_or_none()
+    try:
+        return db.get(AnalysisJob, job_id, populate_existing=True)
+    except TypeError:
+        return db.get(AnalysisJob, job_id)
+
+
+def _analysis_attempt_id(job: AnalysisJob) -> str | None:
+    target = job.target if isinstance(job.target, dict) else {}
+    return str(target.get("analysis_attempt_id") or "").strip() or None
+
+
+def _reject_active_analysis(job: AnalysisJob) -> None:
+    status = str(job.status or "").upper()
+    if status not in ACTIVE_ANALYSIS_STATUSES:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "ANALYSIS_IN_PROGRESS",
+            "message": "Player details cannot change during an active analysis.",
+            "details": {
+                "status": status,
+                "analysis_attempt_id": _analysis_attempt_id(job),
+            },
+        },
+    )
+
+
 @router.post("/jobs/{job_id}/player-profile")
 def save_player_profile(
     job_id: str,
@@ -78,12 +119,18 @@ def save_player_profile(
     and shirt number are optional labels and never auto-select a candidate.
     """
 
-    job = db.get(AnalysisJob, job_id)
+    job = _load_job_for_update(db, job_id)
     if not job:
         raise HTTPException(
             status_code=404,
             detail={"code": "JOB_NOT_FOUND", "message": "Job not found"},
         )
+    require_analysis_attempt(
+        job,
+        request,
+        mutation="player-profile",
+    )
+    _reject_active_analysis(job)
     if not _has_visual_selection(job.player_ref):
         raise HTTPException(
             status_code=409,

@@ -26,9 +26,7 @@ class ReIDBenchmarkEvidenceTests(unittest.TestCase):
             }
             for index in range(5)
         ]
-        with patch.dict(
-            os.environ, {"PLAYER_REID_BENCHMARK_EVIDENCE_SAMPLES": "3"}
-        ):
+        with patch.dict(os.environ, {"PLAYER_REID_BENCHMARK_EVIDENCE_SAMPLES": "3"}):
             evidence = candidate_evidence(detections, window_start=10.0, fps=2.0)
 
         self.assertEqual(len(evidence), 3)
@@ -103,6 +101,57 @@ class ReIDBenchmarkEvidenceTests(unittest.TestCase):
         self.assertTrue(wrapped.accepted)
         self.assertEqual(payload["selected_candidate_id"], "7")
         self.assertEqual(payload["candidates"][0]["evidence"][0]["time_sec"], 21.0)
+
+    def test_empty_scoped_tracklet_does_not_reopen_raw_id_evidence(self):
+        descriptor = AppearanceDescriptor(
+            vector=(1.0, 0.0), sample_count=3, quality=0.9
+        )
+
+        def build(_segment, _track_map, **_kwargs):
+            return (
+                [
+                    CandidateProfile(
+                        candidate_id="7",
+                        descriptor=None,
+                        detection_count=0,
+                        metadata={
+                            "local_track_id": 7,
+                            "tracklet_sample_indices": (),
+                            "tracklet_detections": (),
+                        },
+                    )
+                ],
+                {"7": 7},
+                {"7": descriptor},
+            )
+
+        module = SimpleNamespace(
+            _build_candidate_profiles=build,
+            associate_identity=lambda *_args, **_kwargs: None,
+        )
+        self.assertTrue(install_candidate_evidence(module))
+        profiles, _, _ = module._build_candidate_profiles(
+            None,
+            {
+                7: [
+                    {
+                        "t": 1.0,
+                        "sample_index": 0,
+                        "conf": 0.9,
+                        "bbox": {
+                            "x": 0.2,
+                            "y": 0.2,
+                            "w": 0.1,
+                            "h": 0.2,
+                        },
+                    }
+                ]
+            },
+            window_start=20.0,
+            fps=1,
+        )
+
+        self.assertEqual(profiles[0].metadata["benchmark_evidence"], [])
 
 
 if __name__ == "__main__":

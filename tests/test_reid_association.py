@@ -81,6 +81,132 @@ class ReIdAssociationTests(unittest.TestCase):
             decision.reason_codes,
         )
 
+    def test_unique_strong_overlap_resolves_a_tiny_appearance_margin(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-overlap",
+                    descriptor([0.99, 0.12, 0.0, 0.0]),
+                    overlap_score=0.78,
+                    geometry_score=0.60,
+                    metadata={"strong_overlap_unique": True},
+                ),
+                CandidateProfile(
+                    "track-lookalike",
+                    descriptor([0.98, 0.15, 0.0, 0.0]),
+                    overlap_score=0.64,
+                    geometry_score=0.60,
+                ),
+            ],
+            thresholds=AssociationThresholds(
+                require_strong_overlap=True,
+            ),
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.selected_candidate_id, "track-overlap")
+        self.assertLess(decision.margin, 0.07)
+        self.assertIn("STRONG_TEMPORAL_OVERLAP", decision.reason_codes)
+
+    def test_unverified_unique_overlap_does_not_bypass_margin(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-overlap",
+                    descriptor([0.99, 0.12, 0.0, 0.0]),
+                    overlap_score=0.78,
+                    geometry_score=0.60,
+                ),
+                CandidateProfile(
+                    "track-lookalike",
+                    descriptor([0.98, 0.15, 0.0, 0.0]),
+                    overlap_score=0.64,
+                    geometry_score=0.60,
+                ),
+            ],
+            thresholds=AssociationThresholds(
+                require_strong_overlap=True,
+            ),
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn("AMBIGUOUS_CANDIDATE_MARGIN", decision.reason_codes)
+
+    def test_two_strong_overlap_candidates_keep_the_margin_gate(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-6",
+                    descriptor([0.99, 0.12, 0.0, 0.0]),
+                    overlap_score=0.78,
+                    geometry_score=0.60,
+                ),
+                CandidateProfile(
+                    "track-8",
+                    descriptor([0.98, 0.15, 0.0, 0.0]),
+                    overlap_score=0.76,
+                    geometry_score=0.60,
+                ),
+            ],
+            thresholds=AssociationThresholds(
+                require_strong_overlap=True,
+            ),
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn("AMBIGUOUS_CANDIDATE_MARGIN", decision.reason_codes)
+
+    def test_non_unique_strong_overlap_abstains_even_with_large_appearance_margin(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-6",
+                    descriptor([0.99, 0.12, 0.0, 0.0]),
+                    overlap_score=0.78,
+                    geometry_score=0.80,
+                    metadata={"strong_overlap_unique": False},
+                ),
+                CandidateProfile(
+                    "track-8",
+                    descriptor([0.50, 0.86, 0.0, 0.0]),
+                    overlap_score=0.70,
+                    geometry_score=0.75,
+                    metadata={"strong_overlap_unique": False},
+                ),
+            ],
+            thresholds=AssociationThresholds(
+                require_strong_overlap=True,
+            ),
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn("AMBIGUOUS_STRONG_OVERLAP", decision.reason_codes)
+
+    def test_appearance_only_candidate_abstains_when_overlap_is_required(self):
+        decision = associate_identity(
+            self.identity,
+            [
+                CandidateProfile(
+                    "track-lookalike",
+                    descriptor([0.99, 0.12, 0.0, 0.0]),
+                    geometry_score=0.90,
+                )
+            ],
+            thresholds=AssociationThresholds(
+                require_strong_overlap=True,
+            ),
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            "STRONG_TEMPORAL_OVERLAP_REQUIRED",
+            decision.reason_codes,
+        )
+
     def test_missing_appearance_never_accepts_geometry_alone(self):
         decision = associate_identity(
             self.identity,

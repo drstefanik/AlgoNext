@@ -134,6 +134,7 @@ class AssociationThresholds:
     min_margin: float = 0.07
     min_descriptor_quality: float = 0.30
     min_descriptor_samples: int = 2
+    require_strong_overlap: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -149,6 +150,8 @@ class AssociationThresholds:
             object.__setattr__(self, field_name, value)
         if self.min_descriptor_samples < 1:
             raise ValueError("min_descriptor_samples must be >= 1")
+        if not isinstance(self.require_strong_overlap, bool):
+            raise ValueError("require_strong_overlap must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -172,9 +175,7 @@ class CandidateScore:
                 else None
             ),
             "overlap_score": (
-                round(self.overlap_score, 6)
-                if self.overlap_score is not None
-                else None
+                round(self.overlap_score, 6) if self.overlap_score is not None else None
             ),
             "geometry_score": (
                 round(self.geometry_score, 6)
@@ -318,6 +319,11 @@ def _score_candidate(
             reasons.append("LOW_APPEARANCE_SIMILARITY")
     if combined < thresholds.min_combined_score:
         reasons.append("LOW_COMBINED_SCORE")
+    if (
+        thresholds.require_strong_overlap
+        and (candidate.overlap_score or 0.0) < thresholds.strong_overlap_score
+    ):
+        reasons.append("STRONG_TEMPORAL_OVERLAP_REQUIRED")
 
     return CandidateScore(
         candidate_id=candidate.candidate_id,
@@ -338,11 +344,15 @@ def associate_identity(
     thresholds: AssociationThresholds | None = None,
 ) -> AssociationDecision:
     thresholds = thresholds or AssociationThresholds()
+    candidate_profiles = tuple(candidates)
+    profiles_by_id = {
+        candidate.candidate_id: candidate for candidate in candidate_profiles
+    }
     scored = tuple(
         sorted(
             (
                 _score_candidate(identity, candidate, thresholds)
-                for candidate in candidates
+                for candidate in candidate_profiles
             ),
             key=lambda candidate: (
                 candidate.combined_score,
@@ -363,10 +373,29 @@ def associate_identity(
         )
 
     best = scored[0]
+    best_profile = profiles_by_id.get(best.candidate_id)
+    best_metadata = (
+        dict(best_profile.metadata or {}) if best_profile is not None else {}
+    )
     runner_up_score = scored[1].combined_score if len(scored) > 1 else 0.0
     margin = max(0.0, best.combined_score - runner_up_score)
     reasons = list(best.reason_codes)
-    if len(scored) > 1 and margin < thresholds.min_margin:
+    unique_strong_overlap = bool(
+        thresholds.require_strong_overlap
+        and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
+        and best_metadata.get("strong_overlap_unique") is True
+        and all(
+            (candidate.overlap_score or 0.0) < thresholds.strong_overlap_score
+            for candidate in scored[1:]
+        )
+    )
+    if (
+        thresholds.require_strong_overlap
+        and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
+        and best_metadata.get("strong_overlap_unique") is not True
+    ):
+        reasons.append("AMBIGUOUS_STRONG_OVERLAP")
+    if len(scored) > 1 and margin < thresholds.min_margin and not unique_strong_overlap:
         reasons.append("AMBIGUOUS_CANDIDATE_MARGIN")
 
     hard_failures = {
@@ -376,6 +405,8 @@ def associate_identity(
         "INSUFFICIENT_DESCRIPTOR_SAMPLES",
         "LOW_APPEARANCE_SIMILARITY",
         "LOW_COMBINED_SCORE",
+        "STRONG_TEMPORAL_OVERLAP_REQUIRED",
+        "AMBIGUOUS_STRONG_OVERLAP",
         "AMBIGUOUS_CANDIDATE_MARGIN",
     }
     accepted = not hard_failures.intersection(reasons)
@@ -385,7 +416,14 @@ def associate_identity(
             selected_candidate_id=best.candidate_id,
             best_score=best.combined_score,
             margin=margin,
-            reason_codes=("ASSOCIATION_ACCEPTED",),
+            reason_codes=(
+                (
+                    "ASSOCIATION_ACCEPTED",
+                    "STRONG_TEMPORAL_OVERLAP",
+                )
+                if unique_strong_overlap
+                else ("ASSOCIATION_ACCEPTED",)
+            ),
             candidates=scored,
         )
     return AssociationDecision(

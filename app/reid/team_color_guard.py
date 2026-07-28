@@ -12,6 +12,12 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 import numpy as np
 
+from app.core.tracking_outcome import StaleAnalysisAttemptError
+from app.reid.window_logic import (
+    autonomous_tracking_evidence,
+    retained_autonomous_chain_indices,
+)
+
 logger = logging.getLogger(__name__)
 
 GUARD_VERSION = "kit-color-guard-v1"
@@ -220,9 +226,41 @@ def signatures_compatible(
     )
     if anchor.confidence < confidence_gate or observed.confidence < confidence_gate:
         return None
+    similarity = signature_similarity(anchor, observed)
     if anchor.dominant_family != observed.dominant_family:
+        # A two-tone jersey can briefly flip the argmax when the printed number
+        # or grass contamination occupies the centre of a small tracked crop.
+        # Treat only a very-high-similarity, near-tied distribution as unknown;
+        # it still cannot satisfy the minimum compatible-sample count.
+        anchor_family_index = COLOR_FAMILIES.index(anchor.dominant_family)
+        anchor_family_share = observed.distribution[anchor_family_index]
+        dominant_share = max(observed.distribution)
+        mixed_similarity_gate = _env_float(
+            "PLAYER_REID_TEAM_COLOR_MIXED_MIN_SIMILARITY",
+            0.90,
+            0.0,
+            1.0,
+        )
+        mixed_anchor_share_gate = _env_float(
+            "PLAYER_REID_TEAM_COLOR_MIXED_MIN_ANCHOR_SHARE",
+            0.35,
+            0.0,
+            1.0,
+        )
+        mixed_dominant_gap_gate = _env_float(
+            "PLAYER_REID_TEAM_COLOR_MIXED_MAX_DOMINANT_GAP",
+            0.20,
+            0.0,
+            1.0,
+        )
+        if (
+            similarity >= mixed_similarity_gate
+            and anchor_family_share >= mixed_anchor_share_gate
+            and dominant_share - anchor_family_share <= mixed_dominant_gap_gate
+        ):
+            return None
         return False
-    return signature_similarity(anchor, observed) >= similarity_gate
+    return similarity >= similarity_gate
 
 
 class _VideoReader:
@@ -656,10 +694,18 @@ def _select_guard_anchor(
     conflicts: list[dict[str, Any]] = []
     for left_index, left in enumerate(usable):
         for right in usable[left_index + 1 :]:
-            compatible = signatures_compatible(
-                left["signature"],
-                right["signature"],
-                minimum_confidence=confidence_gate,
+            # Mixed-family tolerance is observation-only. Two explicit manual
+            # anchors with different high-confidence dominant kit families are
+            # an identity conflict even when both distributions are near-tied.
+            compatible = (
+                False
+                if left["signature"].dominant_family
+                != right["signature"].dominant_family
+                else signatures_compatible(
+                    left["signature"],
+                    right["signature"],
+                    minimum_confidence=confidence_gate,
+                )
             )
             if compatible is False:
                 conflicts.append(
@@ -855,6 +901,7 @@ def _abstain_segment(
             "reason_codes": reasons,
             "kit_color_guard": dict(guard),
             "pre_guard_selected_candidate_id": original_candidate,
+            "autonomous_bboxes_count": 0,
         }
     )
     updated.update(
@@ -1002,7 +1049,11 @@ def apply_team_color_guard(
                     anchor_times=anchor_times,
                 )
                 decisions.append({"window_index": index, **segment_guard})
-                if not segment_guard["passed"]:
+                if segment_guard["passed"]:
+                    reid_payload = dict(segments[index].get("reid") or {})
+                    reid_payload["kit_color_guard"] = segment_guard
+                    segments[index]["reid"] = reid_payload
+                else:
                     segments[index] = _abstain_segment(
                         segments[index], segment_guard, "KIT_COLOR_GUARD_REJECTED"
                     )
@@ -1030,11 +1081,62 @@ def apply_team_color_guard(
                         segments[index], guard, "ANCHOR_TRACK_COLOR_UNVERIFIED"
                     )
 
+        retained_autonomous_indices = retained_autonomous_chain_indices(segments)
+        for index, segment in enumerate(segments):
+            if (
+                str(segment.get("direction") or "").lower() == "anchor"
+                or str(segment.get("identity_status") or "").upper() != "ACCEPTED"
+                or not segment.get("bboxes")
+                or index in retained_autonomous_indices
+            ):
+                continue
+            reid_payload = (
+                segment.get("reid") if isinstance(segment.get("reid"), Mapping) else {}
+            )
+            segment_guard = (
+                reid_payload.get("kit_color_guard")
+                if isinstance(reid_payload.get("kit_color_guard"), Mapping)
+                else {
+                    "version": GUARD_VERSION,
+                    "passed": False,
+                    "reason_codes": ["REID_PARENT_CHAIN_BROKEN"],
+                    "evidence": [],
+                }
+            )
+            segments[index] = _abstain_segment(
+                segment,
+                segment_guard,
+                "REID_PARENT_CHAIN_BROKEN",
+            )
+
         duration = max(
             [float(segment.get("window_end") or 0.0) for segment in segments] or [0.0]
         )
         fps = float(output.get("fps") or 1.0)
         segments_with_player = sum(1 for segment in segments if segment.get("bboxes"))
+        autonomous_evidence = autonomous_tracking_evidence(
+            segments,
+            fps=fps,
+            require_retained_chain=True,
+        )
+        autonomous_segments_with_player = int(
+            autonomous_evidence["segments_with_player"]
+        )
+        autonomous_bboxes_count = int(autonomous_evidence["bboxes_count"])
+        autonomous_identity_proven = bool(autonomous_evidence["proven"])
+        for segment in segments:
+            reid_payload = dict(segment.get("reid") or {})
+            reid_payload["autonomous_bboxes_count"] = 0
+            segment["reid"] = reid_payload
+        for segment_index, count in autonomous_evidence["segment_counts"].items():
+            reid_payload = dict(segments[segment_index].get("reid") or {})
+            reid_payload["autonomous_bboxes_count"] = int(count)
+            segments[segment_index]["reid"] = reid_payload
+        tracking_scope_status = (
+            "CROSS_WINDOW_EVIDENCE"
+            if autonomous_identity_proven
+            else "ANCHOR_ONLY" if segments_with_player > 0 else "EMPTY"
+        )
         coverage = _coverage_pct(segments, duration, fps)
         largest_gap = _largest_gap(segments, duration)
 
@@ -1060,28 +1162,70 @@ def apply_team_color_guard(
             "decisions": decisions,
         }
         summary["status"] = (
-            "ANCHOR_REJECTED" if anchor_failed else "EXPERIMENTAL_GUARDED"
+            "ANCHOR_REJECTED"
+            if anchor_failed
+            else (
+                "ANCHOR_ONLY"
+                if not autonomous_identity_proven
+                else "EXPERIMENTAL_GUARDED"
+            )
         )
         summary["validated"] = False
+        summary["autonomous_segments_with_player"] = autonomous_segments_with_player
+        summary["autonomous_bboxes_count"] = autonomous_bboxes_count
+        summary["tracking_scope_status"] = tracking_scope_status
+        summary["autonomous_minimum_samples"] = int(
+            autonomous_evidence["minimum_samples"]
+        )
         summary["reason_codes"] = list(
             dict.fromkeys([*(summary.get("reason_codes") or []), *reason_codes])
         )
-        tracking_failed = bool(anchor_failed or segments_with_player == 0)
+        if not autonomous_identity_proven:
+            summary["reason_codes"] = list(
+                dict.fromkeys(
+                    [
+                        *(summary.get("reason_codes") or []),
+                        "AUTONOMOUS_REID_NOT_PROVEN",
+                    ]
+                )
+            )
+        tracking_failed = bool(
+            anchor_failed or segments_with_player == 0 or not autonomous_identity_proven
+        )
 
         guarded.update(
             {
                 "identity_mode": "appearance_reid_v1+kit_color_guard_v1",
                 "segments": segments,
                 "segments_with_player": segments_with_player,
+                "autonomous_segments_with_player": (autonomous_segments_with_player),
+                "autonomous_bboxes_count": autonomous_bboxes_count,
+                "tracking_scope_status": tracking_scope_status,
                 "coverage_pct_total": round(coverage, 2),
                 "coverage_pct": round(coverage, 2),
                 "largest_gap_sec": (None if tracking_failed else round(largest_gap, 2)),
                 "tracking_success": not tracking_failed,
+                "partial": bool(not tracking_failed and coverage < 5.0),
+                "partial_reason": (
+                    "SPARSE_CROSS_WINDOW_EVIDENCE"
+                    if not tracking_failed and coverage < 5.0
+                    else None
+                ),
                 "tracking_status": (
                     "ANCHOR_REJECTED"
                     if anchor_failed
                     else (
-                        "NO_PLAYER_TRACK" if segments_with_player == 0 else "SUCCEEDED"
+                        "NO_PLAYER_TRACK"
+                        if segments_with_player == 0
+                        else (
+                            "ANCHOR_ONLY"
+                            if not autonomous_identity_proven
+                            else (
+                                "SPARSE_CROSS_WINDOW_EVIDENCE"
+                                if coverage < 5.0
+                                else "SUCCEEDED"
+                            )
+                        )
                     )
                 ),
                 "action_required": ("RESELECT_PLAYER" if tracking_failed else None),
@@ -1098,33 +1242,275 @@ def apply_team_color_guard(
             owned_reader.close()
 
 
-def _repersist_guarded_output(output: dict[str, Any], job_id: str) -> dict[str, Any]:
+def _team_color_guard_failure_output(
+    output: Any,
+    *,
+    status: str,
+    reason_code: str,
+    action_required: str = "RETRY_ANALYSIS",
+    preserve_source_reasons: bool = False,
+) -> dict[str, Any]:
+    source = dict(output) if isinstance(output, Mapping) else {}
+
+    raw_segments = source.get("segments")
+    segments: list[dict[str, Any]] = []
+    if isinstance(raw_segments, list):
+        for raw in raw_segments:
+            segment_source = dict(raw) if isinstance(raw, Mapping) else {}
+            source_reid = (
+                segment_source.get("reid")
+                if isinstance(segment_source.get("reid"), Mapping)
+                else {}
+            )
+            segment = {
+                key: segment_source[key]
+                for key in (
+                    "window_index",
+                    "parent_window_index",
+                    "window_start",
+                    "window_end",
+                    "direction",
+                    "processing_direction",
+                    "sample_fps",
+                )
+                if key in segment_source
+            }
+            segment.update(
+                {
+                    "selected_track_id": None,
+                    "selected_track_ids": [],
+                    "identity_id": None,
+                    "identity_status": "ABSTAINED",
+                    "reacquire_score": 0.0,
+                    "coverage_pct": 0.0,
+                    "lost_segments": [],
+                    "bboxes": [],
+                    "reid": {
+                        "version": source_reid.get("version"),
+                        "validated": False,
+                        "status": "ABSTAINED",
+                        "identity_id": None,
+                        "selected_candidate_id": None,
+                        "best_score": 0.0,
+                        "margin": 0.0,
+                        "reason_codes": [reason_code],
+                        "candidates": [],
+                        "autonomous_bboxes_count": 0,
+                        "kit_color_guard": {
+                            "version": GUARD_VERSION,
+                            "passed": False,
+                            "reason_codes": [reason_code],
+                            "evidence": [],
+                        },
+                    },
+                }
+            )
+            segments.append(segment)
+
+    guard_status = (
+        "UNVERIFIED_FAILURE_SANITIZED"
+        if reason_code == "TEAM_COLOR_GUARD_UNVERIFIED_FAILURE_OUTPUT"
+        else {
+            "TEAM_COLOR_GUARD_DISABLED": "DISABLED_FAIL_CLOSED",
+            "TEAM_COLOR_GUARD_INPUT_INVALID": "INPUT_INVALID_FAIL_CLOSED",
+        }.get(status, "ERROR_FAIL_CLOSED")
+    )
+    source_summary = (
+        source.get("reid_summary")
+        if isinstance(source.get("reid_summary"), Mapping)
+        else {}
+    )
+    source_reason_codes = (
+        source_summary.get("reason_codes")
+        if isinstance(source_summary.get("reason_codes"), (list, tuple))
+        else []
+    )
+    preserved_reason_codes = [
+        str(item)
+        for item in source_reason_codes
+        if item
+        and "ACCEPTED" not in str(item).upper()
+        and str(item).upper() not in {"SUCCEEDED", "VALIDATED"}
+    ]
+    summary_reason_codes = list(
+        dict.fromkeys(
+            [
+                *(preserved_reason_codes if preserve_source_reasons else []),
+                reason_code,
+            ]
+        )
+    )
+    normalized_action = (
+        action_required
+        if action_required in {"RETRY_ANALYSIS", "RESELECT_PLAYER"}
+        else "RETRY_ANALYSIS"
+    )
+    preserved = {
+        key: source[key]
+        for key in (
+            "mode",
+            "method",
+            "fps",
+            "window_sec",
+            "overlap_sec",
+            "runtime_profile",
+            "windows_processed",
+        )
+        if key in source
+    }
+    return {
+        "mode": preserved.pop("mode", "full_match_windowed"),
+        "identity_mode": "unverified_team_color_guard",
+        **preserved,
+        "segments": segments,
+        "segments_total": len(segments),
+        "segments_with_player": 0,
+        "autonomous_segments_with_player": 0,
+        "autonomous_bboxes_count": 0,
+        "tracking_scope_status": "EMPTY",
+        "coverage_pct": 0.0,
+        "coverage_pct_total": 0.0,
+        "largest_gap_sec": None,
+        "bboxes": [],
+        "bboxes_count": 0,
+        "lost_segments": [],
+        "motion_segments": [],
+        "anchor_reacquisitions": 0,
+        "anchors_total": 0,
+        "anchors_matched": 0,
+        "anchor_matches": [],
+        "anchors_used": {},
+        "anchor_acquisition": {},
+        "tracking_success": False,
+        "partial": False,
+        "partial_reason": None,
+        "tracking_status": status,
+        "action_required": normalized_action,
+        "reid_summary": {
+            "status": status,
+            "validated": False,
+            "reason_codes": summary_reason_codes,
+            "anchors_total": 0,
+            "anchors_matched": 0,
+            "anchor_matches": [],
+            "autonomous_segments_with_player": 0,
+            "autonomous_bboxes_count": 0,
+            "tracking_scope_status": "EMPTY",
+            "team_color_guard": {
+                "version": GUARD_VERSION,
+                "status": guard_status,
+                "validated": False,
+                "reason_codes": [reason_code],
+            },
+        },
+        "notes": (
+            "Selected-player identity output was discarded because the "
+            "team-colour guard could not attest it."
+        ),
+    }
+
+
+def _contains_selected_player_evidence(output: Mapping[str, Any]) -> bool:
+    if output.get("bboxes"):
+        return True
+    for key in (
+        "segments_with_player",
+        "autonomous_segments_with_player",
+        "bboxes_count",
+        "autonomous_bboxes_count",
+        "anchors_matched",
+    ):
+        try:
+            if float(output.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    for key in ("track_id", "selected_track_id", "identity_id"):
+        if output.get(key) is not None:
+            return True
+    if output.get("selected_track_ids"):
+        return True
+    if str(output.get("identity_status") or "").upper() == "ACCEPTED":
+        return True
+    summary = (
+        output.get("reid_summary")
+        if isinstance(output.get("reid_summary"), Mapping)
+        else {}
+    )
+    if any(
+        summary.get(key) is not None
+        for key in ("identity_id", "anchor_local_track_id", "selected_candidate_id")
+    ):
+        return True
+    raw_matches = output.get("anchor_matches")
+    for match in raw_matches if isinstance(raw_matches, list) else []:
+        if not isinstance(match, Mapping):
+            continue
+        if (
+            str(match.get("status") or "").upper() == "MATCHED"
+            or match.get("local_track_id") is not None
+        ):
+            return True
+
+    raw_segments = output.get("segments")
+    if not isinstance(raw_segments, list):
+        return False
+    for raw in raw_segments:
+        if not isinstance(raw, Mapping):
+            continue
+        reid = raw.get("reid") if isinstance(raw.get("reid"), Mapping) else {}
+        if (
+            raw.get("bboxes")
+            or raw.get("selected_track_id") is not None
+            or raw.get("selected_track_ids")
+            or raw.get("identity_id") is not None
+            or str(raw.get("identity_status") or "").upper() == "ACCEPTED"
+            or str(reid.get("status") or "").upper() == "ACCEPTED"
+            or reid.get("selected_candidate_id") is not None
+            or reid.get("pre_guard_selected_candidate_id") is not None
+        ):
+            return True
+    return False
+
+
+def _repersist_guarded_output(
+    output: dict[str, Any],
+    job_id: Any,
+    *,
+    analysis_attempt_id: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in output.items()
+        if key not in {"tracking_key", "tracking_url"}
+    }
     try:
-        from app.reid import windowed_tracking
+        from app.reid.full_match_runtime import persist_canonical_tracking_artifact
         from app.workers import tracking as legacy
 
-        endpoint_url = legacy.S3_ENDPOINT_URL
-        bucket = os.environ.get("S3_BUCKET", "").strip()
-        expires_seconds = int(os.environ.get("SIGNED_URL_EXPIRES_SECONDS", "3600"))
-        if not endpoint_url or not bucket:
-            return output
-        payload = {
-            key: value
-            for key, value in output.items()
-            if key not in {"tracking_key", "tracking_url"}
-        }
-        return windowed_tracking._persist_tracking_output(
-            job_id,
+        return persist_canonical_tracking_artifact(
             payload,
-            endpoint_url=endpoint_url,
-            bucket=bucket,
-            expires_seconds=expires_seconds,
+            job_id=job_id,
+            tracking_module=legacy,
+            analysis_attempt_id=analysis_attempt_id,
         )
+    except StaleAnalysisAttemptError:
+        raise
     except Exception:
         logger.exception(
             "Unable to persist kit-colour-guarded tracking output job_id=%s", job_id
         )
-        return output
+        return payload
+
+
+def _valid_player_reference(value: Any) -> bool:
+    if not isinstance(value, Mapping) or _normalized_bbox(value) is None:
+        return False
+    try:
+        time_sec = float(value.get("t", value.get("best_time_sec")))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(time_sec) and time_sec >= 0.0
 
 
 def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any]:
@@ -1133,17 +1519,71 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
 
     def guarded(*args: Any, **kwargs: Any) -> Any:
         output = implementation(*args, **kwargs)
-        if not team_color_guard_enabled() or not isinstance(output, Mapping):
-            return output
-        if output.get("tracking_success") is False:
-            return output
-        if not isinstance(output.get("segments"), list):
-            return output
-        if len(args) < 3 or not isinstance(args[2], Mapping):
-            logger.warning(
-                "Kit-colour guard skipped because the player reference is unavailable"
+        job_id = args[0] if args else None
+        analysis_attempt_id = (
+            str(kwargs.get("analysis_attempt_id") or "").strip() or None
+        )
+
+        def fail_closed(
+            status: str,
+            reason_code: str,
+            *,
+            action_required: str = "RETRY_ANALYSIS",
+            preserve_source_reasons: bool = False,
+        ) -> dict[str, Any]:
+            corrected = _team_color_guard_failure_output(
+                output,
+                status=status,
+                reason_code=reason_code,
+                action_required=action_required,
+                preserve_source_reasons=preserve_source_reasons,
             )
-            return output
+            return _repersist_guarded_output(
+                corrected,
+                job_id,
+                analysis_attempt_id=analysis_attempt_id,
+            )
+
+        if isinstance(output, Mapping) and output.get("tracking_success") is False:
+            if not _contains_selected_player_evidence(output):
+                return output
+            source_summary = (
+                output.get("reid_summary")
+                if isinstance(output.get("reid_summary"), Mapping)
+                else {}
+            )
+            source_status = str(
+                output.get("tracking_status")
+                or source_summary.get("status")
+                or "TEAM_COLOR_GUARD_OUTPUT_INCONSISTENT"
+            )
+            source_action = str(output.get("action_required") or "RETRY_ANALYSIS")
+            return fail_closed(
+                source_status,
+                "TEAM_COLOR_GUARD_UNVERIFIED_FAILURE_OUTPUT",
+                action_required=source_action,
+                preserve_source_reasons=True,
+            )
+
+        if not team_color_guard_enabled():
+            return fail_closed(
+                "TEAM_COLOR_GUARD_DISABLED",
+                "TEAM_COLOR_GUARD_DISABLED",
+            )
+        if (
+            not isinstance(output, Mapping)
+            or not isinstance(output.get("segments"), list)
+            or len(args) < 3
+            or not _valid_player_reference(args[2])
+        ):
+            logger.warning(
+                "Kit-colour guard input is incomplete; failing selected-player "
+                "tracking closed"
+            )
+            return fail_closed(
+                "TEAM_COLOR_GUARD_INPUT_INVALID",
+                "TEAM_COLOR_GUARD_INPUT_INVALID",
+            )
         try:
             corrected = apply_team_color_guard(
                 output,
@@ -1154,46 +1594,15 @@ def guard_windowed_reid(implementation: Callable[..., Any]) -> Callable[..., Any
             logger.exception(
                 "Kit-colour guard failed; clearing accepted identity links"
             )
-            corrected = dict(output)
-            segments = []
-            for raw in output.get("segments") or []:
-                segment = dict(raw) if isinstance(raw, Mapping) else {}
-                if segment.get("bboxes"):
-                    segment = _abstain_segment(
-                        segment,
-                        {
-                            "version": GUARD_VERSION,
-                            "passed": False,
-                            "reason_codes": ["TEAM_COLOR_GUARD_ERROR"],
-                            "evidence": [],
-                        },
-                        "TEAM_COLOR_GUARD_ERROR",
-                    )
-                segments.append(segment)
-            corrected["segments"] = segments
-            corrected["segments_with_player"] = 0
-            corrected["coverage_pct"] = 0.0
-            corrected["coverage_pct_total"] = 0.0
-            corrected["largest_gap_sec"] = None
-            corrected["tracking_success"] = False
-            corrected["tracking_status"] = "TEAM_COLOR_GUARD_ERROR"
-            corrected["action_required"] = "RETRY_ANALYSIS"
-            summary = dict(output.get("reid_summary") or {})
-            summary.update(
-                {
-                    "status": "TEAM_COLOR_GUARD_ERROR",
-                    "validated": False,
-                    "team_color_guard": {
-                        "version": GUARD_VERSION,
-                        "status": "ERROR_FAIL_CLOSED",
-                        "validated": False,
-                        "reason_codes": ["TEAM_COLOR_GUARD_ERROR"],
-                    },
-                }
+            return fail_closed(
+                "TEAM_COLOR_GUARD_ERROR",
+                "TEAM_COLOR_GUARD_ERROR",
             )
-            corrected["reid_summary"] = summary
-        job_id = str(args[0]) if args else ""
-        return _repersist_guarded_output(corrected, job_id) if job_id else corrected
+        return _repersist_guarded_output(
+            corrected,
+            job_id,
+            analysis_attempt_id=analysis_attempt_id,
+        )
 
     guarded.__name__ = getattr(implementation, "__name__", "guarded_windowed_reid")
     guarded.__doc__ = (
