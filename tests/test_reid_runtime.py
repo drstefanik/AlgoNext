@@ -65,6 +65,66 @@ class ReIDRuntimeTests(unittest.TestCase):
             self.assertTrue(install_windowed_reid(module, implementation))
         self.assertEqual(calls, ["reid"])
 
+    def test_enabled_wrapper_forwards_every_selection_unchanged(self):
+        captured = {}
+        selections = [
+            {
+                "frame_key": "frame-0.jpg",
+                "frame_time_sec": 0.0,
+                "x": 0.10,
+                "y": 0.20,
+                "w": 0.10,
+                "h": 0.25,
+            },
+            {
+                "frame_key": "frame-90.jpg",
+                "frame_time_sec": 90.0,
+                "x": 0.40,
+                "y": 0.20,
+                "w": 0.10,
+                "h": 0.25,
+            },
+            {
+                "frame_key": "frame-180.jpg",
+                "frame_time_sec": 180.0,
+                "x": 0.70,
+                "y": 0.20,
+                "w": 0.10,
+                "h": 0.25,
+            },
+        ]
+
+        def original(*args, **kwargs):
+            return {"mode": "legacy"}
+
+        def implementation(*args, fallback, **kwargs):
+            self.assertIs(fallback, original)
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return {
+                "mode": "reid",
+                "anchors_used": {"selections": args[3]},
+            }
+
+        module = SimpleNamespace(track_player_windowed=original)
+        with patch.dict(os.environ, {"PLAYER_REID_ENABLED": "1"}, clear=False):
+            install_windowed_reid(module, implementation)
+            output = module.track_player_windowed(
+                "job-multi",
+                "/tmp/input.mp4",
+                {"t": 0.0},
+                selections,
+                video_duration_sec=240.0,
+                fps=5,
+            )
+
+        self.assertIs(captured["args"][3], selections)
+        self.assertEqual(captured["args"][3], selections)
+        self.assertEqual(
+            output["anchors_used"]["selections"],
+            selections,
+        )
+
     def test_runtime_failure_falls_back_when_enabled(self):
         def original(value):
             return {"mode": "legacy", "value": value}

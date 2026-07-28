@@ -6,7 +6,7 @@ import time
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import boto3
 import cv2
@@ -23,6 +23,12 @@ except ModuleNotFoundError:
 from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
+from app.workers.multi_anchor import (
+    assign_anchors_to_windows,
+    normalize_anchors,
+    select_track_id_at_time,
+    select_window_tracks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +503,7 @@ def _build_window_bboxes(
     *,
     fps: int,
     time_offset: float,
+    anchor_matches: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]], Optional[Dict[str, float]]]:
     bboxes: List[Dict[str, float]] = []
     lost_segments: List[Dict[str, float]] = []
@@ -506,14 +513,23 @@ def _build_window_bboxes(
     last_missing_time = None
     smoothed: Optional[Dict[str, float]] = None
     last_good_bbox: Optional[Dict[str, float]] = None
+    previous_active_track_id: Optional[int] = None
 
     for sample in samples:
         timestamp = float(sample["t"]) + time_offset
         detections = sample["detections"]
         selected_detection = None
-        if selected_track_id is not None:
+        active_track_id = select_track_id_at_time(
+            anchor_matches or [],
+            timestamp,
+            fallback_track_id=selected_track_id,
+        )
+        if active_track_id != previous_active_track_id:
+            smoothed = None
+            previous_active_track_id = active_track_id
+        if active_track_id is not None:
             for det in detections:
-                if det["track_id"] == selected_track_id:
+                if det["track_id"] == active_track_id:
                     selected_detection = det
                     break
 
@@ -899,6 +915,9 @@ def track_player_windowed(
     player_ref_norm = _normalize_player_ref(player_ref)
     if player_ref_norm is None:
         raise RuntimeError("Missing player_ref for tracking")
+    anchors = normalize_anchors(selections)
+    if not anchors:
+        anchors = normalize_anchors([player_ref_norm], max_items=1)
 
     s3_endpoint_url = S3_ENDPOINT_URL
     s3_access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
@@ -936,20 +955,19 @@ def track_player_windowed(
     )
     if not windows:
         raise RuntimeError("No windows available for tracking")
+    anchors_by_window = assign_anchors_to_windows(anchors, windows)
 
     tracking_timeout_seconds = int(os.environ.get("TRACKING_TIMEOUT_SECONDS", "1200"))
     tracking_started_at = time.monotonic()
     model = YOLO(detector_model)
 
     segments: List[Dict[str, Any]] = []
-    prev_bbox_abs: Optional[Dict[str, float]] = {
-        "x": float(player_ref_norm.get("x", 0.0)),
-        "y": float(player_ref_norm.get("y", 0.0)),
-        "w": float(player_ref_norm.get("w", 0.0)),
-        "h": float(player_ref_norm.get("h", 0.0)),
-    }
+    # A bbox selected later in the match is not valid continuity evidence
+    # for earlier windows. Continuity starts only after a real match.
+    prev_bbox_abs: Optional[Dict[str, float]] = None
     tracked_seconds_total = 0.0
     segments_with_player = 0
+    anchor_reacquisitions = 0
 
     windows_dir = Path("/tmp/fnh_jobs") / job_id / "tracking" / "windows"
     windows_dir.mkdir(parents=True, exist_ok=True)
@@ -979,22 +997,17 @@ def track_player_windowed(
             samples = []
             track_map = {}
 
-        selected_track_id: Optional[int] = None
-        best_score = 0.0
-        if prev_bbox_abs is not None and track_map:
-            for track_id, detections in track_map.items():
-                if not detections:
-                    continue
-                closest = min(detections, key=lambda d: abs(d.get("t", 0.0)))
-                candidate_bbox = closest["bbox"]
-                iou = _bbox_iou(prev_bbox_abs, candidate_bbox)
-                size_penalty = _size_aspect_penalty(prev_bbox_abs, candidate_bbox)
-                score = iou - 0.2 * size_penalty
-                if score > best_score:
-                    best_score = score
-                    selected_track_id = int(track_id)
-        if best_score < 0.15:
-            selected_track_id = None
+        match = select_window_tracks(
+            track_map,
+            anchors_by_window[idx - 1],
+            window_start=window_start,
+            window_end=window_end,
+            previous_bbox=prev_bbox_abs,
+        )
+        selected_track_id: Optional[int] = match.get("track_id")
+        best_score = float(match.get("score") or 0.0)
+        if match.get("source") == "anchor" and selected_track_id is not None:
+            anchor_reacquisitions += 1
 
         if samples and selected_track_id is not None:
             bboxes, lost_segments, last_good_bbox = _build_window_bboxes(
@@ -1002,6 +1015,7 @@ def track_player_windowed(
                 selected_track_id,
                 fps=fps,
                 time_offset=window_start,
+                anchor_matches=match.get("anchor_matches"),
             )
         else:
             bboxes = []
@@ -1014,14 +1028,36 @@ def track_player_windowed(
         if bboxes:
             tracked_seconds_total += len(bboxes) / float(max(1, fps))
             segments_with_player += 1
-            prev_bbox_abs = last_good_bbox or prev_bbox_abs
+            # The next window starts inside the overlap. Compare its
+            # t=0 detections with the bbox from that same absolute time,
+            # not with the current window's final frame.
+            continuity_target_time = max(
+                float(window_start), float(window_end) - float(overlap_sec)
+            )
+            continuity_bbox = min(
+                bboxes,
+                key=lambda item: abs(
+                    float(item.get("t", continuity_target_time))
+                    - continuity_target_time
+                ),
+            )
+            prev_bbox_abs = {
+                key: float(continuity_bbox[key])
+                for key in ("x", "y", "w", "h")
+            }
 
         segments.append(
             {
                 "window_start": float(window_start),
                 "window_end": float(window_end),
                 "selected_track_id": selected_track_id,
+                "selected_track_ids": match.get("selected_track_ids") or [],
                 "reacquire_score": round(float(best_score), 4),
+                "reacquire_source": match.get("source"),
+                "anchor_time_sec": match.get("anchor_time_sec"),
+                "anchor_frame_key": match.get("anchor_frame_key"),
+                "anchor_matches": match.get("anchor_matches") or [],
+                "reacquire_metrics": match.get("metrics") or {},
                 "coverage_pct": round(float(coverage_pct), 2),
                 "lost_segments": lost_segments,
                 "bboxes": bboxes,
@@ -1062,10 +1098,11 @@ def track_player_windowed(
         "segments": segments,
         "segments_total": len(segments),
         "segments_with_player": segments_with_player,
+        "anchor_reacquisitions": anchor_reacquisitions,
         "coverage_pct_total": round(coverage_pct_total, 2),
         "largest_gap_sec": round(float(largest_gap_sec), 2),
         "coverage_pct": round(coverage_pct_total, 2),
-        "anchors_used": {"player_ref": player_ref_norm, "selections": selections},
+        "anchors_used": {"player_ref": player_ref_norm, "selections": anchors},
     }
 
     tracking_dir = Path("/tmp/fnh_jobs") / job_id / "tracking"

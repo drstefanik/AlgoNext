@@ -1998,7 +1998,7 @@ def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
     selections = []
     selection_payload = None
     for selection in payload.selections:
-        selection_data = selection.dict()
+        selection_data = selection.model_dump()
         selection_entry = {
             "frame_time_sec": selection_data["frame_time_sec"],
             "x": selection_data["x"],
@@ -2026,6 +2026,29 @@ def _build_target_from_selections(payload: SelectionPayload) -> Dict[str, Any]:
         "selections": selections,
         "tracking": {"status": "PENDING"},
     }
+
+
+_SELECTION_OWNED_TARGET_FIELDS = frozenset(
+    {"confirmed", "selection", "selections", "tracking"}
+)
+
+
+def _merge_target_from_selections(
+    existing_target: Any,
+    selection_target: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Replace selection state without discarding job-level target metadata."""
+
+    preserved = (
+        {
+            key: value
+            for key, value in existing_target.items()
+            if key not in _SELECTION_OWNED_TARGET_FIELDS
+        }
+        if isinstance(existing_target, dict)
+        else {}
+    )
+    return {**preserved, **selection_target}
 
 
 class _InvalidTargetPayload(Exception):
@@ -2548,7 +2571,10 @@ def _save_target_selection(
             status_code=404,
             detail=error_detail("JOB_NOT_FOUND", "Job not found"),
         )
-    target_payload = _build_target_from_selections(payload)
+    target_payload = _merge_target_from_selections(
+        job.target,
+        _build_target_from_selections(payload),
+    )
     preview_frames = job.preview_frames or []
     preview_lookup: Dict[str, Dict[str, Any]] = {}
     if isinstance(preview_frames, list):
@@ -2560,36 +2586,67 @@ def _save_target_selection(
                 preview_lookup[key] = frame
                 preview_lookup.setdefault(key.split("/")[-1], frame)
     if preview_lookup:
+        resolved_frame_keys: set[str] = set()
         for selection in target_payload.get("selections", []):
             if not isinstance(selection, dict):
                 continue
-            if selection.get("frame_key"):
-                continue
-            time_sec = selection.get("frame_time_sec")
-            if time_sec is None:
-                continue
-            selected_frame = min(
-                preview_lookup.values(),
-                key=lambda item: abs(
-                    float(item.get("time_sec") or 0.0) - float(time_sec)
-                ),
-            )
-            if selected_frame.get("key"):
-                selection["frame_key"] = selected_frame.get("key")
-        selection_payload = target_payload.get("selection")
-        if isinstance(selection_payload, dict) and not selection_payload.get(
-            "frame_key"
-        ):
-            time_sec = selection_payload.get("time_sec")
-            if time_sec is not None:
-                selected_frame = min(
-                    preview_lookup.values(),
-                    key=lambda item: abs(
-                        float(item.get("time_sec") or 0.0) - float(time_sec)
-                    ),
+            requested_frame_key = selection.get("frame_key")
+            selected_frame = None
+            if isinstance(requested_frame_key, str) and requested_frame_key:
+                selected_frame = preview_lookup.get(requested_frame_key)
+                if selected_frame is None:
+                    selected_frame = preview_lookup.get(
+                        requested_frame_key.split("/")[-1]
+                    )
+                if selected_frame is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=error_detail(
+                            "INVALID_SELECTION",
+                            "frame_key not present in preview frames",
+                            {"frame_key": requested_frame_key},
+                        ),
+                    )
+            else:
+                time_sec = selection.get("frame_time_sec")
+                if time_sec is not None:
+                    selected_frame = min(
+                        preview_lookup.values(),
+                        key=lambda item: abs(
+                            float(item.get("time_sec") or 0.0)
+                            - float(time_sec)
+                        ),
+                    )
+            if isinstance(selected_frame, dict):
+                canonical_key = selected_frame.get("key") or selected_frame.get(
+                    "s3_key"
                 )
-                if selected_frame.get("key"):
-                    selection_payload["frame_key"] = selected_frame.get("key")
+                canonical_time = selected_frame.get("time_sec")
+                if isinstance(canonical_key, str) and canonical_key:
+                    if canonical_key in resolved_frame_keys:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=error_detail(
+                                "DUPLICATE_SELECTION_FRAME",
+                                "Only one player reference is allowed per preview frame.",
+                                {"frame_key": canonical_key},
+                            ),
+                        )
+                    resolved_frame_keys.add(canonical_key)
+                    selection["frame_key"] = canonical_key
+                if canonical_time is not None:
+                    selection["frame_time_sec"] = float(canonical_time)
+        selection_payload = target_payload.get("selection")
+        selections_payload = target_payload.get("selections") or []
+        if (
+            isinstance(selection_payload, dict)
+            and selections_payload
+            and isinstance(selections_payload[0], dict)
+        ):
+            selection_payload["frame_key"] = selections_payload[0].get("frame_key")
+            selection_payload["time_sec"] = selections_payload[0].get(
+                "frame_time_sec"
+            )
     job.target = target_payload
 
     player_ref = job.player_ref or job.anchor or {}
