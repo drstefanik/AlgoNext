@@ -72,7 +72,7 @@ def select_full_match_profile(
     requested_overlap = min(requested_overlap, requested_window - 1.0)
     requested_model = str(requested_detector_model or "yolo11s.pt").strip()
 
-    target_samples = _env_int("FULL_MATCH_TARGET_SAMPLES", 6000, 1000, 50000)
+    target_samples = _env_int("FULL_MATCH_TARGET_SAMPLES", 12000, 1000, 50000)
 
     if duration < 900.0:
         fps = requested_fps_value
@@ -107,8 +107,8 @@ def select_full_match_profile(
             max(0.0, window_sec - 1.0),
         )
         detector_model = (
-            os.environ.get("FULL_MATCH_DETECTOR_MODEL") or "yolo11n.pt"
-        ).strip() or "yolo11n.pt"
+            os.environ.get("FULL_MATCH_DETECTOR_MODEL") or "yolo11s.pt"
+        ).strip() or "yolo11s.pt"
 
     step_sec = max(1.0, window_sec - overlap_sec)
     overlap_multiplier = window_sec / step_sec
@@ -156,7 +156,9 @@ def budget_full_match_kwargs(
 
 def install_progress_adapter(tracking_module: Any) -> None:
     current = getattr(tracking_module, "_update_tracking_progress", None)
-    if not callable(current) or getattr(current, "__algonext_progress_adapter__", False):
+    if not callable(current) or getattr(
+        current, "__algonext_progress_adapter__", False
+    ):
         return
 
     def adapted(job_id: str, pct: int, message: str) -> Any:
@@ -168,9 +170,7 @@ def install_progress_adapter(tracking_module: Any) -> None:
         }:
             stage_ratio = max(0.0, min(1.0, (float(pct) - 10.0) / 30.0))
             mapped_pct = 35 + int(round(stage_ratio * 35.0))
-            mapped_message = (
-                f"{message} · {int(round(stage_ratio * 100.0))}% finestre"
-            )
+            mapped_message = f"{message} · {int(round(stage_ratio * 100.0))}% finestre"
         return current(job_id, mapped_pct, mapped_message)
 
     setattr(adapted, "__algonext_progress_adapter__", True)
@@ -253,7 +253,9 @@ def mark_partial_timeout(
         from app.core.models import AnalysisJob
         from app.core.normalizers import normalize_failure_reason
     except Exception:
-        logger.exception("Unable to import job persistence for partial tracking timeout")
+        logger.exception(
+            "Unable to import job persistence for partial tracking timeout"
+        )
         return
 
     db = SessionLocal()

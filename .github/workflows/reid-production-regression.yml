@@ -18,6 +18,10 @@ on:
       - main
     paths:
       - ".github/workflows/reid-production-regression.yml"
+      - "app/reid/full_match_runtime.py"
+      - "app/reid/team_color_guard.py"
+      - "app/reid/windowed_tracking.py"
+      - "docker-compose.yml"
 
 permissions:
   contents: read
