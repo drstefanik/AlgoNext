@@ -1266,28 +1266,213 @@ def _is_full_match_mode(job: AnalysisJob) -> bool:
     return env_enabled or target_flag
 
 
+def _confirmed_full_match_selections(
+    target: Dict[str, Any] | None,
+    player_ref: Dict[str, Any] | None,
+    *,
+    full_match_mode: bool,
+    duration: float | None = None,
+) -> List[Dict[str, Any]]:
+    current_target = target if isinstance(target, dict) else {}
+    raw_selections = current_target.get("selections")
+    if (
+        not full_match_mode
+        or current_target.get("confirmed") is not True
+        or not isinstance(raw_selections, list)
+        or not 1 <= len(raw_selections) <= 5
+    ):
+        return []
+
+    selections = normalize_anchors(raw_selections)
+    normalized_player_ref = normalize_anchors([player_ref], max_items=1)
+    if len(selections) != len(raw_selections) or len(normalized_player_ref) != 1:
+        return []
+
+    if duration is not None:
+        try:
+            duration_seconds = float(duration)
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+            return []
+        if any(
+            float(selection["t"]) > duration_seconds + 0.01 for selection in selections
+        ):
+            return []
+
+    reference = normalized_player_ref[0]
+    if not any(
+        math.isclose(
+            float(selection["t"]),
+            float(reference["t"]),
+            abs_tol=0.01,
+        )
+        and all(
+            math.isclose(
+                float(selection[key]),
+                float(reference[key]),
+                abs_tol=1e-6,
+            )
+            for key in ("x", "y", "w", "h")
+        )
+        for selection in selections
+    ):
+        return []
+    return selections
+
+
+def _reusable_confirmed_full_match_preview_keys(
+    job_id: str,
+    target: Dict[str, Any] | None,
+    player_ref: Dict[str, Any] | None,
+    preview_frames: Any,
+    *,
+    full_match_mode: bool,
+    s3_bucket: str,
+    duration: float | None = None,
+) -> List[str]:
+    current_target = target if isinstance(target, dict) else {}
+    if not isinstance(preview_frames, list) or not preview_frames:
+        return []
+
+    selections = _confirmed_full_match_selections(
+        current_target,
+        player_ref,
+        full_match_mode=full_match_mode,
+        duration=duration,
+    )
+    if not selections:
+        return []
+
+    canonical_key = re.compile(
+        rf"^jobs/{re.escape(str(job_id))}/frames/" r"frame_[0-9]{4}[.](?:jpg|jpeg|png)$"
+    )
+    frames_by_key: Dict[str, Dict[str, Any]] = {}
+    for frame in preview_frames:
+        if not isinstance(frame, dict):
+            continue
+        key = frame.get("key") or frame.get("s3_key")
+        if not isinstance(key, str) or canonical_key.fullmatch(key) is None:
+            continue
+        if frame.get("bucket") != s3_bucket:
+            continue
+        if key in frames_by_key:
+            return []
+        frames_by_key[key] = frame
+
+    selected_keys: List[str] = []
+    for selection in selections:
+        key = selection.get("frame_key")
+        if not isinstance(key, str) or canonical_key.fullmatch(key) is None:
+            return []
+        frame = frames_by_key.get(key)
+        if frame is None:
+            return []
+        try:
+            frame_time = float(frame.get("time_sec"))
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(frame_time) or not math.isclose(
+            frame_time,
+            float(selection["t"]),
+            abs_tol=0.01,
+        ):
+            return []
+        selected_keys.append(key)
+
+    if len(set(selected_keys)) != len(selected_keys):
+        return []
+    return selected_keys
+
+
+def _preview_objects_exist(
+    s3_internal: Any,
+    s3_bucket: str,
+    preview_keys: List[str],
+) -> bool:
+    head_object = getattr(s3_internal, "head_object", None)
+    if not callable(head_object) or not preview_keys:
+        return False
+    for key in preview_keys:
+        try:
+            metadata = head_object(Bucket=s3_bucket, Key=key)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status_code = (exc.response.get("ResponseMetadata") or {}).get(
+                "HTTPStatusCode"
+            )
+            if code in {"404", "NoSuchKey", "NoSuchObject", "NotFound"} or (
+                status_code == 404
+            ):
+                return False
+            raise
+        try:
+            content_length = int((metadata or {}).get("ContentLength") or 0)
+        except (TypeError, ValueError):
+            return False
+        if content_length <= 0:
+            return False
+    return True
+
+
+def _require_selection_preview_reselection(job: AnalysisJob) -> None:
+    target = job.target if isinstance(job.target, dict) else {}
+    analysis_attempt_id = str(target.get("analysis_attempt_id") or "").strip()
+    selections = target.get("selections")
+    anchors_total = len(selections) if isinstance(selections, list) else 0
+    _apply_tracking_outcome(
+        job,
+        {
+            "analysis_attempt_id": analysis_attempt_id or None,
+            "tracking_success": False,
+            "tracking_status": "SELECTION_PREVIEW_UNAVAILABLE",
+            "action_required": "RESELECT_PLAYER",
+            "metrics_scope": "selected_player",
+            "bboxes_count": 0,
+            "anchors_total": anchors_total,
+            "anchors_matched": 0,
+            "reid_summary": {
+                "status": "SELECTION_PREVIEW_UNAVAILABLE",
+                "reason_codes": ["PLAYER_SELECTION_PREVIEW_UNAVAILABLE"],
+            },
+        },
+    )
+    job.warnings = list(
+        dict.fromkeys(
+            [
+                *(job.warnings or []),
+                "PLAYER_SELECTION_PREVIEW_UNAVAILABLE",
+            ]
+        )
+    )
+    set_progress(
+        job,
+        "WAITING_FOR_PLAYER",
+        30,
+        "Saved player preview is unavailable. Select the player again.",
+    )
+
+
 def _requires_candidate_tracking(
     result: Dict[str, Any] | None,
     target: Dict[str, Any] | None,
     *,
     full_match_mode: bool,
     player_ref: Dict[str, Any] | None,
+    duration: float | None = None,
 ) -> bool:
     current_result = result if isinstance(result, dict) else {}
     if current_result.get("candidates"):
         return False
 
-    current_target = target if isinstance(target, dict) else {}
-    selections = normalize_anchors(current_target.get("selections"))
-    normalized_player_ref = normalize_anchors([player_ref], max_items=1)
-    if (
-        full_match_mode
-        and current_target.get("confirmed") is True
-        and selections
-        and normalized_player_ref
-    ):
-        return False
-    return True
+    return not bool(
+        _confirmed_full_match_selections(
+            target,
+            player_ref,
+            full_match_mode=full_match_mode,
+            duration=duration,
+        )
+    )
 
 
 def probe_frame_count(path: Path) -> int:
@@ -3005,71 +3190,152 @@ def run_analysis(
 
         update_current_attempt(db, job_id, store_input_asset)
 
-        # Extract preview frames for UI selection
-        update_current_attempt(
-            db,
-            job_id,
-            lambda job: set_progress(
-                job, "EXTRACTING_FRAMES", 25, "Extracting preview frames"
-            ),
-        )
-        preview_count = _preview_frame_count()
+        job = reload_job(db, job_id)
+        if not job:
+            return
+        target = job.target or {}
+        full_match_mode = _is_full_match_mode(job)
         duration = get_duration_seconds(video_meta)
-        player_ref = _normalize_player_ref(job.player_ref or {})
-        anchor_time = player_ref.get("t") if player_ref else None
-        timestamps = _build_preview_timestamps(duration, preview_count, anchor_time)
-
-        frames_dir = base_dir / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-
-        preview_frames: List[Dict[str, Any]] = []
-        for index, timestamp in enumerate(timestamps, start=1):
-            frame_name = f"frame_{index:04d}.jpg"
-            frame_path = frames_dir / frame_name
-
-            try:
-                _run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-ss",
-                        str(timestamp),
-                        "-i",
-                        str(input_path),
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "2",
-                        str(frame_path),
-                    ]
-                )
-            except Exception:
-                break
-
-            width, height = probe_image_dimensions(frame_path)
-            frame_key = f"jobs/{job_id}/frames/{frame_name}"
-            upload_file(s3_internal, s3_bucket, frame_path, frame_key, "image/jpeg")
-            preview_frames.append(
-                {
-                    "time_sec": timestamp,
-                    "bucket": s3_bucket,
-                    "key": frame_key,
-                    "width": width,
-                    "height": height,
-                }
-            )
-
-        if preview_frames:
+        confirmed_selections = _confirmed_full_match_selections(
+            target,
+            job.player_ref or job.anchor or {},
+            full_match_mode=full_match_mode,
+            duration=duration,
+        )
+        reusable_preview_keys = _reusable_confirmed_full_match_preview_keys(
+            job_id,
+            target,
+            job.player_ref or job.anchor or {},
+            job.preview_frames,
+            full_match_mode=full_match_mode,
+            s3_bucket=s3_bucket,
+            duration=duration,
+        )
+        confirmed_full_match_target = bool(
+            full_match_mode and target.get("confirmed") is True
+        )
+        if confirmed_full_match_target and (
+            not confirmed_selections or not reusable_preview_keys
+        ):
             update_current_attempt(
                 db,
                 job_id,
-                lambda job: (
-                    setattr(job, "preview_frames", preview_frames),
-                    set_progress(job, "PREVIEWS_READY", 30, "Preview frames ready"),
+                _require_selection_preview_reselection,
+            )
+            return
+
+        reuse_persisted_previews = False
+        if reusable_preview_keys:
+            if not _preview_objects_exist(
+                s3_internal,
+                s3_bucket,
+                reusable_preview_keys,
+            ):
+                update_current_attempt(
+                    db,
+                    job_id,
+                    _require_selection_preview_reselection,
+                )
+                return
+            reuse_persisted_previews = True
+
+        if reuse_persisted_previews:
+            update_current_attempt(
+                db,
+                job_id,
+                lambda job: set_progress(
+                    job,
+                    "PREVIEWS_READY",
+                    30,
+                    "Reusing saved preview frames",
                 ),
             )
+            logger.info(
+                "run_analysis reusing confirmed selection previews "
+                "job_id=%s attempt=%s selected_frames=%d",
+                job_id,
+                analysis_attempt_id,
+                len(reusable_preview_keys),
+            )
+        else:
+            # Extract preview frames for UI selection.
+            update_current_attempt(
+                db,
+                job_id,
+                lambda job: set_progress(
+                    job, "EXTRACTING_FRAMES", 25, "Extracting preview frames"
+                ),
+            )
+            preview_count = _preview_frame_count()
+            player_ref = _normalize_player_ref(job.player_ref or {})
+            anchor_time = player_ref.get("t") if player_ref else None
+            timestamps = _build_preview_timestamps(
+                duration,
+                preview_count,
+                anchor_time,
+            )
 
-        full_match_mode = _is_full_match_mode(job)
+            frames_dir = base_dir / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+
+            preview_frames: List[Dict[str, Any]] = []
+            for index, timestamp in enumerate(timestamps, start=1):
+                frame_name = f"frame_{index:04d}.jpg"
+                frame_path = frames_dir / frame_name
+
+                try:
+                    _run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-ss",
+                            str(timestamp),
+                            "-i",
+                            str(input_path),
+                            "-frames:v",
+                            "1",
+                            "-q:v",
+                            "2",
+                            str(frame_path),
+                        ]
+                    )
+                except Exception:
+                    break
+
+                width, height = probe_image_dimensions(frame_path)
+                frame_key = f"jobs/{job_id}/frames/{frame_name}"
+                upload_file(
+                    s3_internal,
+                    s3_bucket,
+                    frame_path,
+                    frame_key,
+                    "image/jpeg",
+                )
+                preview_frames.append(
+                    {
+                        "time_sec": timestamp,
+                        "bucket": s3_bucket,
+                        "key": frame_key,
+                        "width": width,
+                        "height": height,
+                    }
+                )
+
+            if preview_frames:
+                update_current_attempt(
+                    db,
+                    job_id,
+                    lambda job: (
+                        setattr(job, "preview_frames", preview_frames),
+                        set_progress(
+                            job,
+                            "PREVIEWS_READY",
+                            30,
+                            "Preview frames ready",
+                        ),
+                    ),
+                )
+
         tracking_input_path = input_path
         tracking_time_offset = 0.0
         tracking_window_before = float(
@@ -3126,6 +3392,7 @@ def run_analysis(
             target,
             full_match_mode=full_match_mode,
             player_ref=job.player_ref or job.anchor or {},
+            duration=duration,
         ):
             update_current_attempt(
                 db,
