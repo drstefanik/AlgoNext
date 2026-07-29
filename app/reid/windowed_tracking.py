@@ -329,15 +329,14 @@ def _motion_continuous(
     *,
     maximum_gap_sec: float,
     maximum_center_distance: float,
+    maximum_missing_samples: int = 0,
 ) -> bool:
     previous_sample = previous.get("sample_index")
     current_sample = current.get("sample_index")
-    if (
-        previous_sample is not None
-        and current_sample is not None
-        and abs(int(current_sample) - int(previous_sample)) != 1
-    ):
-        return False
+    if previous_sample is not None and current_sample is not None:
+        sample_gap = abs(int(current_sample) - int(previous_sample))
+        if sample_gap < 1 or sample_gap > maximum_missing_samples + 1:
+            return False
     gap = abs(float(current.get("t") or 0.0) - float(previous.get("t") or 0.0))
     if gap > maximum_gap_sec:
         return False
@@ -870,6 +869,9 @@ def _tracklet_detections_from_overlap(
     maximum_center_distance = _env_float(
         "PLAYER_REID_TRACKLET_MAX_CENTER_DISTANCE", 0.20, 0.02, 0.5
     )
+    maximum_missing_samples = _env_int(
+        "PLAYER_REID_TRACKLET_MAX_MISSING_SAMPLES", 1, 0, 1
+    )
     concrete_seed_span = [item for item in seed_span if item is not None]
     if any(
         not _motion_continuous(
@@ -877,6 +879,7 @@ def _tracklet_detections_from_overlap(
             concrete_seed_span[index],
             maximum_gap_sec=maximum_gap,
             maximum_center_distance=maximum_center_distance,
+            maximum_missing_samples=maximum_missing_samples,
         )
         for index in range(1, len(concrete_seed_span))
     ):
@@ -892,6 +895,7 @@ def _tracklet_detections_from_overlap(
                 detection,
                 maximum_gap_sec=maximum_gap,
                 maximum_center_distance=maximum_center_distance,
+                maximum_missing_samples=maximum_missing_samples,
             ):
                 break
             selected.add(index)
@@ -905,6 +909,7 @@ def _tracklet_detections_from_overlap(
                 detection,
                 maximum_gap_sec=maximum_gap,
                 maximum_center_distance=maximum_center_distance,
+                maximum_missing_samples=maximum_missing_samples,
             ):
                 break
             selected.add(index)
