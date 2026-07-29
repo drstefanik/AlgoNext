@@ -341,7 +341,17 @@ class AnchorReselectionPipelineTests(unittest.TestCase):
                 "diagnostic_only": True,
                 "validated": False,
                 "anchors_total": 2,
-                "anchors_matched_before_guard": 2,
+                "anchors_matched_before_guard": 999,
+                "anchor_matches": [
+                    {
+                        "anchor_id": 1,
+                        "matched_before_guard": True,
+                    },
+                    {
+                        "anchor_id": 2,
+                        "matched_before_guard": True,
+                    },
+                ],
             },
             "reid_summary": {
                 "status": "ANCHOR_ONLY",
