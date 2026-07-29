@@ -1319,7 +1319,11 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertTrue(output["tracking_success"])
         self.assertEqual(output["reid_summary"]["accepted_associations"], 1)
         self.assertEqual(output["reid_summary"]["profile_samples"], 3)
-        self.assertEqual(output["autonomous_bboxes_count"], 2)
+        self.assertEqual(output["autonomous_bboxes_count"], 7)
+        self.assertEqual(
+            output["segments"][1]["reid"]["autonomous_bboxes_count"],
+            5,
+        )
         backward = output["segments"][0]
         self.assertEqual(backward["identity_status"], "ACCEPTED")
         self.assertEqual(backward["reid"]["descriptor"]["sample_count"], 0)
