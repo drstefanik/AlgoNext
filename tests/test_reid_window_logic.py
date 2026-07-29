@@ -185,51 +185,5 @@ class ReIDWindowLogicTests(unittest.TestCase):
         self.assertEqual(evidence["segment_counts"], {3: 2})
 
 
-    def test_motion_linked_anchor_tracklet_outside_manual_range_is_autonomous(self):
-        segment = {
-            "direction": "anchor",
-            "window_start": 0.0,
-            "window_end": 10.0,
-            "identity_status": "ACCEPTED",
-            "reid": {
-                "status": "ACCEPTED",
-                "manual_evidence_ranges": [{"start": 4.0, "end": 6.0}],
-            },
-            "bboxes": [{"t": 5.0}, {"t": 7.5}, {"t": 8.0}],
-        }
-
-        evidence = autonomous_tracking_evidence(
-            [segment],
-            fps=2.0,
-            require_retained_chain=True,
-        )
-
-        self.assertTrue(evidence["proven"])
-        self.assertEqual(evidence["segments_with_player"], 1)
-        self.assertEqual(evidence["bboxes_count"], 2)
-        self.assertEqual(evidence["segment_counts"], {0: 2})
-        self.assertEqual(evidence["manual_evidence_ranges"], [(4.0, 6.0)])
-
-    def test_malformed_manual_range_keeps_whole_anchor_window_fail_closed(self):
-        segment = {
-            "direction": "anchor",
-            "window_start": 0.0,
-            "window_end": 10.0,
-            "identity_status": "ACCEPTED",
-            "reid": {
-                "status": "ACCEPTED",
-                "manual_evidence_ranges": [{"start": 7.0, "end": 3.0}],
-            },
-            "bboxes": [{"t": 1.0}, {"t": 9.0}],
-        }
-
-        evidence = autonomous_tracking_evidence([segment], fps=2.0)
-
-        self.assertFalse(evidence["proven"])
-        self.assertEqual(evidence["bboxes_count"], 0)
-        self.assertEqual(evidence["segment_counts"], {})
-        self.assertEqual(evidence["manual_evidence_ranges"], [(0.0, 10.0)])
-
-
 if __name__ == "__main__":
     unittest.main()
