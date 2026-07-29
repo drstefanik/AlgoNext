@@ -473,7 +473,12 @@ def _stitch_manual_anchor_bboxes(
     fps: int,
     window_start: float,
     radius_sec: float,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[int]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[int],
+    list[float],
+]:
     """Build one deterministic window track from one or more manual anchors.
 
     ByteTrack can assign a new local ID after a camera cut inside the same
@@ -490,7 +495,7 @@ def _stitch_manual_anchor_bboxes(
         ),
     )
     if not ordered:
-        return [], [], []
+        return [], [], [], []
 
     track_bboxes: dict[tuple[int, int], list[dict[str, Any]]] = {}
     track_link_bboxes: dict[tuple[int, int], list[dict[str, Any]]] = {}
@@ -649,7 +654,8 @@ def _stitch_manual_anchor_bboxes(
     track_ids = list(
         dict.fromkeys(int(observation["track_id"]) for observation in ordered)
     )
-    return stitched, link_bboxes, track_ids
+    manual_seed_times = sorted(raw_anchor_samples)
+    return stitched, link_bboxes, track_ids, manual_seed_times
 
 
 def _boundary_bbox(
@@ -2028,6 +2034,7 @@ def track_player_windowed_reid(
                 manual_bboxes,
                 manual_link_bboxes,
                 manual_track_ids,
+                manual_seed_times,
             ) = _stitch_manual_anchor_bboxes(
                 manual_observations,
                 samples,
@@ -2065,24 +2072,10 @@ def track_player_windowed_reid(
             coverage = len(manual_bboxes) / float(max(1, len(samples))) * 100.0
             manual_evidence_ranges = [
                 {
-                    "start": round(
-                        max(
-                            float(window_start),
-                            float(observation["anchor"]["t"])
-                            - float(anchor_tracklet_radius),
-                        ),
-                        6,
-                    ),
-                    "end": round(
-                        min(
-                            float(window_end),
-                            float(observation["anchor"]["t"])
-                            + float(anchor_tracklet_radius),
-                        ),
-                        6,
-                    ),
+                    "start": round(float(seed_time), 6),
+                    "end": round(float(seed_time), 6),
                 }
-                for observation in manual_observations
+                for seed_time in manual_seed_times
             ]
             primary_track_id = manual_track_ids[0]
             segments_by_index[root_index] = {

@@ -390,7 +390,12 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             }
             for time_sec in (0.0, 5.0, 10.0)
         ]
-        bboxes, link_bboxes, track_ids = self.module._stitch_manual_anchor_bboxes(
+        (
+            bboxes,
+            link_bboxes,
+            track_ids,
+            seed_times,
+        ) = self.module._stitch_manual_anchor_bboxes(
             [
                 {
                     "anchor": {"anchor_id": 1, "t": 10.0, **_bbox()},
@@ -411,6 +416,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertEqual(track_ids, [7])
         self.assertEqual([item["t"] for item in bboxes], [10.0])
         self.assertEqual([item["t"] for item in link_bboxes], [10.0])
+        self.assertEqual(seed_times, [10.0])
 
     def test_manual_anchor_tracklet_stops_before_spatial_id_switch(self):
         distant = {"x": 0.72, "y": 0.20, "w": 0.10, "h": 0.20}
@@ -827,7 +833,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             "_build_window_bboxes",
             return_value=(lagged, [], lagged[-1]),
         ):
-            display, raw_links, track_ids = (
+            display, raw_links, track_ids, seed_times = (
                 self.module._stitch_manual_anchor_bboxes(
                     [
                         {
@@ -853,6 +859,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertAlmostEqual(nearest["x"], anchor_bbox["x"], places=6)
         self.assertNotAlmostEqual(nearest["x"], lagged[0]["x"], places=3)
         self.assertEqual(track_ids, [7])
+        self.assertEqual(seed_times, [2157.0])
         self.assertGreaterEqual(len(raw_links), 2)
 
     def test_near_threshold_overlap_runner_blocks_unique_margin_override(self):
@@ -1248,7 +1255,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         )
         self.assertEqual(
             output["segments"][1]["reid"]["manual_evidence_ranges"],
-            [{"start": 40.0, "end": 60.0}],
+            [{"start": 50.0, "end": 50.0}],
         )
 
     def test_physical_continuity_without_autonomous_descriptor_is_retained(self):
@@ -1319,10 +1326,10 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertTrue(output["tracking_success"])
         self.assertEqual(output["reid_summary"]["accepted_associations"], 1)
         self.assertEqual(output["reid_summary"]["profile_samples"], 3)
-        self.assertEqual(output["autonomous_bboxes_count"], 7)
+        self.assertEqual(output["autonomous_bboxes_count"], 17)
         self.assertEqual(
             output["segments"][1]["reid"]["autonomous_bboxes_count"],
-            5,
+            15,
         )
         backward = output["segments"][0]
         self.assertEqual(backward["identity_status"], "ACCEPTED")
@@ -2001,7 +2008,8 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertFalse(output["tracking_success"])
         self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
         self.assertEqual(output["tracking_scope_status"], "ANCHOR_ONLY")
-        self.assertEqual(output["autonomous_segments_with_player"], 0)
+        self.assertEqual(output["autonomous_segments_with_player"], 1)
+        self.assertEqual(output["autonomous_bboxes_count"], 1)
         profiles = {
             item["window_number"]: (item["fps"], item["model"])
             for item in type(self).collection_profiles
@@ -2070,8 +2078,14 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 video_duration_sec=115.0,
             )
 
-        self.assertFalse(output["tracking_success"])
-        self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
+        self.assertTrue(output["tracking_success"])
+        self.assertEqual(
+            output["tracking_status"],
+            "SPARSE_CROSS_WINDOW_EVIDENCE",
+        )
+        self.assertEqual(output["tracking_scope_status"], "CROSS_WINDOW_EVIDENCE")
+        self.assertEqual(output["autonomous_segments_with_player"], 1)
+        self.assertEqual(output["autonomous_bboxes_count"], 2)
         self.assertEqual(output["anchor_acquisition"]["seed_anchor_id"], 2)
         self.assertEqual(output["anchor_acquisition"]["seed_window_index"], 2)
         self.assertEqual(
