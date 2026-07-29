@@ -1246,6 +1246,10 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             [segment["processing_direction"] for segment in output["segments"]],
             ["backward", "anchor", "forward"],
         )
+        self.assertEqual(
+            output["segments"][1]["reid"]["manual_evidence_ranges"],
+            [{"start": 40.0, "end": 60.0}],
+        )
 
     def test_physical_continuity_without_autonomous_descriptor_is_retained(self):
         type(self).track_maps = {
