@@ -930,7 +930,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertFalse(strongest.metadata["strong_overlap_unique"])
         self.assertEqual({item.candidate_id for item in profiles}, {"326", "927"})
 
-    def test_overlap_tracklet_extends_only_through_consecutive_motion(self):
+    def test_overlap_tracklet_bridges_only_one_bounded_detector_miss(self):
         raw = [
             {
                 "t": float(index),
@@ -952,10 +952,37 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             [0, 1, 2, 3, 4],
         )
 
-        missing_sample = [raw[0], raw[1], {**raw[2], "sample_index": 4}]
+        one_missing_sample = [raw[0], raw[1], raw[3], raw[4]]
+        bridged = self.module._tracklet_detections_from_overlap(
+            one_missing_sample,
+            one_missing_sample[:2],
+            direction="forward",
+            fps=1,
+        )
+        self.assertEqual(
+            [item["sample_index"] for item in bridged],
+            [0, 1, 3, 4],
+        )
+        with patch.dict(
+            os.environ,
+            {"PLAYER_REID_TRACKLET_MAX_MISSING_SAMPLES": "0"},
+            clear=False,
+        ):
+            strict = self.module._tracklet_detections_from_overlap(
+                one_missing_sample,
+                one_missing_sample[:2],
+                direction="forward",
+                fps=1,
+            )
+        self.assertEqual(
+            [item["sample_index"] for item in strict],
+            [0, 1],
+        )
+
+        too_many_missing_samples = [raw[0], raw[1], {**raw[2], "sample_index": 4}]
         stopped = self.module._tracklet_detections_from_overlap(
-            missing_sample,
-            missing_sample[:2],
+            too_many_missing_samples,
+            too_many_missing_samples[:2],
             direction="forward",
             fps=1,
         )
