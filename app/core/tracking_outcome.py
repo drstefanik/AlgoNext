@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Mapping
 
 _PLAYER_RESELECTION_WARNINGS = {
     "PLAYER_ANCHOR_NOT_FOUND",
@@ -46,6 +46,60 @@ def _tracking_reason_codes(tracking: Dict[str, Any]) -> List[str]:
     return codes
 
 
+def _pre_guard_anchor_diagnostics(
+    tracking: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return only a record-backed, explicitly diagnostic pre-guard payload."""
+
+    summary = tracking.get("reid_summary")
+    summary_payload = summary if isinstance(summary, Mapping) else {}
+    for raw_diagnostics in (
+        tracking.get("pre_guard_anchor_diagnostics"),
+        summary_payload.get("pre_guard_anchor_diagnostics"),
+    ):
+        if not isinstance(raw_diagnostics, Mapping):
+            continue
+        if (
+            raw_diagnostics.get("diagnostic_only") is not True
+            or raw_diagnostics.get("validated") is not False
+        ):
+            continue
+        anchors_total = raw_diagnostics.get("anchors_total")
+        anchor_matches = raw_diagnostics.get("anchor_matches")
+        if (
+            not isinstance(anchors_total, int)
+            or isinstance(anchors_total, bool)
+            or not 0 <= anchors_total <= 5
+            or not isinstance(anchor_matches, list)
+        ):
+            continue
+        return dict(raw_diagnostics)
+    return {}
+
+
+def _pre_guard_matched_anchor_count(
+    diagnostics: Mapping[str, Any],
+) -> int:
+    """Count proved matches; never trust the aggregate declaration alone."""
+
+    anchors_total = diagnostics.get("anchors_total")
+    anchor_matches = diagnostics.get("anchor_matches")
+    if (
+        not isinstance(anchors_total, int)
+        or isinstance(anchors_total, bool)
+        or not 0 <= anchors_total <= 5
+        or not isinstance(anchor_matches, list)
+    ):
+        return 0
+    matched = sum(
+        1
+        for item in anchor_matches
+        if isinstance(item, Mapping)
+        and item.get("matched_before_guard") is True
+    )
+    return min(anchors_total, matched)
+
+
 def apply_tracking_outcome(
     job: Any,
     tracking_payload: Dict[str, Any],
@@ -81,33 +135,14 @@ def apply_tracking_outcome(
         windows_total > 0 and windows_processed >= windows_total
     )
     anchors_matched = int(tracking_payload.get("anchors_matched") or 0)
-    pre_guard_anchor_diagnostics = (
-        tracking_payload.get("pre_guard_anchor_diagnostics")
-        if isinstance(
-            tracking_payload.get("pre_guard_anchor_diagnostics"),
-            dict,
+    pre_guard_anchor_diagnostics = _pre_guard_anchor_diagnostics(tracking_payload)
+    if pre_guard_anchor_diagnostics:
+        tracking_payload["pre_guard_anchor_diagnostics"] = (
+            pre_guard_anchor_diagnostics
         )
-        and tracking_payload["pre_guard_anchor_diagnostics"].get(
-            "diagnostic_only"
-        )
-        is True
-        and tracking_payload["pre_guard_anchor_diagnostics"].get("validated")
-        is False
-        else {}
+    anchors_matched_before_guard = _pre_guard_matched_anchor_count(
+        pre_guard_anchor_diagnostics
     )
-    try:
-        anchors_matched_before_guard = max(
-            0,
-            int(
-                pre_guard_anchor_diagnostics.get(
-                    "anchors_matched_before_guard",
-                    0,
-                )
-                or 0
-            ),
-        )
-    except (TypeError, ValueError):
-        anchors_matched_before_guard = 0
     tracking_failed = tracking_payload.get("tracking_success") is False
     tracking_incomplete = bool(tracking_payload.get("partial") is True)
     analysis_outcome = {
@@ -127,7 +162,9 @@ def apply_tracking_outcome(
         ),
         "metrics_scope": "selected_player",
         "observed_samples": observed_samples,
-        "segments_with_player": int(tracking_payload.get("segments_with_player") or 0),
+        "segments_with_player": int(
+            tracking_payload.get("segments_with_player") or 0
+        ),
         "autonomous_segments_with_player": int(
             tracking_payload.get("autonomous_segments_with_player") or 0
         ),
