@@ -2063,6 +2063,27 @@ def track_player_windowed_reid(
                     source=local_profile.source,
                 )
             coverage = len(manual_bboxes) / float(max(1, len(samples))) * 100.0
+            manual_evidence_ranges = [
+                {
+                    "start": round(
+                        max(
+                            float(window_start),
+                            float(observation["anchor"]["t"])
+                            - float(anchor_tracklet_radius),
+                        ),
+                        6,
+                    ),
+                    "end": round(
+                        min(
+                            float(window_end),
+                            float(observation["anchor"]["t"])
+                            + float(anchor_tracklet_radius),
+                        ),
+                        6,
+                    ),
+                }
+                for observation in manual_observations
+            ]
             primary_track_id = manual_track_ids[0]
             segments_by_index[root_index] = {
                 "window_index": int(root_index),
@@ -2100,6 +2121,7 @@ def track_player_windowed_reid(
                         )
                     ],
                     "descriptor": _descriptor_metadata(local_profile.descriptor),
+                    "manual_evidence_ranges": manual_evidence_ranges,
                     "candidates": [],
                 },
             }
