@@ -2008,7 +2008,8 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertFalse(output["tracking_success"])
         self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
         self.assertEqual(output["tracking_scope_status"], "ANCHOR_ONLY")
-        self.assertEqual(output["autonomous_segments_with_player"], 0)
+        self.assertEqual(output["autonomous_segments_with_player"], 1)
+        self.assertEqual(output["autonomous_bboxes_count"], 1)
         profiles = {
             item["window_number"]: (item["fps"], item["model"])
             for item in type(self).collection_profiles
@@ -2077,8 +2078,14 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 video_duration_sec=115.0,
             )
 
-        self.assertFalse(output["tracking_success"])
-        self.assertEqual(output["tracking_status"], "ANCHOR_ONLY")
+        self.assertTrue(output["tracking_success"])
+        self.assertEqual(
+            output["tracking_status"],
+            "SPARSE_CROSS_WINDOW_EVIDENCE",
+        )
+        self.assertEqual(output["tracking_scope_status"], "CROSS_WINDOW_EVIDENCE")
+        self.assertEqual(output["autonomous_segments_with_player"], 1)
+        self.assertEqual(output["autonomous_bboxes_count"], 2)
         self.assertEqual(output["anchor_acquisition"]["seed_anchor_id"], 2)
         self.assertEqual(output["anchor_acquisition"]["seed_window_index"], 2)
         self.assertEqual(
