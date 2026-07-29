@@ -237,52 +237,16 @@ def autonomous_tracking_evidence(
     fps: float,
     require_retained_chain: bool = False,
 ) -> dict[str, Any]:
-    """Measure motion-linked evidence outside explicit manual neighborhoods.
+    """Measure evidence outside the union of all manual-anchor windows."""
 
-    New anchor segments declare the bounded interval influenced by each manual
-    selection. Legacy or malformed anchor metadata remains fail-closed by
-    treating the complete anchor window as manual evidence.
-    """
-
-    anchor_windows: list[tuple[float, float]] = []
-    manual_evidence_ranges: list[tuple[float, float]] = []
-    scoped_anchor_indices: set[int] = set()
-    for index, segment in enumerate(segments):
-        if str(segment.get("direction") or "").lower() != "anchor":
-            continue
-        window_start = float(segment.get("window_start") or 0.0)
-        window_end = float(segment.get("window_end") or 0.0)
-        anchor_windows.append((window_start, window_end))
-        reid = segment.get("reid") if isinstance(segment.get("reid"), Mapping) else {}
-        raw_ranges = reid.get("manual_evidence_ranges")
-        parsed_ranges: list[tuple[float, float]] = []
-        ranges_valid = isinstance(raw_ranges, list) and bool(raw_ranges)
-        for raw_range in raw_ranges if isinstance(raw_ranges, list) else []:
-            if not isinstance(raw_range, Mapping):
-                ranges_valid = False
-                break
-            try:
-                range_start = float(raw_range["start"])
-                range_end = float(raw_range["end"])
-            except (KeyError, TypeError, ValueError):
-                ranges_valid = False
-                break
-            if (
-                not math.isfinite(range_start)
-                or not math.isfinite(range_end)
-                or range_start > range_end
-                or range_start < window_start - 1e-6
-                or range_end > window_end + 1e-6
-            ):
-                ranges_valid = False
-                break
-            parsed_ranges.append((range_start, range_end))
-        if ranges_valid and parsed_ranges:
-            manual_evidence_ranges.extend(parsed_ranges)
-            scoped_anchor_indices.add(index)
-        else:
-            manual_evidence_ranges.append((window_start, window_end))
-
+    anchor_windows = [
+        (
+            float(segment.get("window_start") or 0.0),
+            float(segment.get("window_end") or 0.0),
+        )
+        for segment in segments
+        if str(segment.get("direction") or "").lower() == "anchor"
+    ]
     boundary_tolerance = max(1e-6, 1.0 / max(1e-9, float(fps)))
     try:
         minimum_samples = int(os.environ.get("PLAYER_REID_MIN_AUTONOMOUS_SAMPLES", "2"))
@@ -297,7 +261,6 @@ def autonomous_tracking_evidence(
         "boundary_tolerance_sec": round(boundary_tolerance, 6),
         "segment_counts": {},
         "anchor_windows": anchor_windows,
-        "manual_evidence_ranges": manual_evidence_ranges,
     }
     if not anchor_windows:
         return empty
@@ -309,13 +272,11 @@ def autonomous_tracking_evidence(
     unique_times: set[float] = set()
     segment_counts: dict[int, int] = {}
     for index, segment in enumerate(segments):
-        is_anchor = str(segment.get("direction") or "").lower() == "anchor"
         if (
-            str(segment.get("identity_status") or "").upper() != "ACCEPTED"
-            or (is_anchor and index not in scoped_anchor_indices)
+            str(segment.get("direction") or "").lower() == "anchor"
+            or str(segment.get("identity_status") or "").upper() != "ACCEPTED"
             or (
-                not is_anchor
-                and retained_chain_indices is not None
+                retained_chain_indices is not None
                 and index not in retained_chain_indices
             )
         ):
@@ -333,7 +294,7 @@ def autonomous_tracking_evidence(
             if all(
                 timestamp < start - boundary_tolerance
                 or timestamp > end + boundary_tolerance
-                for start, end in manual_evidence_ranges
+                for start, end in anchor_windows
             ):
                 outside_times.add(round(timestamp, 6))
         if outside_times:
@@ -346,6 +307,7 @@ def autonomous_tracking_evidence(
         "bboxes_count": len(unique_times),
         "segment_counts": segment_counts,
     }
+
 
 def retained_autonomous_chain_indices(
     segments: Sequence[Mapping[str, Any]],
