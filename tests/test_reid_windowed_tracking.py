@@ -390,8 +390,12 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             }
             for time_sec in (0.0, 5.0, 10.0)
         ]
-        bboxes, link_bboxes, track_ids, seed_times = (
-            self.module._stitch_manual_anchor_bboxes(
+        (
+            bboxes,
+            link_bboxes,
+            track_ids,
+            seed_times,
+        ) = self.module._stitch_manual_anchor_bboxes(
             [
                 {
                     "anchor": {"anchor_id": 1, "t": 10.0, **_bbox()},
@@ -407,7 +411,6 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             fps=1,
             window_start=0.0,
             radius_sec=1.0,
-        )
         )
 
         self.assertEqual(track_ids, [7])
