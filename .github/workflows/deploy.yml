@@ -62,9 +62,19 @@ jobs:
                 -pkeyopt rsa_oaep_md:sha256 \
                 -in "$SEALED_LGI_URL" \
                 -out "$DECRYPTED_LGI_URL"
-              python scripts/set_secret_env.py \
-                /opt/AlgoNext/.env \
-                LGI_READONLY_DATABASE_URL < "$DECRYPTED_LGI_URL"
+              if command -v python3 >/dev/null 2>&1; then
+                python3 scripts/set_secret_env.py \
+                  /opt/AlgoNext/.env \
+                  LGI_READONLY_DATABASE_URL < "$DECRYPTED_LGI_URL"
+              else
+                docker run --rm -i \
+                  -v /opt/AlgoNext:/repo \
+                  -w /repo \
+                  python:3.11-slim \
+                  python scripts/set_secret_env.py \
+                    /repo/.env \
+                    LGI_READONLY_DATABASE_URL < "$DECRYPTED_LGI_URL"
+              fi
               shred -u "$DECRYPTED_LGI_URL" 2>/dev/null || rm -f "$DECRYPTED_LGI_URL"
               trap - EXIT
               echo "LGI read-only runtime URL installed"
