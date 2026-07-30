@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -7,6 +8,10 @@ import cv2
 import numpy as np
 
 from app.reid.association import AppearanceDescriptor, DESCRIPTOR_VERSION
+from app.reid.osnet_embedding import (
+    OSNET_DESCRIPTOR_VERSION,
+    extract_osnet_embedding,
+)
 
 
 @dataclass(frozen=True)
@@ -106,7 +111,7 @@ def evaluate_crop_quality(crop: np.ndarray) -> CropQuality:
     )
 
 
-def extract_appearance_descriptor(
+def _extract_hsv_descriptor(
     crop: np.ndarray,
 ) -> AppearanceDescriptor | None:
     quality = evaluate_crop_quality(crop)
@@ -145,19 +150,84 @@ def extract_appearance_descriptor(
     )
 
 
+def configured_descriptor_version() -> str:
+    backend = os.environ.get("PLAYER_REID_DESCRIPTOR_BACKEND", "hsv").strip().lower()
+    return (
+        OSNET_DESCRIPTOR_VERSION
+        if backend in {"osnet", "osnet_hybrid", "hybrid_osnet"}
+        else DESCRIPTOR_VERSION
+    )
+
+
+def extract_appearance_descriptor(
+    crop: np.ndarray,
+) -> AppearanceDescriptor | None:
+    hsv_descriptor = _extract_hsv_descriptor(crop)
+    if hsv_descriptor is None:
+        return None
+    backend = os.environ.get("PLAYER_REID_DESCRIPTOR_BACKEND", "hsv").strip().lower()
+    if backend not in {"osnet", "osnet_hybrid", "hybrid_osnet"}:
+        return hsv_descriptor
+
+    osnet_vector = extract_osnet_embedding(crop)
+    if osnet_vector is None:
+        fail_open = (
+            os.environ.get("PLAYER_REID_LEARNED_FAIL_OPEN", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        return hsv_descriptor if fail_open else None
+
+    hsv_vector = np.asarray(hsv_descriptor.vector, dtype=np.float64)
+    learned_vector = np.asarray(osnet_vector, dtype=np.float64)
+    hsv_norm = float(np.linalg.norm(hsv_vector))
+    learned_norm = float(np.linalg.norm(learned_vector))
+    if hsv_norm <= 1e-12 or learned_norm <= 1e-12:
+        return hsv_descriptor
+
+    # Preserve kit-colour discrimination while making the learned,
+    # person-ReID-specific embedding the dominant identity signal.
+    combined = np.concatenate(
+        [
+            (hsv_vector / hsv_norm) * np.sqrt(0.30),
+            (learned_vector / learned_norm) * np.sqrt(0.70),
+        ]
+    )
+    combined_norm = float(np.linalg.norm(combined))
+    if combined_norm <= 1e-12:
+        return hsv_descriptor
+    combined = combined / combined_norm
+    return AppearanceDescriptor(
+        vector=tuple(float(value) for value in combined),
+        sample_count=1,
+        quality=hsv_descriptor.quality,
+        version=OSNET_DESCRIPTOR_VERSION,
+    )
+
+
 def aggregate_appearance_descriptors(
     descriptors: Iterable[AppearanceDescriptor],
 ) -> AppearanceDescriptor | None:
     values = list(descriptors)
     if not values:
         return None
-    version = values[0].version
-    dimension = len(values[0].vector)
+    groups: dict[tuple[str, int], list[AppearanceDescriptor]] = {}
     for descriptor in values:
-        if descriptor.version != version or len(descriptor.vector) != dimension:
-            raise ValueError(
-                "all appearance descriptors must use the same version and dimension"
-            )
+        groups.setdefault(
+            (descriptor.version, len(descriptor.vector)),
+            [],
+        ).append(descriptor)
+    # A transient learned-inference miss must never crash a complete tracking
+    # window. Prefer learned descriptors whenever at least one survived; their
+    # sample count still feeds the conservative association sufficiency gate.
+    version, dimension = max(
+        groups,
+        key=lambda key: (
+            key[0] == OSNET_DESCRIPTOR_VERSION,
+            len(groups[key]),
+            sum(item.quality for item in groups[key]),
+        ),
+    )
+    values = groups[(version, dimension)]
     weights = np.array(
         [
             max(0.05, descriptor.quality) * descriptor.sample_count

@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/pitch-keypoint-benchmark-report-v1.schema.json",
+  "title": "AlgoNext pitch keypoint benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "thresholds", "pitch", "counts", "metrics", "per_frame", "note"
+  ],
+  "properties": {
+    "schema_version": {"const": "pitch-keypoint-benchmark-report-v1"},
+    "thresholds": {"type": "object"},
+    "pitch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["length_m", "width_m"],
+      "properties": {
+        "length_m": {"type": "number", "minimum": 90, "maximum": 120},
+        "width_m": {"type": "number", "minimum": 45, "maximum": 90}
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frames", "pitch_frames", "non_pitch_frames",
+        "visible_ground_truth_keypoints", "accepted_predicted_keypoints",
+        "true_positives", "false_positives", "false_negatives", "abstained_frames",
+        "calibration_attempted_frames", "calibration_solved_frames",
+        "calibration_validated_frames"
+      ],
+      "properties": {
+        "frames": {"type": "integer", "minimum": 1},
+        "pitch_frames": {"type": "integer", "minimum": 0},
+        "non_pitch_frames": {"type": "integer", "minimum": 0},
+        "visible_ground_truth_keypoints": {"type": "integer", "minimum": 0},
+        "accepted_predicted_keypoints": {"type": "integer", "minimum": 0},
+        "true_positives": {"type": "integer", "minimum": 0},
+        "false_positives": {"type": "integer", "minimum": 0},
+        "false_negatives": {"type": "integer", "minimum": 0},
+        "abstained_frames": {"type": "integer", "minimum": 0},
+        "calibration_attempted_frames": {"type": "integer", "minimum": 0},
+        "calibration_solved_frames": {"type": "integer", "minimum": 0},
+        "calibration_validated_frames": {"type": "integer", "minimum": 0}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_precision", "semantic_recall", "semantic_f1", "label_match_count",
+        "mean_normalized_error", "median_normalized_error", "p95_normalized_error",
+        "pck_01", "pck_02", "pck_05", "pitch_frame_prediction_coverage",
+        "non_pitch_false_positive_rate", "abstention_rate", "calibration_attempt_rate",
+        "calibration_solved_rate", "calibration_validated_rate"
+      ],
+      "properties": {
+        "semantic_precision": {"$ref": "#/$defs/probability"},
+        "semantic_recall": {"$ref": "#/$defs/probability"},
+        "semantic_f1": {"$ref": "#/$defs/probability"},
+        "label_match_count": {"type": "integer", "minimum": 0},
+        "mean_normalized_error": {"$ref": "#/$defs/nullableNonNegative"},
+        "median_normalized_error": {"$ref": "#/$defs/nullableNonNegative"},
+        "p95_normalized_error": {"$ref": "#/$defs/nullableNonNegative"},
+        "pck_01": {"$ref": "#/$defs/probability"},
+        "pck_02": {"$ref": "#/$defs/probability"},
+        "pck_05": {"$ref": "#/$defs/probability"},
+        "pitch_frame_prediction_coverage": {"$ref": "#/$defs/probability"},
+        "non_pitch_false_positive_rate": {"$ref": "#/$defs/probability"},
+        "abstention_rate": {"$ref": "#/$defs/probability"},
+        "calibration_attempt_rate": {"$ref": "#/$defs/probability"},
+        "calibration_solved_rate": {"$ref": "#/$defs/probability"},
+        "calibration_validated_rate": {"$ref": "#/$defs/probability"}
+      }
+    },
+    "per_frame": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "frame_id", "split", "is_pitch_view", "prediction_abstained",
+          "accepted_prediction_count", "ground_truth_count", "true_positives",
+          "false_positives", "false_negatives", "mean_localization_error", "calibration"
+        ],
+        "properties": {
+          "frame_id": {"type": "string", "minLength": 1},
+          "split": {"enum": ["development", "validation", "test"]},
+          "is_pitch_view": {"type": "boolean"},
+          "prediction_abstained": {"type": "boolean"},
+          "accepted_prediction_count": {"type": "integer", "minimum": 0},
+          "ground_truth_count": {"type": "integer", "minimum": 0},
+          "true_positives": {"type": "integer", "minimum": 0},
+          "false_positives": {"type": "integer", "minimum": 0},
+          "false_negatives": {"type": "integer", "minimum": 0},
+          "mean_localization_error": {"$ref": "#/$defs/nullableNonNegative"},
+          "calibration": {"type": "object"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "note": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "probability": {"type": "number", "minimum": 0, "maximum": 1},
+    "nullableNonNegative": {
+      "type": ["number", "null"],
+      "minimum": 0
+    }
+  }
+}

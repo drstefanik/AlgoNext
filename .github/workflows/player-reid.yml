@@ -9,6 +9,7 @@ on:
       - "app/workers/tracking.py"
       - "docker-compose.yml"
       - "tests/test_reid_appearance.py"
+      - "tests/test_match_observations.py"
       - "tests/test_reid_association.py"
       - "tests/test_reid_benchmark_evidence.py"
       - "tests/test_reid_team_color_guard.py"
@@ -30,6 +31,7 @@ on:
       - "app/workers/tracking.py"
       - "docker-compose.yml"
       - "tests/test_reid_appearance.py"
+      - "tests/test_match_observations.py"
       - "tests/test_reid_association.py"
       - "tests/test_reid_benchmark_evidence.py"
       - "tests/test_reid_team_color_guard.py"
@@ -69,6 +71,7 @@ jobs:
           python -m py_compile
           app/reid/__init__.py
           app/reid/appearance.py
+          app/reid/osnet_embedding.py
           app/reid/association.py
           app/reid/benchmark_evidence.py
           app/reid/team_color_guard.py
@@ -80,7 +83,9 @@ jobs:
           app/core/preview_asset_policy.py
           app/workers/pipeline.py
           app/workers/tracking.py
+          app/vision/match_observations.py
           tests/test_reid_appearance.py
+          tests/test_match_observations.py
           tests/test_reid_association.py
           tests/test_reid_benchmark_evidence.py
           tests/test_reid_team_color_guard.py
@@ -96,6 +101,7 @@ jobs:
         run: >-
           python -m unittest
           tests/test_reid_appearance.py
+          tests/test_match_observations.py
           tests/test_reid_association.py
           tests/test_reid_benchmark_evidence.py
           tests/test_reid_team_color_guard.py

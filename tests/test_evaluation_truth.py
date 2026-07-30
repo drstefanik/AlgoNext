@@ -247,6 +247,78 @@ class EvaluationTruthTests(unittest.TestCase):
         )
         self.assertFalse(evaluation["capabilities"]["technical_tactical_scoring"])
 
+    def test_operational_observability_is_exposed_as_experimental(self):
+        tracking = {
+            "identity_mode": "appearance_reid_v1",
+            "tracking_scope_status": "CROSS_WINDOW_EVIDENCE",
+            "coverage_pct_total": 8.0,
+            "segments_total": 5,
+            "segments_with_player": 3,
+            "segments": [
+                {
+                    "bboxes": [
+                        {"t": 0.0, "x": 0.1, "y": 0.2, "w": 0.1, "h": 0.3},
+                        {"t": 1.0, "x": 0.2, "y": 0.2, "w": 0.1, "h": 0.3},
+                    ],
+                    "camera_motion": {
+                        "player_motion": {
+                            "available": True,
+                            "compensated_path_length": 0.03,
+                        }
+                    },
+                }
+            ],
+            "reid_summary": {
+                "validated": False,
+                "accepted_associations": 2,
+            },
+            "camera_motion": {
+                "available": True,
+                "validated": False,
+                "method": "multi-person-median-displacement-v1",
+            },
+            "ball_tracking": {
+                "available": True,
+                "validated": False,
+                "method": "yolo-coco-sports-ball+bytetrack-v1",
+            },
+            "event_detection": {
+                "available": True,
+                "validated": False,
+                "method": "selected-player-ball-proximity-v1",
+            },
+        }
+
+        evaluation = build_tracking_evaluation(tracking=tracking)
+
+        self.assertFalse(
+            evaluation["capabilities"]["cross_shot_player_reidentification"]
+        )
+        self.assertTrue(evaluation["capabilities"]["camera_motion_compensation"])
+        self.assertTrue(evaluation["capabilities"]["ball_tracking"])
+        self.assertTrue(evaluation["capabilities"]["event_detection"])
+        self.assertEqual(
+            evaluation["capability_details"][
+                "cross_shot_player_reidentification"
+            ]["status"],
+            "experimental",
+        )
+        self.assertEqual(
+            evaluation["capability_details"]["pitch_calibration"]["status"],
+            "foundation",
+        )
+        self.assertIn(
+            "BALL_AND_EVENTS_EXPERIMENTAL_NOT_VALIDATED",
+            evaluation["reason_codes"],
+        )
+        self.assertNotIn(
+            "BALL_AND_EVENTS_NOT_MODELLED",
+            evaluation["reason_codes"],
+        )
+        self.assertTrue(
+            evaluation["signals"]["image_motion"]["camera_motion_compensated"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

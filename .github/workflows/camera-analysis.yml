@@ -9,6 +9,7 @@ on:
       - "tests/test_pitch_geometry.py"
       - "tests/test_shot_segmentation.py"
       - "tests/test_camera_analysis*.py"
+      - "tests/test_match_observations.py"
       - "tests/synthetic_pitch.py"
       - "docs/camera_analysis.md"
       - "docs/schemas/camera-analysis-v1.schema.json"
@@ -20,6 +21,7 @@ on:
       - "tests/test_pitch_geometry.py"
       - "tests/test_shot_segmentation.py"
       - "tests/test_camera_analysis*.py"
+      - "tests/test_match_observations.py"
       - "tests/synthetic_pitch.py"
       - "docs/camera_analysis.md"
       - "docs/schemas/camera-analysis-v1.schema.json"
@@ -55,6 +57,7 @@ jobs:
           app/vision/pitch_geometry.py
           app/vision/shot_segmentation.py
           app/vision/camera_analysis.py
+          app/vision/match_observations.py
           scripts/analyze_camera_segments.py
           tests/synthetic_pitch.py
           tests/test_pitch_geometry.py
@@ -62,6 +65,7 @@ jobs:
           tests/test_camera_analysis.py
           tests/test_camera_analysis_schema.py
           tests/test_camera_analysis_video.py
+          tests/test_match_observations.py
 
       - name: Run deterministic camera-analysis tests
         id: tests
@@ -74,6 +78,7 @@ jobs:
             tests/test_camera_analysis.py \
             tests/test_camera_analysis_schema.py \
             tests/test_camera_analysis_video.py \
+            tests/test_match_observations.py \
             > /tmp/camera-analysis-tests.log 2>&1
           status=$?
           cat /tmp/camera-analysis-tests.log

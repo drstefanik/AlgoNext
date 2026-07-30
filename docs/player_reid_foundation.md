@@ -69,7 +69,18 @@ the entire match.
 
 ## Appearance descriptor
 
-`hsv-torso-v1` is a lightweight baseline built from:
+Production workers now default to
+`osnet-x0.25-msmt17+hsv-torso-v2`, a hybrid descriptor combining:
+
+- a person-ReID-specific OSNet x0.25 embedding trained on MSMT17;
+- the existing upper/lower-body kit-colour descriptor;
+- a fail-open rollback to `hsv-torso-v1` if the learned model is unavailable.
+
+The worker image prefetches the checkpoint during build. No identity model is
+downloaded while a match is running. `PLAYER_REID_DESCRIPTOR_BACKEND=hsv`
+provides an immediate runtime rollback.
+
+`hsv-torso-v1` remains the lightweight baseline built from:
 
 - separate upper- and lower-body regions;
 - hue, saturation and value histograms;

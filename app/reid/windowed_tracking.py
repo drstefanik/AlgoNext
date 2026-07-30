@@ -14,6 +14,7 @@ from ultralytics import YOLO
 from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
+    configured_descriptor_version,
     crop_from_normalized_bbox,
     extract_appearance_descriptor,
 )
@@ -38,6 +39,10 @@ from app.reid.window_logic import (
     largest_tracking_gap_sec,
     temporal_overlap_score,
     tracking_coverage_pct,
+)
+from app.vision.match_observations import (
+    aggregate_segment_observability,
+    build_segment_observability,
 )
 from app.workers import tracking as legacy
 from app.workers.multi_anchor import normalize_anchors
@@ -126,7 +131,7 @@ def _reset_tracker(model: YOLO) -> None:
 def _descriptor_metadata(descriptor: AppearanceDescriptor | None) -> dict[str, Any]:
     if descriptor is None:
         return {
-            "version": DESCRIPTOR_VERSION,
+            "version": configured_descriptor_version(),
             "sample_count": 0,
             "quality": 0.0,
         }
@@ -1341,8 +1346,16 @@ def _anchor_failure_output(
     )
     return {
         "mode": "full_match_windowed",
-        "identity_mode": "appearance_reid_v1",
-        "method": "yolo+bytetrack+appearance_reid",
+        "identity_mode": (
+            "appearance_reid_v2_osnet"
+            if configured_descriptor_version() != DESCRIPTOR_VERSION
+            else "appearance_reid_v1"
+        ),
+        "method": (
+            "yolo+bytetrack+osnet_reid"
+            if configured_descriptor_version() != DESCRIPTOR_VERSION
+            else "yolo+bytetrack+appearance_reid"
+        ),
         "fps": fps,
         "window_sec": window_sec,
         "overlap_sec": overlap_sec,
@@ -2080,6 +2093,12 @@ def track_player_windowed_reid(
                 "sample_fps": sample_fps,
                 "lost_segments": [],
                 "bboxes": manual_bboxes,
+                **build_segment_observability(
+                    samples,
+                    manual_bboxes,
+                    window_start=float(window_start),
+                    fps=float(sample_fps),
+                ),
                 "reid": {
                     "version": ASSOCIATION_VERSION,
                     "validated": False,
@@ -2527,6 +2546,12 @@ def track_player_windowed_reid(
                 "sample_fps": sample_fps,
                 "lost_segments": lost_segments,
                 "bboxes": bboxes,
+                **build_segment_observability(
+                    samples,
+                    bboxes,
+                    window_start=float(window_start),
+                    fps=float(sample_fps),
+                ),
                 "reid": reid_payload,
                 "_continuity_component": {
                     "track_id": selected_track_id,
@@ -2798,8 +2823,16 @@ def track_player_windowed_reid(
     )
     output: dict[str, Any] = {
         "mode": "full_match_windowed",
-        "identity_mode": "appearance_reid_v1",
-        "method": "yolo+bytetrack+appearance_reid",
+        "identity_mode": (
+            "appearance_reid_v2_osnet"
+            if configured_descriptor_version() != DESCRIPTOR_VERSION
+            else "appearance_reid_v1"
+        ),
+        "method": (
+            "yolo+bytetrack+osnet_reid"
+            if configured_descriptor_version() != DESCRIPTOR_VERSION
+            else "yolo+bytetrack+appearance_reid"
+        ),
         "fps": fps,
         "window_sec": window_sec,
         "overlap_sec": overlap_sec,
@@ -2866,7 +2899,7 @@ def track_player_windowed_reid(
             "status": "EXPERIMENTAL",
             "validated": False,
             "identity_id": identity_id,
-            "descriptor_version": DESCRIPTOR_VERSION,
+            "descriptor_version": configured_descriptor_version(),
             "association_version": ASSOCIATION_VERSION,
             "anchor_window_index": anchor_index,
             "anchor_local_track_id": anchor_track_id,
@@ -2898,6 +2931,7 @@ def track_player_windowed_reid(
             "descriptor, temporal overlap, and geometry. Ambiguous windows are "
             "omitted instead of being assigned to the selected player."
         ),
+        **aggregate_segment_observability(segments),
     }
     return _persist_tracking_output(
         job_id,

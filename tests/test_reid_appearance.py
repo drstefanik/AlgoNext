@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -9,6 +10,8 @@ from app.reid.appearance import (
     extract_appearance_descriptor,
 )
 from app.reid.association import cosine_similarity
+from app.reid.association import DESCRIPTOR_VERSION
+from app.reid.osnet_embedding import OSNET_DESCRIPTOR_VERSION
 
 
 def player_crop(upper_bgr, lower_bgr):
@@ -68,6 +71,59 @@ class ReIdAppearanceTests(unittest.TestCase):
         self.assertIsNotNone(crop)
         self.assertEqual(crop.shape[:2], (60, 50))
         self.assertEqual(int(crop.mean()), 255)
+
+    def test_osnet_backend_combines_learned_and_colour_features(self):
+        with patch.dict(
+            "os.environ",
+            {"PLAYER_REID_DESCRIPTOR_BACKEND": "osnet_hybrid"},
+        ), patch(
+            "app.reid.appearance.extract_osnet_embedding",
+            return_value=(1.0, 0.0, 0.0, 0.0),
+        ):
+            descriptor = extract_appearance_descriptor(
+                player_crop((20, 20, 220), (20, 20, 80))
+            )
+
+        self.assertIsNotNone(descriptor)
+        self.assertEqual(descriptor.version, OSNET_DESCRIPTOR_VERSION)
+        self.assertGreater(len(descriptor.vector), 4)
+
+    def test_osnet_backend_falls_back_without_model(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "PLAYER_REID_DESCRIPTOR_BACKEND": "osnet_hybrid",
+                "PLAYER_REID_LEARNED_FAIL_OPEN": "1",
+            },
+        ), patch(
+            "app.reid.appearance.extract_osnet_embedding",
+            return_value=None,
+        ):
+            descriptor = extract_appearance_descriptor(
+                player_crop((20, 20, 220), (20, 20, 80))
+            )
+
+        self.assertIsNotNone(descriptor)
+        self.assertNotEqual(descriptor.version, OSNET_DESCRIPTOR_VERSION)
+
+    def test_aggregation_prefers_surviving_learned_descriptors(self):
+        crop = player_crop((20, 20, 220), (20, 20, 80))
+        with patch.dict(
+            "os.environ",
+            {"PLAYER_REID_DESCRIPTOR_BACKEND": "osnet_hybrid"},
+        ), patch(
+            "app.reid.appearance.extract_osnet_embedding",
+            side_effect=[(1.0, 0.0, 0.0, 0.0), None],
+        ):
+            learned = extract_appearance_descriptor(crop)
+            fallback = extract_appearance_descriptor(crop)
+
+        self.assertEqual(learned.version, OSNET_DESCRIPTOR_VERSION)
+        self.assertEqual(fallback.version, DESCRIPTOR_VERSION)
+        aggregate = aggregate_appearance_descriptors([fallback, learned])
+        self.assertIsNotNone(aggregate)
+        self.assertEqual(aggregate.version, OSNET_DESCRIPTOR_VERSION)
+        self.assertEqual(aggregate.sample_count, 1)
 
 
 if __name__ == "__main__":

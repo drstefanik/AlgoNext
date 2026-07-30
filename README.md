@@ -21,6 +21,11 @@ cp .env.example .env
 | `SIGNED_URL_EXPIRES_SECONDS` | Expiration for presigned URLs. |
 | `PREVIEW_FRAME_COUNT` | Number of preview frames to extract per job (default: 16). |
 | `FULL_MATCH_MODE` | Enable full-match windowed tracking (set to `1` to use 45s windows with 10s overlap). |
+| `PLAYER_REID_DESCRIPTOR_BACKEND` | `osnet_hybrid` uses the packaged OSNet person-ReID embedding plus kit colour; `hsv` is the rollback baseline. |
+| `PLAYER_REID_OSNET_MODEL_PATH` | Local OSNet checkpoint path. The worker image prefetches the default MSMT17 x0.25 model. |
+| `PLAYER_REID_LEARNED_FAIL_OPEN` | Fall back to the conservative HSV descriptor if OSNet cannot load. |
+| `BALL_TRACKING_ENABLED` | Collect COCO sports-ball observations in the existing YOLO/ByteTrack pass. |
+| `BALL_TRACKING_MIN_CONFIDENCE` | Minimum ball confidence retained for experimental trajectory/event diagnostics. |
 
 **VPS example values**
 
@@ -94,6 +99,19 @@ curl -s "https://api.nextgroupintl.com/jobs/<id>/frames?count=16" | jq '.data.it
 
 Expected result: `16` (when at least 16 preview frames are available).
 
+## Match observability
+
+The full-match tracker now emits a versioned `match-observability-v1` contract:
+
+- robust multi-person median camera-motion compensation inside each window;
+- ball observations from the same YOLO/ByteTrack pass, without rescanning the video;
+- selected-player/ball proximity sequences as auditable event candidates;
+- dynamic capability details (`available`, `experimental`, `foundation`, `unavailable`).
+
+These signals are deliberately marked `validated: false` until their locked
+real-match benchmarks pass. They enrich diagnostics but do not bypass the
+player-evaluation truth gate.
+
 ## GitHub Actions Deploy
 
 Create these GitHub Secrets for the repository:
@@ -131,4 +149,3 @@ When ready (`DONE`), the payload includes `report` with strict JSON fields:
 
 Environment:
 - `OPENAI_MODEL` defaults to `gpt-5.2`
-
