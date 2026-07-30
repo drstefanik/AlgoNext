@@ -26,6 +26,10 @@ from app.core.db import SessionLocal
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
 from app.core.tracking_outcome import StaleAnalysisAttemptError
+from app.vision.match_observations import (
+    aggregate_segment_observability,
+    build_segment_observability,
+)
 from app.workers.multi_anchor import (
     assign_anchors_to_windows,
     normalize_anchors,
@@ -528,6 +532,17 @@ def _collect_window_samples(
 
     samples: List[Dict[str, Any]] = []
     track_map: Dict[int, List[Dict[str, Any]]] = {}
+    ball_tracking_enabled = (
+        os.environ.get("BALL_TRACKING_ENABLED", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    try:
+        configured_ball_confidence = float(
+            os.environ.get("BALL_TRACKING_MIN_CONFIDENCE", "0.10")
+        )
+    except (TypeError, ValueError):
+        configured_ball_confidence = 0.10
+    ball_min_confidence = max(0.01, min(0.95, configured_ball_confidence))
 
     frame_index = 0
     processed_samples = 0
@@ -546,27 +561,56 @@ def _collect_window_samples(
                 source=frame,
                 persist=True,
                 tracker=tracker,
-                conf=0.25,
+                conf=min(0.25, ball_min_confidence) if ball_tracking_enabled else 0.25,
                 iou=0.5,
-                classes=[0],
+                classes=[0, 32] if ball_tracking_enabled else [0],
                 verbose=False,
             )
             detections: List[Dict[str, Any]] = []
+            ball_detections: List[Dict[str, Any]] = []
             if results:
                 boxes = results[0].boxes
                 if boxes is not None and boxes.xyxy is not None:
                     xyxy = boxes.xyxy.cpu().numpy()
                     confs = boxes.conf.cpu().numpy() if boxes.conf is not None else []
                     ids = boxes.id.cpu().numpy() if boxes.id is not None else []
+                    classes = (
+                        boxes.cls.cpu().numpy()
+                        if getattr(boxes, "cls", None) is not None
+                        else np.zeros(len(xyxy), dtype=np.float32)
+                    )
                     for idx in range(len(xyxy)):
-                        if idx >= len(ids):
-                            continue
-                        track_id = ids[idx]
-                        if track_id is None:
-                            continue
+                        class_id = int(classes[idx]) if idx < len(classes) else 0
+                        confidence = (
+                            float(confs[idx]) if idx < len(confs) else 0.0
+                        )
+                        track_id = ids[idx] if idx < len(ids) else None
                         bbox_norm = _bbox_xyxy_to_xywh_norm(
                             tuple(xyxy[idx]), width, height
                         )
+                        if class_id == 32:
+                            if confidence < ball_min_confidence:
+                                continue
+                            ball_detections.append(
+                                {
+                                    "track_id": (
+                                        int(track_id)
+                                        if track_id is not None
+                                        else None
+                                    ),
+                                    "bbox": {
+                                        "x": bbox_norm[0],
+                                        "y": bbox_norm[1],
+                                        "w": bbox_norm[2],
+                                        "h": bbox_norm[3],
+                                    },
+                                    "conf": confidence,
+                                    "class_id": class_id,
+                                }
+                            )
+                            continue
+                        if class_id != 0 or confidence < 0.25 or track_id is None:
+                            continue
                         detection = {
                             "track_id": int(track_id),
                             "bbox": {
@@ -575,7 +619,7 @@ def _collect_window_samples(
                                 "w": bbox_norm[2],
                                 "h": bbox_norm[3],
                             },
-                            "conf": float(confs[idx]) if idx < len(confs) else 0.0,
+                            "conf": confidence,
                         }
                         detections.append(detection)
                         track_map.setdefault(int(track_id), []).append(
@@ -587,7 +631,13 @@ def _collect_window_samples(
                             }
                         )
 
-            samples.append({"t": float(timestamp), "detections": detections})
+            samples.append(
+                {
+                    "t": float(timestamp),
+                    "detections": detections,
+                    "ball_detections": ball_detections,
+                }
+            )
             processed_samples += 1
             now = time.monotonic()
             if now - tracking_started_at > tracking_timeout_seconds:
@@ -1190,6 +1240,12 @@ def track_player_windowed(
                 "coverage_pct": round(float(coverage_pct), 2),
                 "lost_segments": lost_segments,
                 "bboxes": bboxes,
+                **build_segment_observability(
+                    samples,
+                    bboxes,
+                    window_start=float(window_start),
+                    fps=float(fps),
+                ),
             }
         )
 
@@ -1238,6 +1294,7 @@ def track_player_windowed(
         "largest_gap_sec": round(float(largest_gap_sec), 2),
         "coverage_pct": round(coverage_pct_total, 2),
         "anchors_used": {"player_ref": player_ref_norm, "selections": anchors},
+        **aggregate_segment_observability(segments),
     }
 
     tracking_dir = (

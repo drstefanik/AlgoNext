@@ -1,0 +1,39 @@
+{
+  "schema_version": "pitch-keypoint-prediction-v1",
+  "frames": [
+    {
+      "frame_id": "demo-pitch-0001",
+      "video_id": "demo-match",
+      "shot_id": "shot-0001",
+      "time_sec": 10.0,
+      "abstained": false,
+      "model_version": "fixture-perfect-v1",
+      "configuration_hash": "sha256:fixture-perfect",
+      "reason_codes": [],
+      "keypoints": [
+        {"landmark": "corner_left_top", "x": 0.1, "y": 0.15, "confidence": 0.99},
+        {"landmark": "corner_left_bottom", "x": 0.1, "y": 0.85, "confidence": 0.99},
+        {"landmark": "corner_right_top", "x": 0.9, "y": 0.15, "confidence": 0.99},
+        {"landmark": "corner_right_bottom", "x": 0.9, "y": 0.85, "confidence": 0.99},
+        {"landmark": "halfway_top", "x": 0.5, "y": 0.15, "confidence": 0.99},
+        {"landmark": "halfway_bottom", "x": 0.5, "y": 0.85, "confidence": 0.99},
+        {"landmark": "centre_spot", "x": 0.5, "y": 0.5, "confidence": 0.99},
+        {"landmark": "left_penalty_area_top", "x": 0.22571429, "y": 0.29247059, "confidence": 0.99},
+        {"landmark": "left_penalty_area_bottom", "x": 0.22571429, "y": 0.70752941, "confidence": 0.99},
+        {"landmark": "right_penalty_area_top", "x": 0.77428571, "y": 0.29247059, "confidence": 0.99},
+        {"landmark": "right_penalty_area_bottom", "x": 0.77428571, "y": 0.70752941, "confidence": 0.99}
+      ]
+    },
+    {
+      "frame_id": "demo-non-pitch-0002",
+      "video_id": "demo-match",
+      "shot_id": "shot-0002",
+      "time_sec": 12.0,
+      "abstained": true,
+      "model_version": "fixture-perfect-v1",
+      "configuration_hash": "sha256:fixture-perfect",
+      "reason_codes": ["NON_PITCH_VIEW"],
+      "keypoints": []
+    }
+  ]
+}

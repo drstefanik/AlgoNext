@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://algonext.local/schemas/pitch-keypoint-prediction-v1.schema.json",
+  "title": "AlgoNext pitch keypoint prediction v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "frames"],
+  "properties": {
+    "schema_version": {"const": "pitch-keypoint-prediction-v1"},
+    "frames": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/frame"}
+    }
+  },
+  "$defs": {
+    "landmark": {
+      "enum": [
+        "centre_circle_left", "centre_circle_right", "centre_spot",
+        "corner_left_bottom", "corner_left_top", "corner_right_bottom", "corner_right_top",
+        "halfway_bottom", "halfway_top",
+        "left_goal_area_bottom", "left_goal_area_top", "left_penalty_area_bottom",
+        "left_penalty_area_top", "left_penalty_spot",
+        "right_goal_area_bottom", "right_goal_area_top", "right_penalty_area_bottom",
+        "right_penalty_area_top", "right_penalty_spot"
+      ]
+    },
+    "keypoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["landmark", "x", "y", "confidence"],
+      "properties": {
+        "landmark": {"$ref": "#/$defs/landmark"},
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_id", "video_id", "shot_id", "time_sec", "abstained",
+        "model_version", "configuration_hash", "reason_codes", "keypoints"
+      ],
+      "properties": {
+        "frame_id": {"type": "string", "minLength": 1},
+        "video_id": {"type": "string", "minLength": 1},
+        "shot_id": {"type": "string", "minLength": 1},
+        "time_sec": {"type": "number", "minimum": 0},
+        "abstained": {"type": "boolean"},
+        "model_version": {"type": "string", "minLength": 1},
+        "configuration_hash": {"type": "string", "minLength": 1},
+        "reason_codes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "keypoints": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/keypoint"}
+        }
+      }
+    }
+  }
+}

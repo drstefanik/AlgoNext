@@ -305,7 +305,33 @@ def compute_image_motion_metrics(
     else:
         p95_speed = 0.0
 
-    return {
+    camera_motion = _as_mapping(source.get("camera_motion"))
+    compensated_segments = [
+        _as_mapping(_as_mapping(segment.get("camera_motion")).get("player_motion"))
+        for segment in source.get("segments") or []
+        if isinstance(segment, Mapping)
+    ]
+    compensated_segments = [
+        item
+        for item in compensated_segments
+        if item.get("available") is True
+        and _safe_float(item.get("compensated_path_length")) is not None
+    ]
+    camera_motion_compensated = bool(
+        camera_motion.get("available") is True and compensated_segments
+    )
+    compensated_path_length = sum(
+        float(_safe_float(item.get("compensated_path_length")) or 0.0)
+        for item in compensated_segments
+    )
+    reported_path_length = (
+        compensated_path_length if camera_motion_compensated else path_length
+    )
+    reported_average_speed = (
+        reported_path_length / tracked_span_sec if tracked_span_sec > 0 else 0.0
+    )
+
+    metrics = {
         "metric_space": "image_plane_normalized",
         "camera_motion_compensated": False,
         "pitch_calibrated": False,
@@ -316,6 +342,28 @@ def compute_image_motion_metrics(
         "p95_center_speed_norm_per_sec": round(p95_speed, 6),
         "motion_bursts_proxy": motion_bursts,
     }
+    if camera_motion_compensated:
+        # Preserve the legacy exact contract when compensation is absent. Once
+        # active, suppress raw speed/burst fields rather than presenting them as
+        # compensated values.
+        metrics.update(
+            {
+                "metric_space": "camera_compensated_image_plane_normalized",
+                "camera_motion_compensated": True,
+                "camera_motion_validated": bool(
+                    camera_motion.get("validated") is True
+                ),
+                "normalized_path_length": round(reported_path_length, 6),
+                "raw_normalized_path_length": round(path_length, 6),
+                "avg_center_speed_norm_per_sec": round(
+                    reported_average_speed,
+                    6,
+                ),
+            }
+        )
+        metrics.pop("p95_center_speed_norm_per_sec", None)
+        metrics.pop("motion_bursts_proxy", None)
+    return metrics
 
 
 def sanitize_evidence_metrics(
@@ -481,32 +529,180 @@ def build_tracking_evaluation(
         if largest_gap_sec is not None and largest_gap_sec > 30.0:
             reason_codes.append("LONG_TRACKING_GAPS")
 
-    reason_codes.extend(
-        [
-            "IDENTITY_NOT_VERIFIED_ACROSS_SHOTS",
-            "CAMERA_MOTION_NOT_COMPENSATED",
-            "PITCH_NOT_CALIBRATED",
-            "BALL_AND_EVENTS_NOT_MODELLED",
-            "PLAYER_SCORING_NOT_VALIDATED",
-        ]
+    reid_summary = _as_mapping(tracking_source.get("reid_summary"))
+    reid_operational = bool(
+        tracking_source.get("identity_mode")
+        and (
+            int(_safe_float(reid_summary.get("accepted_associations")) or 0) > 0
+            or str(tracking_source.get("tracking_scope_status") or "").upper()
+            == "CROSS_WINDOW_EVIDENCE"
+        )
     )
+    reid_validated = bool(reid_summary.get("validated") is True)
+    camera_motion = _as_mapping(tracking_source.get("camera_motion"))
+    camera_motion_operational = bool(camera_motion.get("available") is True)
+    camera_motion_validated = bool(camera_motion.get("validated") is True)
+    pitch_calibration = _as_mapping(tracking_source.get("pitch_calibration"))
+    pitch_calibration_operational = bool(
+        pitch_calibration.get("available") is True
+        or pitch_calibration.get("validated") is True
+    )
+    pitch_calibration_validated = bool(
+        pitch_calibration.get("validated") is True
+    )
+    ball_tracking = _as_mapping(tracking_source.get("ball_tracking"))
+    ball_tracking_operational = bool(ball_tracking.get("available") is True)
+    ball_tracking_validated = bool(ball_tracking.get("validated") is True)
+    event_detection = _as_mapping(tracking_source.get("event_detection"))
+    event_detection_operational = bool(event_detection.get("available") is True)
+    event_detection_validated = bool(event_detection.get("validated") is True)
+    athletic_metrics = _as_mapping(tracking_source.get("athletic_metrics"))
+    athletic_metrics_operational = bool(
+        athletic_metrics.get("available") is True
+    )
+    athletic_metrics_validated = bool(
+        athletic_metrics.get("validated") is True
+    )
+
+    if not reid_validated:
+        reason_codes.append("IDENTITY_NOT_VERIFIED_ACROSS_SHOTS")
+    reason_codes.append(
+        "CAMERA_MOTION_EXPERIMENTAL_NOT_VALIDATED"
+        if camera_motion_operational and not camera_motion_validated
+        else "CAMERA_MOTION_NOT_COMPENSATED"
+    )
+    if not pitch_calibration_validated:
+        reason_codes.append("PITCH_NOT_CALIBRATED")
+    reason_codes.append(
+        "BALL_AND_EVENTS_EXPERIMENTAL_NOT_VALIDATED"
+        if ball_tracking_operational or event_detection_operational
+        else "BALL_AND_EVENTS_NOT_MODELLED"
+    )
+    reason_codes.append("PLAYER_SCORING_NOT_VALIDATED")
 
     capabilities = {
         "person_detection": True,
         "short_term_tracking": True,
-        "cross_shot_player_reidentification": False,
-        "camera_motion_compensation": False,
-        "pitch_calibration": False,
-        "ball_tracking": False,
-        "event_detection": False,
-        "athletic_metrics": False,
+        "cross_shot_player_reidentification": reid_validated,
+        "camera_motion_compensation": camera_motion_operational,
+        "pitch_calibration": pitch_calibration_validated,
+        "ball_tracking": ball_tracking_operational,
+        "event_detection": event_detection_operational,
+        "athletic_metrics": athletic_metrics_validated,
         "technical_tactical_scoring": False,
     }
 
+    capability_details = {
+        "person_detection": {
+            "status": "available",
+            "available": True,
+            "validated": True,
+            "method": "yolo-person-detection",
+        },
+        "short_term_tracking": {
+            "status": "available",
+            "available": True,
+            "validated": True,
+            "method": "bytetrack",
+        },
+        "cross_shot_player_reidentification": {
+            "status": (
+                "available"
+                if reid_validated
+                else "experimental" if reid_operational else "unavailable"
+            ),
+            "available": reid_validated,
+            "validated": reid_validated,
+            "method": tracking_source.get("identity_mode"),
+        },
+        "camera_motion_compensation": {
+            "status": (
+                "available"
+                if camera_motion_validated
+                else "experimental"
+                if camera_motion_operational
+                else "unavailable"
+            ),
+            "available": camera_motion_operational,
+            "validated": camera_motion_validated,
+            "method": camera_motion.get("method"),
+        },
+        "pitch_calibration": {
+            "status": (
+                "available"
+                if pitch_calibration_validated
+                else "experimental"
+                if pitch_calibration_operational
+                else "foundation"
+            ),
+            "available": pitch_calibration_validated,
+            "validated": pitch_calibration_validated,
+            "method": pitch_calibration.get("method") or "homography-gate-v1",
+        },
+        "ball_tracking": {
+            "status": (
+                "available"
+                if ball_tracking_validated
+                else "experimental"
+                if ball_tracking_operational
+                else "unavailable"
+            ),
+            "available": ball_tracking_operational,
+            "validated": ball_tracking_validated,
+            "method": ball_tracking.get("method"),
+        },
+        "event_detection": {
+            "status": (
+                "available"
+                if event_detection_validated
+                else "experimental"
+                if event_detection_operational
+                else "unavailable"
+            ),
+            "available": event_detection_operational,
+            "validated": event_detection_validated,
+            "method": event_detection.get("method"),
+        },
+        "athletic_metrics": {
+            "status": (
+                "available"
+                if athletic_metrics_validated
+                else "experimental"
+                if athletic_metrics_operational
+                else "foundation"
+            ),
+            "available": athletic_metrics_validated,
+            "validated": athletic_metrics_validated,
+            "method": athletic_metrics.get("method")
+            or "validated-homography-kinematics-v1",
+        },
+        "technical_tactical_scoring": {
+            "status": "unavailable",
+            "available": False,
+            "validated": False,
+            "method": None,
+        },
+    }
+
     limitations = [
-        "L'identità del giocatore non è verificata tra cambi camera, replay e occlusioni.",
-        "Il movimento è misurato nel piano immagine normalizzato, non in metri sul campo.",
-        "Non sono disponibili tracking della palla o eventi tecnico-tattici validati.",
+        (
+            "La ReID collega alcune finestre in modo sperimentale, ma l'identità "
+            "non è ancora validata tra cambi camera, replay e occlusioni."
+            if reid_operational
+            else "L'identità del giocatore non è verificata tra cambi camera, replay e occlusioni."
+        ),
+        (
+            "Il movimento camera viene compensato sperimentalmente nel piano "
+            "immagine; senza calibrazione semantica non è ancora espresso in metri."
+            if camera_motion_operational
+            else "Il movimento è misurato nel piano immagine normalizzato, non in metri sul campo."
+        ),
+        (
+            "Palla e prossimità giocatore-palla sono rilevate in modalità "
+            "sperimentale; non sono ancora eventi tecnico-tattici validati."
+            if ball_tracking_operational or event_detection_operational
+            else "Non sono disponibili tracking della palla o eventi tecnico-tattici validati."
+        ),
         "Il sistema non produce ancora un voto attendibile del calciatore.",
     ]
 
@@ -542,6 +738,7 @@ def build_tracking_evaluation(
         },
         "reason_codes": reason_codes,
         "capabilities": capabilities,
+        "capability_details": capability_details,
         "limitations": limitations,
         "provenance": {
             "kind": score_kind,
@@ -641,6 +838,7 @@ def apply_evaluation_truth_gate(
             "tracking_signals": evaluation["signals"],
             "score_provenance": evaluation["provenance"],
             "capabilities": evaluation["capabilities"],
+            "capability_details": evaluation["capability_details"],
             "limitations": evaluation["limitations"],
             "reason_codes": evaluation["reason_codes"],
             "evidence_metrics": sanitized_evidence,

@@ -1,0 +1,39 @@
+{
+  "schema_version": "pitch-keypoint-annotation-v1",
+  "frames": [
+    {
+      "frame_id": "demo-pitch-0001",
+      "video_id": "demo-match",
+      "shot_id": "shot-0001",
+      "time_sec": 10.0,
+      "width": 1280,
+      "height": 720,
+      "is_pitch_view": true,
+      "split": "development",
+      "keypoints": [
+        {"landmark": "corner_left_top", "x": 0.1, "y": 0.15, "visibility": "visible"},
+        {"landmark": "corner_left_bottom", "x": 0.1, "y": 0.85, "visibility": "visible"},
+        {"landmark": "corner_right_top", "x": 0.9, "y": 0.15, "visibility": "visible"},
+        {"landmark": "corner_right_bottom", "x": 0.9, "y": 0.85, "visibility": "visible"},
+        {"landmark": "halfway_top", "x": 0.5, "y": 0.15, "visibility": "visible"},
+        {"landmark": "halfway_bottom", "x": 0.5, "y": 0.85, "visibility": "visible"},
+        {"landmark": "centre_spot", "x": 0.5, "y": 0.5, "visibility": "visible"},
+        {"landmark": "left_penalty_area_top", "x": 0.22571429, "y": 0.29247059, "visibility": "visible"},
+        {"landmark": "left_penalty_area_bottom", "x": 0.22571429, "y": 0.70752941, "visibility": "visible"},
+        {"landmark": "right_penalty_area_top", "x": 0.77428571, "y": 0.29247059, "visibility": "visible"},
+        {"landmark": "right_penalty_area_bottom", "x": 0.77428571, "y": 0.70752941, "visibility": "visible"}
+      ]
+    },
+    {
+      "frame_id": "demo-non-pitch-0002",
+      "video_id": "demo-match",
+      "shot_id": "shot-0002",
+      "time_sec": 12.0,
+      "width": 1280,
+      "height": 720,
+      "is_pitch_view": false,
+      "split": "development",
+      "keypoints": []
+    }
+  ]
+}

@@ -48,3 +48,8 @@ COPY app ./app
 
 # Prefetch both detector profiles so runtime never depends on external downloads.
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt'); YOLO('yolo11n.pt')"
+
+# Prefetch the lightweight, person-ReID-specific OSNet checkpoint. The worker
+# never downloads identity models while a match is running.
+RUN mkdir -p /opt/algonext-models \
+    && HF_HUB_DISABLE_XET=1 python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='kaiyangzhou/osnet', filename='osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth', local_dir='/opt/algonext-models')"
