@@ -40,6 +40,41 @@ jobs:
             export APP_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "== revision $APP_GIT_SHA built at $APP_BUILD_TIME =="
 
+            echo "== sealed runtime configuration =="
+            SEAL_DIR="/opt/algonext-runtime-secrets"
+            SEAL_KEY="$SEAL_DIR/lgi-readonly-seal.pem"
+            SEALED_LGI_URL="ops/secrets/lgi-readonly-database-url.enc"
+            install -d -m 700 "$SEAL_DIR"
+            if [ ! -s "$SEAL_KEY" ]; then
+              openssl genpkey \
+                -algorithm RSA \
+                -pkeyopt rsa_keygen_bits:4096 \
+                -out "$SEAL_KEY" >/dev/null 2>&1
+              chmod 600 "$SEAL_KEY"
+            fi
+            if [ -s "$SEALED_LGI_URL" ]; then
+              DECRYPTED_LGI_URL="$(mktemp "$SEAL_DIR/lgi-url.XXXXXX")"
+              trap 'shred -u "$DECRYPTED_LGI_URL" 2>/dev/null || rm -f "$DECRYPTED_LGI_URL"' EXIT
+              openssl pkeyutl \
+                -decrypt \
+                -inkey "$SEAL_KEY" \
+                -pkeyopt rsa_padding_mode:oaep \
+                -pkeyopt rsa_oaep_md:sha256 \
+                -in "$SEALED_LGI_URL" \
+                -out "$DECRYPTED_LGI_URL"
+              python scripts/set_secret_env.py \
+                /opt/AlgoNext/.env \
+                LGI_READONLY_DATABASE_URL < "$DECRYPTED_LGI_URL"
+              shred -u "$DECRYPTED_LGI_URL" 2>/dev/null || rm -f "$DECRYPTED_LGI_URL"
+              trap - EXIT
+              echo "LGI read-only runtime URL installed"
+            else
+              echo "LGI_SEAL_PUBLIC_KEY_BEGIN"
+              openssl pkey -in "$SEAL_KEY" -pubout 2>/dev/null
+              echo "LGI_SEAL_PUBLIC_KEY_END"
+              echo "LGI read-only ciphertext not present yet"
+            fi
+
             echo "== docker compose pull =="
             docker compose pull || true
 

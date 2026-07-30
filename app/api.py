@@ -29,6 +29,13 @@ from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.ai_report import generate_ai_report
 from app.core.normalizers import normalize_failure_reason
+from app.integrations.lgi_readonly import (
+    LgiMatchNotFound,
+    LgiSourceError,
+    build_source_uri as build_lgi_source_uri,
+    get_match as get_lgi_match,
+    parse_source_uri as parse_lgi_source_uri,
+)
 from app.schemas import (
     JobCreate,
     PlayerRefPayload,
@@ -588,6 +595,8 @@ def resolve_job_video_source(job: AnalysisJob, fallback_bucket: str) -> Tuple[st
             )
         return job.video_key, bucket
     if job.video_url:
+        if parse_lgi_source_uri(job.video_url):
+            return job.video_url, fallback_bucket
         parsed = urlsplit(job.video_url)
         if parsed.scheme not in ("http", "https"):
             raise HTTPException(
@@ -733,6 +742,8 @@ def build_public_video_url(
     context: Dict[str, Any] | None,
 ) -> str | None:
     if not job.video_url and not job.video_key:
+        return None
+    if job.video_url and parse_lgi_source_uri(job.video_url):
         return None
     if context is None:
         return job.video_url
@@ -992,7 +1003,25 @@ def create_job(
         video_url = payload.video_url
         video_bucket = None
         video_key = None
-        if payload.video_key:
+        lgi_match = None
+        if payload.lgi_match_id:
+            try:
+                lgi_match = get_lgi_match(payload.lgi_match_id)
+            except (LgiSourceError, ValueError) as exc:
+                code = getattr(exc, "code", "LGI_MATCH_ID_INVALID")
+                status_code = (
+                    404
+                    if isinstance(exc, LgiMatchNotFound)
+                    else 503
+                    if isinstance(exc, LgiSourceError)
+                    else 400
+                )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=error_detail(code, str(exc)),
+                ) from exc
+            video_url = build_lgi_source_uri(lgi_match.id)
+        elif payload.video_key:
             context = load_s3_context()
             s3_public = context["s3_public"]
             bucket = payload.video_bucket or context["bucket"]
@@ -1053,6 +1082,22 @@ def create_job(
             "selections": [],
             "tracking": {"status": "PENDING"},
         }
+        if lgi_match is not None:
+            target["source"] = {
+                "kind": "lgi",
+                "read_only": True,
+                "match_id": lgi_match.id,
+                "title": lgi_match.title,
+                "home_team": lgi_match.home_team,
+                "away_team": lgi_match.away_team,
+                "competition": lgi_match.competition,
+                "season": lgi_match.season,
+                "provider": lgi_match.provider,
+                "lineup": [
+                    player.as_dict()
+                    for player in lgi_match.lineup
+                ],
+            }
         if payload.full_match_mode is not None:
             target["full_match_mode"] = bool(payload.full_match_mode)
 

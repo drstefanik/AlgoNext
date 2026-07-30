@@ -1128,6 +1128,20 @@ def download_video(
     if not source:
         raise RuntimeError("Missing video source.")
 
+    from app.integrations.lgi_readonly import (
+        download_match as download_lgi_match,
+        parse_source_uri as parse_lgi_source_uri,
+    )
+
+    lgi_match_id = parse_lgi_source_uri(source)
+    if lgi_match_id:
+        download_lgi_match(
+            lgi_match_id,
+            dst_path,
+            progress_callback=progress_callback,
+        )
+        return
+
     if _is_http_url(source):
         _ensure_public_url(source)
         if _is_shared_object_url(source):
