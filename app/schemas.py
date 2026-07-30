@@ -7,6 +7,7 @@ class JobCreate(BaseModel):
     video_url: Optional[str] = None
     video_bucket: Optional[str] = None
     video_key: Optional[str] = None
+    lgi_match_id: Optional[str] = None
     role: str
     category: str
     team_name: Optional[str] = None
@@ -16,10 +17,15 @@ class JobCreate(BaseModel):
 
     @model_validator(mode="after")
     def require_video_source(self) -> "JobCreate":
-        if not self.video_url and not self.video_key:
-            raise ValueError("video_url or video_key is required")
-        if self.video_url and self.video_key:
-            raise ValueError("Provide either video_url or video_key, not both")
+        sources = [
+            bool(self.video_url),
+            bool(self.video_key),
+            bool(self.lgi_match_id),
+        ]
+        if sum(sources) != 1:
+            raise ValueError(
+                "Provide exactly one of video_url, video_key, or lgi_match_id"
+            )
         return self
 
 class JobOut(BaseModel):

@@ -23,6 +23,7 @@ from app.core.runtime_health import build_metadata, inspect_runtime
 from app.api import router as api_router
 from app.player_profile_api import router as player_profile_router
 from app.runtime_api import router as runtime_router
+from app.lgi_source_api import router as lgi_source_router
 
 load_env()
 install_evaluation_guard()
@@ -315,3 +316,4 @@ def ready():
 app.include_router(api_router)
 app.include_router(player_profile_router)
 app.include_router(runtime_router)
+app.include_router(lgi_source_router)
