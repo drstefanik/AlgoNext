@@ -138,9 +138,13 @@ def _invalidate_analysis_attempt_for_selection(job: AnalysisJob) -> str:
         job.result,
         analysis_attempt_id=selection_revision_id,
     )
-    progress = dict(job.progress or {})
-    progress["analysis_attempt_id"] = selection_revision_id
-    job.progress = progress
+    # Selection starts a new attempt. Completed percentages, worker claims and
+    # window counts describe the previous attempt and must not survive it.
+    job.progress = {
+        "analysis_attempt_id": selection_revision_id,
+        "pct": 0,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
     job.error = None
     job.failure_reason = normalize_failure_reason(None)
     job.warnings = []
@@ -2423,16 +2427,11 @@ def analyze_player(
         job.report_status = "PENDING"
     if hasattr(job, "report_error"):
         job.report_error = None
-    progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
-    try:
-        current_pct = int(current_pct)
-    except (TypeError, ValueError):
-        current_pct = 0
     job.progress = {
-        **progress,
         "step": "QUEUED",
-        "pct": max(current_pct, 20),
+        "phase": "QUEUE",
+        "pct": 20,
+        "message": "Analysis queued",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "analysis_attempt_id": analysis_attempt_id,
     }
@@ -3613,16 +3612,11 @@ def enqueue_job(
         job.report_status = "PENDING"
     if hasattr(job, "report_error"):
         job.report_error = None
-    progress = job.progress or {}
-    current_pct = progress.get("pct") or 0
-    try:
-        current_pct = int(current_pct)
-    except (TypeError, ValueError):
-        current_pct = 0
     job.progress = {
-        **progress,
         "step": "QUEUED",
-        "pct": max(current_pct, 20),
+        "phase": "QUEUE",
+        "pct": 20,
+        "message": "Analysis queued",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "analysis_attempt_id": analysis_attempt_id,
     }

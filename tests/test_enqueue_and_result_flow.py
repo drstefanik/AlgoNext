@@ -136,6 +136,12 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
     def test_enqueue_queues_when_ready(self):
         self.job.player_ref = {"track_id": 8}
         self.job.target = {"confirmed": True}
+        self.job.progress = {
+            "step": "DONE", "phase": "TRACKING", "pct": 100,
+            "stats": {"windows_completed": 108},
+            "worker_revision": "old-worker", "analysis_task_id": "old-task",
+            "message": "Previous analysis finished",
+        }
         self.job.warnings = ["STALE_WARNING"]
         self.job.failure_reason = "STALE_FAILURE"
         self.job.result = {
@@ -163,6 +169,10 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
 
         self.assertTrue(self.session.committed)
         self.assertEqual(self.job.status, "QUEUED")
+        self.assertEqual(self.job.progress["pct"], 20)
+        self.assertEqual(self.job.progress["phase"], "QUEUE")
+        for key in ("stats", "worker_revision", "analysis_task_id"):
+            self.assertNotIn(key, self.job.progress)
         self.assertTrue(response["ok"])
         attempt_id = response["data"]["analysis_attempt_id"]
         self.assertIsInstance(attempt_id, str)
@@ -683,6 +693,9 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
             "step": "DONE",
             "pct": 100,
             "analysis_attempt_id": attempt_a,
+            "stats": {"windows_completed": 108},
+            "worker_revision": "old-worker",
+            "analysis_task_id": "old-task",
         }
         self.job.result = {
             "analysis_attempt_id": attempt_a,
@@ -723,6 +736,9 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
         selection_revision = self.job.target["analysis_attempt_id"]
         self.assertNotEqual(selection_revision, attempt_a)
         self.assertEqual(self.job.status, "READY_TO_ENQUEUE")
+        self.assertLess(self.job.progress["pct"], 100)
+        for key in ("stats", "worker_revision", "analysis_task_id"):
+            self.assertNotIn(key, self.job.progress)
         self.assertEqual(
             self.job.target["tracking"]["analysis_attempt_id"],
             selection_revision,
@@ -831,6 +847,11 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
 
     def test_analyze_player_clears_stale_report_for_direct_enqueue(self):
         self.job.status = "PARTIAL"
+        self.job.progress = {
+            "step": "DONE", "pct": 100,
+            "stats": {"windows_completed": 108},
+            "worker_revision": "old-worker", "analysis_task_id": "old-task",
+        }
         self.job.player_ref = {"track_id": 8}
         self.job.preview_frames = [
             {
@@ -888,6 +909,10 @@ class EnqueueAndResultFlowTests(unittest.TestCase):
 
         attempt_b = response["data"]["analysis_attempt_id"]
         self.assertEqual(self.job.status, "QUEUED")
+        self.assertEqual(self.job.progress["pct"], 20)
+        self.assertEqual(self.job.progress["phase"], "QUEUE")
+        for key in ("stats", "worker_revision", "analysis_task_id"):
+            self.assertNotIn(key, self.job.progress)
         self.assertEqual(self.job.target["analysis_attempt_id"], attempt_b)
         self.assertTrue(self.job.target["full_match_mode"])
         self.assertEqual(
