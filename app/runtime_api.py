@@ -286,7 +286,7 @@ def retry_job(
             ),
         )
 
-    if current_status != "FAILED" and not force:
+    if current_status != "FAILED" and not force and not preparation_retry:
         raise HTTPException(
             status_code=409,
             detail=_error_detail(
