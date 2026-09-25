@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -12,14 +13,34 @@ PREPARATION_FAILURES = frozenset(
 )
 
 
-def can_retry_preparation(job: Any) -> bool:
-    """Only retry an explicitly failed preparation, never reset analysis truth."""
+def can_retry_preparation(job: Any, *, now: datetime | None = None) -> bool:
+    """Recover failed or unstarted preparation without resetting analysis truth."""
     target = job.target if isinstance(job.target, dict) else {}
     result = job.result if isinstance(job.result, dict) else {}
     progress = job.progress if isinstance(job.progress, dict) else {}
+    status = str(job.status or "").upper()
+    recoverable = status == "FAILED" and job.failure_reason in PREPARATION_FAILURES
+    if (
+        status == "CREATED"
+        and progress.get("step") == "CREATED"
+        and progress.get("pct") == 0
+    ):
+        stamp = progress.get("updated_at") or getattr(job, "created_at", None)
+        try:
+            started = (
+                stamp
+                if isinstance(stamp, datetime)
+                else datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            )
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            recoverable = (
+                (now or datetime.now(timezone.utc)) - started
+            ).total_seconds() >= 600
+        except (TypeError, ValueError, OverflowError):
+            recoverable = False
     return bool(
-        str(job.status or "").upper() == "FAILED"
-        and job.failure_reason in PREPARATION_FAILURES
+        recoverable
         and not job.player_ref
         and not target.get("confirmed")
         and not target.get("selections")

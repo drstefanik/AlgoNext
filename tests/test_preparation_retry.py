@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -113,6 +114,44 @@ class PreparationRetryTests(unittest.TestCase):
             self.call_retry(job, payload={"expected_analysis_attempt_id": "old"})
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertEqual(job.target["analysis_attempt_id"], "current")
+
+    def test_unstarted_preparation_can_be_recovered_without_losing_its_job(self):
+        job = self.job(
+            status="CREATED",
+            failure_reason=None,
+            progress={"step": "CREATED", "pct": 0},
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=11),
+        )
+        response, pipeline = self.call_retry(job)
+        attempt = response["data"]["analysis_attempt_id"]
+        pipeline.extract_preview_frames.delay.assert_called_once_with("job-1", attempt)
+        self.assertEqual(job.target["analysis_attempt_id"], attempt)
+        self.assertEqual(job.video_key, "cached.mp4")
+        self.assertFalse(
+            can_retry_preparation(job)
+        )  # A fresh retry cannot be repeated immediately.
+
+    def test_stalled_preparation_does_not_include_recent_or_started_work(self):
+        now = datetime(2026, 9, 25, tzinfo=timezone.utc)
+        for changes in (
+            {"created_at": now - timedelta(seconds=599)},
+            {"created_at": None},
+            {"progress": {"step": "EXTRACTING_PREVIEWS", "pct": 0}},
+            {"progress": {"step": "CREATED", "pct": 15}},
+            {"progress": {"step": "CREATED", "pct": 0, "updated_at": now.isoformat()}},
+            {"progress": {"step": "CREATED", "pct": 0, "analysis_task_id": "claimed"}},
+            {"player_ref": {"track_id": 1}},
+            {"result": {"tracking": {"tracking_success": False}}},
+        ):
+            with self.subTest(changes=changes):
+                values = dict(
+                    status="CREATED",
+                    failure_reason=None,
+                    progress={"step": "CREATED", "pct": 0},
+                    created_at=now - timedelta(minutes=11),
+                )
+                values.update(changes)
+                self.assertFalse(can_retry_preparation(self.job(**values), now=now))
 
 
 if __name__ == "__main__":
