@@ -29,6 +29,7 @@ from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.ai_report import generate_ai_report
 from app.core.normalizers import normalize_failure_reason
+from app.core.http_errors import public_validation_errors
 from app.integrations.lgi_readonly import (
     LgiMatchNotFound,
     LgiSourceError,
@@ -1123,10 +1124,29 @@ def create_job(
         db.add(job)
         db.commit()
         db.refresh(job)
-        from app.workers.pipeline import kickoff_job
+        try:
+            from app.workers.pipeline import kickoff_job
 
-        kickoff_job.delay(str(job.id))
-        logger.info("Enqueued kickoff_job", extra={"job_id": str(job.id)})
+            kickoff_job.delay(str(job.id))
+            logger.info("Enqueued kickoff_job", extra={"job_id": str(job.id)})
+        except Exception:
+            logger.exception("Initial preparation dispatch failed job_id=%s", job_id)
+            db.rollback()
+            job = _load_job_for_update(db, job_id)
+            if job is None:
+                raise
+            # Publishing can succeed before the broker connection drops. Keep
+            # any progress made by that delivery, and expose the saved job ID.
+            if job.status == "CREATED" and (job.progress or {}).get("step") == "CREATED":
+                job.status = "FAILED"
+                job.failure_reason = "PREPARATION_ENQUEUE_FAILED"
+                job.error = "Unable to queue video preparation. Retry this job."
+                job.progress = {
+                    "step": "PREVIEWS_FAILED", "phase": "PREPARE", "pct": 0,
+                    "message": "Preparation enqueue failed",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                db.commit()
 
         return ok_response(
             {"job_id": job.id, "id": job.id, "status": job.status}, request
@@ -1729,7 +1749,7 @@ def _parse_track_selection_payload(payload: Any) -> TrackSelectionPayload:
             detail=error_detail(
                 "INVALID_PAYLOAD",
                 "Invalid select-track payload",
-                {"errors": exc.errors()},
+                {"errors": public_validation_errors(exc.errors())},
             ),
         ) from exc
 
@@ -1756,7 +1776,7 @@ def _parse_pick_player_payload(payload: Any) -> PickPlayerPayload:
             detail=error_detail(
                 "INVALID_PAYLOAD",
                 "Invalid pick-player payload",
-                {"errors": exc.errors()},
+                {"errors": public_validation_errors(exc.errors())},
             ),
         ) from exc
 
@@ -3276,7 +3296,7 @@ async def save_player_ref(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise HTTPException(status_code=422, detail=public_validation_errors(exc.errors())) from exc
     logger.info("player-ref normalized_payload=%s", normalized_payload.model_dump())
 
     try:
@@ -3478,13 +3498,6 @@ def get_frames(
     return ok_response({"items": items}, request)
 
 
-@router.get("/jobs/{job_id}/frames/{filename}")
-def get_frame_file(job_id: str, filename: str) -> StreamingResponse:
-    _validate_filename(filename)
-    key = f"jobs/{job_id}/frames/{filename}"
-    return _stream_s3_image(key)
-
-
 @router.get("/jobs/{job_id}/frames/list")
 def list_frames(
     job_id: str,
@@ -3504,6 +3517,15 @@ def overlay_frames(job_id: str, request: Request, db: Session = Depends(get_db))
             "Deprecated. Use /jobs/{id}/frames?count=N",
         ),
     )
+
+
+# Static frame endpoints must precede the filename route: Starlette matches
+# routes in registration order, otherwise "list" and "overlay" become files.
+@router.get("/jobs/{job_id}/frames/{filename}")
+def get_frame_file(job_id: str, filename: str) -> StreamingResponse:
+    _validate_filename(filename)
+    key = f"jobs/{job_id}/frames/{filename}"
+    return _stream_s3_image(key)
 
 
 @router.post("/jobs/{job_id}/enqueue")

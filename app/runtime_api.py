@@ -14,6 +14,7 @@ from app.core.analysis_attempt_precondition import require_analysis_attempt
 from app.core.deps import get_db
 from app.core.models import AnalysisJob
 from app.core.normalizers import normalize_failure_reason
+from app.core.preparation_retry import can_retry_preparation
 from app.core.runtime_health import build_metadata, inspect_runtime
 
 logger = logging.getLogger(__name__)
@@ -228,6 +229,7 @@ def retry_job(
     supersede_active = request_payload.get("supersede_active") is True
     current_status = str(job.status or "").upper()
     current_retry_count = _retry_count(job.result)
+    preparation_retry = can_retry_preparation(job)
     current_analysis_attempt_id = require_analysis_attempt(
         job,
         request,
@@ -299,7 +301,7 @@ def retry_job(
         missing.append("player_ref")
     if not bool((job.target or {}).get("confirmed")):
         missing.append("target")
-    if missing:
+    if missing and not preparation_retry:
         raise HTTPException(
             status_code=409,
             detail=_error_detail(
@@ -357,7 +359,14 @@ def retry_job(
         **_preserve_retry_inputs(job.result, history_entry),
         "analysis_attempt_id": analysis_attempt_id,
     }
-    job.status = "QUEUED"
+    if preparation_retry:
+        # The previous detector failure must not short-circuit extract_candidates.
+        for key in PRESERVED_RESULT_KEYS:
+            job.result.pop(key, None)
+    retry_candidates = preparation_retry and bool(getattr(job, "preview_frames", None))
+    dispatch_status = "CREATED" if preparation_retry else "QUEUED"
+    dispatch_step = "PREVIEWS_READY" if retry_candidates else dispatch_status
+    job.status = dispatch_status
     job.error = None
     job.failure_reason = normalize_failure_reason(None)
     job.warnings = []
@@ -375,10 +384,10 @@ def retry_job(
     }
     job.target = target
     job.progress = {
-        "step": "QUEUED",
-        "phase": "QUEUE",
-        "pct": 20,
-        "message": "Retry queued",
+        "step": dispatch_step,
+        "phase": "PREPARE" if preparation_retry else "QUEUE",
+        "pct": 15 if retry_candidates else 0 if preparation_retry else 20,
+        "message": "Preparation retry queued" if preparation_retry else "Retry queued",
         "updated_at": now.isoformat(),
         "retry_count": next_retry_count,
         "retry_id": retry_id,
@@ -390,9 +399,15 @@ def retry_job(
     db.refresh(job)
 
     try:
-        from app.workers.pipeline import run_analysis
+        if preparation_retry:
+            from app.workers.pipeline import extract_candidates, extract_preview_frames
 
-        run_analysis.delay(job.id, analysis_attempt_id)
+            task = extract_candidates if retry_candidates else extract_preview_frames
+        else:
+            from app.workers.pipeline import run_analysis
+
+            task = run_analysis
+        task.delay(job.id, analysis_attempt_id)
     except Exception as exc:
         logger.exception(
             "Retry dispatch raised; reconciling delivery state job_id=%s",
@@ -431,7 +446,8 @@ def retry_job(
         still_unclaimed_attempt = (
             current_attempt_id == analysis_attempt_id
             and progress_attempt_id == analysis_attempt_id
-            and current_status == "QUEUED"
+            and current_status == dispatch_status
+            and (not preparation_retry or current_progress.get("step") == dispatch_step)
             and analysis_task_id is None
         )
 
@@ -465,7 +481,9 @@ def retry_job(
         failed_at = _now()
         current_job.status = "FAILED"
         current_job.error = f"Retry enqueue failed: {exc}"
-        current_job.failure_reason = normalize_failure_reason("RETRY_ENQUEUE_FAILED")
+        current_job.failure_reason = normalize_failure_reason(
+            "PREPARATION_ENQUEUE_FAILED" if preparation_retry else "RETRY_ENQUEUE_FAILED"
+        )
         current_job.progress = {
             **current_progress,
             "step": "FAILED",

@@ -9,6 +9,17 @@ _DEFAULT_MESSAGE = "Request failed"
 _PASSTHROUGH_FIELDS = ("missing", "allow_force", "allowForce")
 
 
+def public_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pydantic context may contain exceptions or NaN, which JSON cannot encode.
+
+    Return field locations and messages, without echoing the submitted payload.
+    """
+    return [
+        {key: error[key] for key in ("type", "loc", "msg") if key in error}
+        for error in errors
+    ]
+
+
 def _non_empty_text(value: Any) -> str | None:
     if not isinstance(value, str):
         return None

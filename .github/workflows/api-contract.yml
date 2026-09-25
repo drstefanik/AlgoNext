@@ -6,6 +6,7 @@ on:
       - ".github/workflows/reid-production-regression.yml"
       - "app/core/analysis_attempt_precondition.py"
       - "app/core/http_errors.py"
+      - "app/core/preparation_retry.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
@@ -22,6 +23,11 @@ on:
       - "tests/test_anchor_reselection_pipeline.py"
       - "tests/test_enqueue_and_result_flow.py"
       - "tests/test_http_error_contract.py"
+      - "tests/test_preparation_dispatch.py"
+      - "tests/test_preparation_retry.py"
+      - "tests/test_selection_validation.py"
+      - "tests/test_validation_response.py"
+      - "tests/test_frame_routes.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
@@ -40,6 +46,7 @@ on:
       - ".github/workflows/reid-production-regression.yml"
       - "app/core/analysis_attempt_precondition.py"
       - "app/core/http_errors.py"
+      - "app/core/preparation_retry.py"
       - "app/core/evaluation_truth.py"
       - "app/core/evaluation_guard.py"
       - "app/core/evaluation_http_guard.py"
@@ -56,6 +63,11 @@ on:
       - "tests/test_anchor_reselection_pipeline.py"
       - "tests/test_enqueue_and_result_flow.py"
       - "tests/test_http_error_contract.py"
+      - "tests/test_preparation_dispatch.py"
+      - "tests/test_preparation_retry.py"
+      - "tests/test_selection_validation.py"
+      - "tests/test_validation_response.py"
+      - "tests/test_frame_routes.py"
       - "tests/test_evaluation_truth.py"
       - "tests/test_evaluation_guard.py"
       - "tests/test_evaluation_report_guard.py"
@@ -92,6 +104,9 @@ jobs:
           python -m pip install
           SQLAlchemy==2.0.32
           fastapi==0.115.0
+          pydantic==2.8.2
+          httpx==0.28.1
+          python-dotenv==1.0.1
           requests==2.32.3
           boto3==1.34.162
           redis==5.0.8
@@ -102,6 +117,7 @@ jobs:
           python -m py_compile
           app/core/analysis_attempt_precondition.py
           app/core/http_errors.py
+          app/core/preparation_retry.py
           app/core/evaluation_truth.py
           app/core/evaluation_guard.py
           app/core/evaluation_http_guard.py
@@ -118,6 +134,11 @@ jobs:
           tests/test_anchor_reselection_pipeline.py
           tests/test_enqueue_and_result_flow.py
           tests/test_http_error_contract.py
+          tests/test_preparation_dispatch.py
+          tests/test_preparation_retry.py
+          tests/test_selection_validation.py
+          tests/test_validation_response.py
+          tests/test_frame_routes.py
           tests/test_evaluation_truth.py
           tests/test_evaluation_guard.py
           tests/test_evaluation_report_guard.py
@@ -198,3 +219,12 @@ jobs:
           )
           runpy.run_path("tests/test_async_report.py", run_name="__main__")
           PY
+
+      - name: Run preparation and HTTP reliability regressions
+        run: >-
+          python -m unittest
+          tests/test_preparation_dispatch.py
+          tests/test_preparation_retry.py
+          tests/test_selection_validation.py
+          tests/test_validation_response.py
+          tests/test_frame_routes.py

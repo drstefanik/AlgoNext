@@ -18,7 +18,7 @@ from app.core.env import load_env
 from app.core.db import Base, SessionLocal, engine, DATABASE_URL
 from app.core.evaluation_guard import install_evaluation_guard
 from app.core.evaluation_http_guard import EvaluationReportGuardMiddleware
-from app.core.http_errors import normalize_http_exception_detail
+from app.core.http_errors import normalize_http_exception_detail, public_validation_errors
 from app.core.runtime_health import build_metadata, inspect_runtime
 from app.api import router as api_router
 from app.player_profile_api import router as player_profile_router
@@ -196,7 +196,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "error": _error_payload(
                 "VALIDATION_ERROR",
                 "Request validation failed",
-                {"errors": exc.errors(), "payload_keys": payload_keys},
+                {"errors": public_validation_errors(exc.errors()), "payload_keys": payload_keys},
             ),
             "meta": _meta_payload(request),
         },
