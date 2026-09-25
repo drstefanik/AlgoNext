@@ -2384,16 +2384,19 @@ def extract_preview_frames(
         db.close()
 
 
-@celery.task(name="app.workers.pipeline.kickoff_job", bind=True)
-def kickoff_job(self, job_id: str) -> None:
+@celery.task(name="app.workers.pipeline.kickoff_job", bind=True, max_retries=2)
+def kickoff_job(
+    self, job_id: str, expected_analysis_attempt_id: str | None = None
+) -> None:
     db: Session = SessionLocal()
+    analysis_attempt_id = None
     try:
         job = _load_job_for_update(db, job_id)
         if job is None:
             return
         target = job.target if isinstance(job.target, dict) else {}
-        analysis_attempt_id = (
-            str(target.get("analysis_attempt_id") or "").strip() or None
+        analysis_attempt_id = _validate_task_analysis_attempt(
+            target, expected_analysis_attempt_id
         )
         _validate_preanalysis_task_state(job)
         safe_commit(db)
@@ -2405,8 +2408,28 @@ def kickoff_job(self, job_id: str) -> None:
             job_id,
             exc,
         )
-    except Exception:
+    except Retry:
+        raise
+    except Exception as exc:
+        db.rollback()
         logger.exception("kickoff_job failed to enqueue tasks job_id=%s", job_id)
+        if self.request.retries < 2:
+            raise self.retry(exc=exc, countdown=5 * (2**self.request.retries))
+        try:
+            # Only the untouched initial phase is ours. An ambiguous publish
+            # must not overwrite an already-running preview or newer attempt.
+            update_preanalysis_job(
+                db, job_id, analysis_attempt_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "failure_reason", "PREPARATION_ENQUEUE_FAILED"),
+                    setattr(job, "error", "Unable to queue video preparation. Retry this job."),
+                    set_progress(job, "PREVIEWS_FAILED", 0, "Preparation enqueue failed"),
+                ),
+                allowed_progress_steps=frozenset({"CREATED"}),
+            )
+        except StaleAnalysisAttemptError:
+            db.rollback()
     finally:
         db.close()
 
@@ -2531,11 +2554,7 @@ def extract_candidates(
         if not preview_frames:
             if self.request.retries < max_retries:
                 raise self.retry(countdown=5)
-            logger.warning(
-                "extract_candidates exiting: preview_frames_missing job_id=%s",
-                job_id,
-            )
-            return {}
+            raise RuntimeError("Preview frames are missing after preparation retries")
         preview_time_index: List[Tuple[float, Dict[str, Any]]] = []
         for frame in preview_frames:
             if not isinstance(frame, dict):
@@ -2947,13 +2966,10 @@ def extract_candidates(
                     "analysis_attempt_id": analysis_attempt_id,
                 },
             )
-            if preview_frames:
-                set_progress(
-                    job,
-                    "WAITING_FOR_SELECTION",
-                    20,
-                    "Waiting for player selection",
-                )
+            job.status = "FAILED"
+            job.failure_reason = "candidates_generation_failed"
+            job.error = "Player detection failed. Retry preparation with the saved video."
+            set_progress(job, "CANDIDATES_FAILED", 20, "Player detection failed")
 
         try:
             update_preanalysis_job(
