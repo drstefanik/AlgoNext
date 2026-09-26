@@ -26,6 +26,7 @@ probe_root = Path("/tmp/fnh_jobs") / probe_id
 assert not probe_root.exists(), "Probe workspace already exists"
 probe_root.mkdir()
 source = probe_root / "input.mp4"
+runtime_call_limit = os.getenv("JERSEY_OCR_MAX_CALLS")
 os.environ.update(
     JERSEY_OCR_ENABLED="1",
     JERSEY_OCR_MAX_CALLS="128",
@@ -68,6 +69,39 @@ def trace_enrich(self, path, candidates, start, **kwargs):
 
 
 tracking.JerseyVerifier.enrich = trace_enrich
+original_build = tracking._build_candidate_profiles
+
+
+def trace_build(path, track_map, **kwargs):
+    result = original_build(path, track_map, **kwargs)
+    hints = kwargs.get("sampling_hints") or []
+    if hints:
+        nearby = []
+        for track_id, detections in track_map.items():
+            for detection in detections:
+                for hint in hints:
+                    delta = abs(detection["t"] - hint["t"])
+                    if delta <= 0.4:
+                        nearby.append(
+                            {
+                                "id": track_id,
+                                "samples": len(detections),
+                                "t": detection["t"],
+                                "delta": delta,
+                                "iou": tracking.bbox_iou(
+                                    detection["bbox"], hint["bbox"]
+                                ),
+                            }
+                        )
+        print(
+            "PROBE_HINT_MATCHES "
+            + json.dumps(sorted(nearby, key=lambda x: -x["iou"])[:12]),
+            flush=True,
+        )
+    return result
+
+
+tracking._build_candidate_profiles = trace_build
 reference = {
     "t": 1192.607,
     "x": 0.6835180759429932,
@@ -103,6 +137,7 @@ try:
     )
     segments = guarded.get("segments", [])
     diagnostics = {
+        "runtime_call_limit": runtime_call_limit,
         "status": guarded.get("tracking_status"),
         "jersey": guarded.get("reid_summary", {}).get("jersey_vision"),
         "identity_search": guarded.get("reid_summary", {}).get("identity_search"),

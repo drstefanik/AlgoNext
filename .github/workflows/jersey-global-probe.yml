@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Verify readable sampling locations survive the candidate ranking cap.
+# Inspect detector continuity at previously readable shirt locations.
 on:
   push:
     branches: [fix/global-jersey-search-20260926]
