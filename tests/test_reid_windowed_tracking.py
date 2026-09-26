@@ -674,6 +674,37 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             all(item.metadata["strong_overlap_unique"] is False for item in profiles)
         )
 
+    def test_readable_sampling_hint_keeps_candidate_below_rank_cap(self):
+        def detections(x, confidence):
+            return [
+                {
+                    "t": t,
+                    "sample_index": i,
+                    "bbox": {**_bbox(), "x": x},
+                    "conf": confidence,
+                }
+                for i, t in enumerate((1.0, 2.0, 3.0))
+            ]
+
+        with patch.dict(os.environ, {"PLAYER_REID_MAX_CANDIDATES": "1"}), patch.object(
+            self.module, "_extract_descriptors_for_tracks", return_value={}
+        ):
+            profiles, ids, _ = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {
+                    1: detections(0.6, 0.99),
+                    2: detections(0.2, 0.5),
+                    3: detections(0.8, 0.4),
+                },
+                previous_bboxes=[],
+                window_start=100,
+                direction="forward",
+                fps=3,
+                sampling_hints=[{"t": 2.0, "bbox": _bbox()}],
+            )
+        self.assertEqual(set(ids), {"1", "2"})
+        self.assertTrue(all("jersey_evidence" not in p.metadata for p in profiles))
+
     def test_two_hit_overlap_runner_blocks_physical_uniqueness(self):
         main = [
             {

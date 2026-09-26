@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Focused diagnosis of dense resampling around a previously readable shirt.
+# Verify readable sampling locations survive the candidate ranking cap.
 on:
   push:
     branches: [fix/global-jersey-search-20260926]

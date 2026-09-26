@@ -41,6 +41,33 @@ tracking.legacy.iter_windows = lambda *a, **k: [
 tracking.legacy._update_tracking_progress = lambda *a, **k: None
 tracking.legacy._mark_tracking_timeout = lambda *a, **k: None
 tracking._persist_tracking_output = lambda job, output, **kwargs: output
+original_enrich = tracking.JerseyVerifier.enrich
+
+
+def trace_enrich(self, path, candidates, start, **kwargs):
+    result = original_enrich(self, path, candidates, start, **kwargs)
+    print(
+        "PROBE_READS "
+        + json.dumps(
+            {
+                "start": start,
+                "hints": self.dense_hints(result, start),
+                "candidates": [
+                    {
+                        "id": c.candidate_id,
+                        "preferred": (c.metadata or {}).get("jersey_preferred_times"),
+                        "evidence": (c.metadata or {}).get("jersey_evidence"),
+                    }
+                    for c in result
+                ],
+            }
+        ),
+        flush=True,
+    )
+    return result
+
+
+tracking.JerseyVerifier.enrich = trace_enrich
 reference = {
     "t": 1192.607,
     "x": 0.6835180759429932,

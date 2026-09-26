@@ -303,23 +303,28 @@ class JerseyVerifier:
         return hints
 
     @staticmethod
-    def prioritize_dense_candidates(candidates, hints):
-        """Hints guide fresh reads; they cannot transfer a number or identity."""
+    def preferred_sampling_times(detections, hints):
         from app.reid.window_logic import bbox_iou
 
+        return [
+            float(d["t"])
+            for d in detections
+            if any(
+                abs(float(d["t"]) - hint["t"]) <= 0.08
+                and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.5
+                for hint in hints
+            )
+        ]
+
+    @staticmethod
+    def prioritize_dense_candidates(candidates, hints):
+        """Hints guide fresh reads; they cannot transfer a number or identity."""
         prioritized = []
         for candidate in candidates:
             metadata = dict(candidate.metadata or {})
-            preferred = []
-            for hint in hints:
-                matches = [
-                    d
-                    for d in metadata.get("tracklet_detections", [])
-                    if abs(float(d["t"]) - hint["t"]) <= 0.08
-                    and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.5
-                ]
-                if matches:
-                    preferred.append(float(matches[0]["t"]))
+            preferred = JerseyVerifier.preferred_sampling_times(
+                metadata.get("tracklet_detections", []), hints
+            )
             if preferred:
                 metadata["jersey_preferred_times"] = preferred
                 candidate = replace(candidate, metadata=metadata)

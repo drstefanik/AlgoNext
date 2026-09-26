@@ -965,6 +965,7 @@ def _build_candidate_profiles(
     direction: str,
     fps: int,
     strong_overlap_score: float | None = None,
+    sampling_hints: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[
     list[CandidateProfile],
     dict[str, int],
@@ -1074,10 +1075,17 @@ def _build_candidate_profiles(
     # a near-threshold runner hidden below the cap cannot be ignored.
     selected = list(ranked[:max_candidates])
     selected_track_ids = {item[1] for item in selected}
+    hinted_ids = {
+        int(track_id)
+        for track_id, detections in track_map.items()
+        if sampling_hints
+        and JerseyVerifier.preferred_sampling_times(detections, sampling_hints)
+    }
     selected.extend(
         item
         for item in ranked
-        if item[1] in plausible_overlap_ids and item[1] not in selected_track_ids
+        if item[1] in plausible_overlap_ids | hinted_ids
+        and item[1] not in selected_track_ids
     )
     selected_track_ids = {item[1] for item in selected}
     for track_id in sorted(plausible_overlap_ids - selected_track_ids):
@@ -2549,6 +2557,7 @@ def track_player_windowed_reid(
                     direction=direction,
                     fps=sample_fps,
                     strong_overlap_score=thresholds.strong_overlap_score,
+                    sampling_hints=dense_hints,
                 )
                 if dense_hints:
                     candidates = jersey_verifier.prioritize_dense_candidates(
