@@ -56,3 +56,5 @@ jobs:
             print('\n'.join(selected))
             PY
 # Observe requested player attempt 92f4305d on jersey release 2b914ce
+
+# Verify deployed hybrid jersey attempt 8212e41c on release 2b619dd
