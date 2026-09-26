@@ -85,6 +85,21 @@ class JerseyVisionTests(unittest.TestCase):
         self.assertNotIn("jersey_evidence", reordered[0].metadata)
         self.assertNotIn("jersey_preferred_times", reordered[1].metadata)
 
+        # A track can be unconfirmed on the original frame and become
+        # observable one 3-fps sample later during a camera pan.
+        shifted = replace(
+            nearby,
+            metadata={
+                "tracklet_detections": [
+                    {"t": 50.358, "bbox": {**box, "x": 0.24}},
+                    {"t": 51.358, "bbox": box},
+                ],
+            },
+        )
+        result = JerseyVerifier.prioritize_dense_candidates([other, shifted], hints)
+        self.assertEqual(result[0].metadata["jersey_preferred_times"], [50.358])
+        self.assertNotIn("jersey_evidence", result[0].metadata)
+
     def test_global_search_requires_read_anchor_kit_and_available_budget(self):
         verifier = JerseyVerifier.__new__(JerseyVerifier)
         verifier.target = 8

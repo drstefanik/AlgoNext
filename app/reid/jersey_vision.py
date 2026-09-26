@@ -310,8 +310,11 @@ class JerseyVerifier:
             float(d["t"])
             for d in detections
             if any(
-                abs(float(d["t"]) - hint["t"]) <= 0.08
-                and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.5
+                # The coarse frame may have no confirmed tracker ID in the
+                # dense pass. An adjacent frame is a fresh OCR sampling hint,
+                # never evidence that these detections share an identity.
+                abs(float(d["t"]) - hint["t"]) <= 0.4
+                and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.25
                 for hint in hints
             )
         ]
