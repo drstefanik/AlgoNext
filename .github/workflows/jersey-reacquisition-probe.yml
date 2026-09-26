@@ -1,6 +1,7 @@
 name: Probe jersey reacquisition on three cached windows
 # Adaptive neighboring-frame confirmation and fractional-fps continuity.
 # Diagnose source crop dimensions and missing nearby detections.
+# Test bounded dense CV retry when a shirt is readable but the track is sparse.
 on:
   push:
     branches: [feat/jersey-reacquisition-20260926]

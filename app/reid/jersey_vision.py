@@ -461,3 +461,26 @@ class JerseyVerifier:
             "target_number": self.target,
             "anchor_reading": self.anchor_reading,
         }
+
+    def should_retry_densely(self, candidates):
+        """Spend bounded CV work only after a real, unprompted matching read."""
+        anchor = self.anchor_reading or {}
+        if (
+            self.target is None
+            or anchor.get("number") != self.target
+            or anchor.get("legible") is not True
+            or not self.reader.enabled
+            or self.reader.errors >= 3
+            or self.reader.max_calls - self.reader.calls < 3
+            or self.reader.max_seconds - self.reader.elapsed < 5
+        ):
+            return False
+        return any(
+            reading.get("legible") is True
+            and reading.get("number") == self.target
+            and reading.get("kit_compatible") is True
+            for candidate in candidates
+            for reading in (candidate.metadata or {})
+            .get("jersey_evidence", {})
+            .get("readings", [])
+        )

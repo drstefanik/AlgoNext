@@ -21,6 +21,7 @@ from app.reid.association import (
 from app.reid.jersey_vision import (
     JerseyCrop,
     JerseyReader,
+    JerseyVerifier,
     evaluate_readings,
     parse_reading,
     nearby_confirmation_detections,
@@ -28,6 +29,29 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_dense_retry_requires_verified_anchor_matching_read_and_remaining_budget(
+        self,
+    ):
+        verifier = JerseyVerifier.__new__(JerseyVerifier)
+        verifier.target = 8
+        verifier.anchor_reading = {"number": 8, "legible": True}
+        verifier.reader = SimpleNamespace(
+            enabled=True, errors=0, max_calls=64, calls=21, max_seconds=240, elapsed=30
+        )
+        candidate = self.jersey_candidate()
+        self.assertTrue(verifier.should_retry_densely([candidate]))
+        self.assertFalse(verifier.should_retry_densely([]))
+        for attr, value in [
+            ("calls", 62),
+            ("elapsed", 238),
+            ("errors", 3),
+            ("enabled", False),
+        ]:
+            with patch.object(verifier.reader, attr, value):
+                self.assertFalse(verifier.should_retry_densely([candidate]))
+        verifier.anchor_reading = {"number": None, "legible": False}
+        self.assertFalse(verifier.should_retry_densely([candidate]))
+
     def test_confirmation_samples_are_nearby_and_temporally_independent(self):
         detections = [
             {"t": t} for t in [0, 10, 10.2, 11.001, 12.002, 13.003, 14.004, 15.005, 30]

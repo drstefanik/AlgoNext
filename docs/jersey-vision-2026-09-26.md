@@ -25,6 +25,9 @@ seconds, separated by at least 0.6 seconds) are inspected under the same attempt
 budget. The requested number remains absent from every model prompt. Components
 use the existing fps-aware motion gate, including 1.001-second sample intervals
 from 29.97-fps footage; disconnected raw track IDs cannot be merged by OCR.
+If a matching read still cannot establish a link at low sampling frequency, the
+window gets one 3-fps CV retry. This is limited to four windows per attempt, with
+the same OCR budget and timeout, and never changes the association acceptance gates.
 
 The isolated three-window probe uses only the already-cached AlgoNext input,
 does not alter the job or upload its tracking result, and fails its workflow when

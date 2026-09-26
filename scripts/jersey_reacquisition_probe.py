@@ -86,8 +86,8 @@ probe_root.mkdir()
 source = probe_root / "input.mp4"
 os.environ.update(
     JERSEY_OCR_ENABLED="1",
-    JERSEY_OCR_MAX_CALLS="36",
-    JERSEY_OCR_MAX_SECONDS="90",
+    JERSEY_OCR_MAX_CALLS="64",
+    JERSEY_OCR_MAX_SECONDS="120",
     TRACKING_TIMEOUT_SECONDS="240",
 )
 tracking.legacy.iter_windows = lambda *a, **k: [

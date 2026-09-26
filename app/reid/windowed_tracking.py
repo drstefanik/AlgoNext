@@ -1623,6 +1623,8 @@ def track_player_windowed_reid(
 
     def collect(
         index: int,
+        *,
+        minimum_fps: int = 0,
     ) -> tuple[
         Path,
         list[dict[str, Any]],
@@ -1631,7 +1633,7 @@ def track_player_windowed_reid(
     ]:
         nonlocal anchor_model
         cached = window_cache.get(index)
-        if cached is not None:
+        if cached is not None and cached[3] >= minimum_fps:
             return cached
         window_start, window_end = windows[index]
         segment_path = windows_dir / f"window_{index + 1:04d}.mp4"
@@ -1644,7 +1646,7 @@ def track_player_windowed_reid(
             max(0.0, window_end - window_start),
             accurate=is_anchor_window,
         )
-        sample_fps = anchor_fps if is_anchor_window else fps
+        sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
         if is_anchor_window and anchor_detector_model != detector_model:
             if anchor_model is None:
@@ -2445,6 +2447,7 @@ def track_player_windowed_reid(
             )
 
         attempted_edges: set[tuple[int, int, str]] = set()
+        dense_windows_used = 0
         while frontier:
             frontier.sort(
                 key=lambda item: (
@@ -2498,34 +2501,60 @@ def track_player_windowed_reid(
                 segments_by_index[index] = resolved_window_proposal(index)
                 continue
 
-            candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
-                segment_path,
-                track_map,
-                previous_bboxes=state["link_bboxes"],
-                window_start=window_start,
-                direction=direction,
-                fps=sample_fps,
-                strong_overlap_score=thresholds.strong_overlap_score,
-            )
-            candidates = jersey_verifier.enrich(
-                segment_path,
-                candidates,
-                window_start,
-                rescope=lambda path, candidate, start: _scope_jersey_candidate(
-                    path, candidate, start, fps=sample_fps
-                ),
-            )
-            descriptor_lookup.update(
-                {
-                    candidate.candidate_id: candidate.descriptor
-                    for candidate in candidates
-                }
-            )
-            decision = associate_identity(
-                base_profile,
-                candidates,
-                thresholds=thresholds,
-            )
+            for density_pass in range(2):
+                candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
+                    segment_path,
+                    track_map,
+                    previous_bboxes=state["link_bboxes"],
+                    window_start=window_start,
+                    direction=direction,
+                    fps=sample_fps,
+                    strong_overlap_score=thresholds.strong_overlap_score,
+                )
+                candidates = jersey_verifier.enrich(
+                    segment_path,
+                    candidates,
+                    window_start,
+                    rescope=lambda path, candidate, start: _scope_jersey_candidate(
+                        path, candidate, start, fps=sample_fps
+                    ),
+                )
+                descriptor_lookup.update(
+                    {
+                        candidate.candidate_id: candidate.descriptor
+                        for candidate in candidates
+                    }
+                )
+                decision = associate_identity(
+                    base_profile, candidates, thresholds=thresholds
+                )
+                if (
+                    decision.accepted
+                    or density_pass
+                    or sample_fps >= 3
+                    or dense_windows_used >= 4
+                    or not jersey_verifier.should_retry_densely(candidates)
+                ):
+                    break
+                dense_windows_used += 1
+                try:
+                    segment_path, samples, track_map, sample_fps = collect(
+                        index, minimum_fps=3
+                    )
+                except (
+                    legacy.TrackingTimeoutError,
+                    StaleAnalysisAttemptError,
+                    InsufficientWorkspaceError,
+                ):
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Dense jersey retry unavailable job_id=%s window=%s error_type=%s",
+                        job_id,
+                        index,
+                        type(exc).__name__,
+                    )
+                    break
             selected_profile = next(
                 (
                     candidate
