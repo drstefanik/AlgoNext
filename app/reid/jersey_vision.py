@@ -329,6 +329,7 @@ class JerseyVerifier:
         window_start: float,
         *,
         rescope=None,
+        max_calls: int | None = None,
     ):
         if (
             self.target is None
@@ -345,6 +346,9 @@ class JerseyVerifier:
         from app.reid.window_logic import choose_descriptor_detections
 
         enriched = []
+        call_limit = (
+            self.reader.calls + max(0, max_calls) if max_calls is not None else None
+        )
         cap = cv2.VideoCapture(str(path))
 
         def sample(detection):
@@ -384,6 +388,9 @@ class JerseyVerifier:
 
         try:
             for candidate in candidates:
+                if call_limit is not None and self.reader.calls >= call_limit:
+                    enriched.append(candidate)
+                    continue
                 metadata = dict(candidate.metadata or {})
                 # OCR may inspect a raw ID, but only a subsequently verified
                 # motion-continuous component can become a reacquisition candidate.
@@ -402,10 +409,16 @@ class JerseyVerifier:
                         selected.append(crop)
                     if len(selected) == 3:
                         break
-                readings = [
-                    {**self.reader.read(crop), "kit_compatible": crop.kit_compatible}
-                    for crop in selected
-                ]
+                readings = []
+                for crop in selected:
+                    if call_limit is not None and self.reader.calls >= call_limit:
+                        break
+                    readings.append(
+                        {
+                            **self.reader.read(crop),
+                            "kit_compatible": crop.kit_compatible,
+                        }
+                    )
                 # A readable back often lasts only a few seconds. Once a digit
                 # is clear, seek independent confirmation nearby rather than
                 # spending the remaining budget on distant front views.
@@ -422,6 +435,8 @@ class JerseyVerifier:
                         [c.time_sec for c in selected],
                         window_start,
                     ):
+                        if call_limit is not None and self.reader.calls >= call_limit:
+                            break
                         crop = sample(detection)
                         if crop is None:
                             continue
@@ -461,6 +476,20 @@ class JerseyVerifier:
             "target_number": self.target,
             "anchor_reading": self.anchor_reading,
         }
+
+    def can_reacquire(self) -> bool:
+        """A new search requires a read anchor and room for independent evidence."""
+        anchor = self.anchor_reading or {}
+        return bool(
+            self.target is not None
+            and anchor.get("number") == self.target
+            and anchor.get("legible") is True
+            and self.anchor_signature is not None
+            and self.reader.enabled
+            and self.reader.errors < 3
+            and self.reader.max_calls - self.reader.calls >= 2
+            and self.reader.max_seconds - self.reader.elapsed >= 5
+        )
 
     def should_retry_densely(self, candidates):
         """Spend bounded CV work only after a real, unprompted matching read."""

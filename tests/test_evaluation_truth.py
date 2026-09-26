@@ -8,6 +8,33 @@ from app.core.evaluation_truth import (
 
 
 class EvaluationTruthTests(unittest.TestCase):
+    def test_sparse_completed_analysis_preserves_observations_without_claiming_timeout(
+        self,
+    ):
+        tracking = {
+            "tracking_success": True,
+            "tracking_status": "SPARSE_CROSS_WINDOW_EVIDENCE",
+            "partial": True,
+            "partial_reason": "SPARSE_CROSS_WINDOW_EVIDENCE",
+            "windows_processed": 120,
+            "segments_total": 120,
+            "segments_with_player": 2,
+            "bboxes_count": 20,
+            "coverage_pct": 0.09,
+            "largest_gap_sec": 5329.32,
+        }
+        result = apply_evaluation_truth_gate({}, tracking=tracking)
+        self.assertFalse(result["player_evaluation_available"])
+        self.assertIsNone(result["tracking_quality_index"])
+        self.assertEqual(result["tracking_signals"]["samples_used"], 20)
+        self.assertEqual(result["tracking_signals"]["largest_gap_sec"], 5329.32)
+        self.assertIn("pochi tratti", result["explain"])
+        self.assertNotIn("budget", result["explain"])
+        tracking["partial_reason"] = "TRACKING_TIMEOUT"
+        timed_out = apply_evaluation_truth_gate({}, tracking=tracking)
+        self.assertIn("budget operativo", timed_out["explain"])
+        self.assertEqual(timed_out["tracking_signals"]["samples_used"], 0)
+
     def test_low_coverage_candidate_is_not_inflated_into_player_score(self):
         candidate_metrics = {
             "coveragePct": 0.125,
@@ -298,9 +325,9 @@ class EvaluationTruthTests(unittest.TestCase):
         self.assertTrue(evaluation["capabilities"]["ball_tracking"])
         self.assertTrue(evaluation["capabilities"]["event_detection"])
         self.assertEqual(
-            evaluation["capability_details"][
-                "cross_shot_player_reidentification"
-            ]["status"],
+            evaluation["capability_details"]["cross_shot_player_reidentification"][
+                "status"
+            ],
             "experimental",
         )
         self.assertEqual(

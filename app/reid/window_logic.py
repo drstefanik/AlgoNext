@@ -309,6 +309,83 @@ def autonomous_tracking_evidence(
     }
 
 
+def reacquisition_window_order(
+    window_count: int, anchor_indices: Sequence[int]
+) -> list[int]:
+    """Search the middle of the largest gaps first, spreading a finite OCR budget."""
+    boundaries = [-1, *sorted(set(anchor_indices)), window_count]
+    gaps = [(left + 1, right) for left, right in zip(boundaries, boundaries[1:])]
+    ordered = []
+    while gaps:
+        gaps.sort(
+            key=lambda interval: (interval[1] - interval[0], -interval[0]), reverse=True
+        )
+        start, end = gaps.pop(0)
+        if start >= end:
+            continue
+        middle = (start + end) // 2
+        ordered.append(middle)
+        gaps.extend([(start, middle), (middle + 1, end)])
+    return ordered
+
+
+def _verified_jersey_anchor_link(
+    segment: Mapping[str, Any], anchor: Mapping[str, Any]
+) -> bool:
+    """Accept a non-adjacent edge only with the full jersey proof and retained anchor."""
+    from app.reid.association import CandidateProfile, _verified_jersey_reacquisition
+
+    reid = segment.get("reid") or {}
+    anchor_reid = anchor.get("reid") or {}
+    if (
+        str(anchor.get("direction") or "").lower() != "anchor"
+        or not segment.get("identity_id")
+        or segment.get("identity_id") != anchor.get("identity_id")
+        or reid.get("identity_link") != "JERSEY_REACQUISITION"
+        or "JERSEY_AIDED_REACQUISITION_EXPERIMENTAL"
+        not in (reid.get("reason_codes") or [])
+    ):
+        return False
+    selected = next(
+        (
+            c
+            for c in reid.get("candidates", [])
+            if isinstance(c, Mapping)
+            and c.get("candidate_id") == reid.get("selected_candidate_id")
+        ),
+        {},
+    )
+    evidence = selected.get("jersey_evidence") or {}
+    reading = anchor_reid.get("jersey_anchor_reading") or {}
+    if (
+        not isinstance(evidence, Mapping)
+        or not isinstance(reading, Mapping)
+        or reading.get("legible") is not True
+        or type(reading.get("number")) is not int
+        or reading.get("number") != evidence.get("target_number")
+    ):
+        return False
+    boxes = [b for b in segment.get("bboxes", []) if isinstance(b, Mapping)]
+    profile = CandidateProfile(
+        str(selected.get("candidate_id")),
+        None,
+        None,
+        None,
+        len(boxes),
+        {"tracklet_scope": reid.get("tracklet_scope"), "jersey_evidence": evidence},
+    )
+    if not _verified_jersey_reacquisition(profile):
+        return False
+    # Every claimed reading must be on an emitted observation, not elsewhere
+    # in a reused tracker ID or a different window.
+    times = [float(b["t"]) for b in boxes if isinstance(b.get("t"), (int, float))]
+    return all(
+        any(abs(t - float(r["time_sec"])) <= 0.01 for t in times)
+        for r in evidence["readings"]
+        if r.get("legible") is True
+    )
+
+
 def retained_autonomous_chain_indices(
     segments: Sequence[Mapping[str, Any]],
 ) -> set[int]:
@@ -429,9 +506,16 @@ def _explicit_retained_autonomous_chain_indices(
             expected_parent = current_window_index + (
                 -1 if processing_direction == "forward" else 1
             )
+            parent_index = segment_by_window.get(parent_window_index)
+            if (
+                parent_index is not None
+                and retained(segments[parent_index])
+                and _verified_jersey_anchor_link(current, segments[parent_index])
+            ):
+                reachable.add(segment_index)
+                break
             if parent_window_index != expected_parent:
                 break
-            parent_index = segment_by_window.get(parent_window_index)
             if parent_index is None:
                 break
             current_index = parent_index

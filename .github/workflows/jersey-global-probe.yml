@@ -1,0 +1,39 @@
+name: Verify jersey reacquisition beyond tracking gaps
+on:
+  push:
+    branches: [fix/global-jersey-search-20260926]
+    paths: [".github/workflows/jersey-global-probe.yml"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Run isolated real-video probe
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /opt/AlgoNext
+            git fetch origin fix/global-jersey-search-20260926
+            test "$(git rev-parse FETCH_HEAD)" = "${{ github.sha }}"
+            stage=$(mktemp -d /tmp/algonext-global-probe.XXXXXX)
+            worker_id=$(docker compose ps -q worker)
+            test -n "$worker_id"
+            container_stage="/tmp/$(basename "$stage")"
+            cleanup() {
+              rm -rf "$stage"
+              docker exec "$worker_id" rm -rf "$container_stage" || true
+            }
+            trap cleanup EXIT
+            for module in association window_logic jersey_vision windowed_tracking; do
+              git show "FETCH_HEAD:app/reid/$module.py" > "$stage/$module.py"
+            done
+            git show FETCH_HEAD:scripts/jersey_global_probe.py > "$stage/probe.py"
+            docker cp "$stage" "$worker_id:$container_stage"
+            docker exec -e PYTHONPATH=/app "$worker_id" python "$container_stage/probe.py" "$container_stage"

@@ -1293,6 +1293,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         verifier = SimpleNamespace(
             enrich=verified_jersey,
             should_retry_densely=lambda _: False,
+            can_reacquire=lambda: False,
             summary=lambda: {},
         )
         with patch.object(
@@ -1324,6 +1325,120 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             self.assertEqual(segment["identity_status"], "ACCEPTED")
             self.assertTrue(segment["bboxes"])
             self.assertTrue(all(box["x"] == _bbox()["x"] for box in segment["bboxes"]))
+
+    def test_global_jersey_search_reaches_a_later_window_after_two_abstentions(self):
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from app.reid.window_logic import retained_autonomous_chain_indices
+        import copy
+
+        windows = [(0, 45), (35, 80), (70, 115), (105, 150), (140, 185)]
+        type(self).track_maps = {i: self._track([i * 10]) for i in range(1, 6)}
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        searched = []
+
+        def enrich(path, candidates, start, **kwargs):
+            searched.append(start)
+            if start != 105:
+                return candidates
+            return [
+                replace(
+                    c,
+                    metadata={
+                        **c.metadata,
+                        "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                        "jersey_evidence": {
+                            "status": "MATCH",
+                            "target_number": 8,
+                            "anchor_number": 8,
+                            "anchor_legible": True,
+                            "component_match_samples": 2,
+                            "readings": [
+                                dict(
+                                    number=8,
+                                    legible=True,
+                                    kit_compatible=True,
+                                    image_sha256=digest * 64,
+                                    time_sec=start + offset,
+                                )
+                                for digest, offset in [("a", 0), ("b", 1)]
+                            ],
+                        },
+                    },
+                )
+                for c in candidates
+            ]
+
+        verifier = SimpleNamespace(
+            enrich=enrich,
+            should_retry_densely=lambda _: False,
+            can_reacquire=lambda: True,
+            summary=lambda: {"anchor_reading": {"number": 8, "legible": True}},
+        )
+        with patch.object(
+            self.module, "JerseyVerifier", return_value=verifier
+        ), patch.object(
+            self.module.legacy, "iter_windows", return_value=windows
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda path, tracks, ids: {i: descriptor for i in ids},
+        ), patch.dict(
+            os.environ,
+            {
+                "S3_BUCKET": "bucket",
+                "S3_ACCESS_KEY": "key",
+                "S3_SECRET_KEY": "secret",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "1",
+            },
+        ):
+            output = self.module.track_player_windowed_reid(
+                "global-jersey-gap",
+                "/tmp/input.mp4",
+                {"t": 50.0, **_bbox()},
+                [],
+                video_duration_sec=185,
+                jersey_target_number=8,
+            )
+        segments = output["segments"]
+        self.assertEqual(searched[:2], [0, 70])
+        self.assertIn(105, searched)
+        self.assertEqual(segments[2]["identity_status"], "ABSTAINED")
+        self.assertEqual(segments[3]["identity_status"], "ACCEPTED")
+        self.assertEqual(segments[3]["parent_window_index"], 1)
+        self.assertEqual(segments[3]["reid"]["identity_link"], "JERSEY_REACQUISITION")
+        self.assertIn(3, retained_autonomous_chain_indices(segments))
+        self.assertEqual(output["windows_processed"], 5)
+        self.assertIn(
+            3, output["reid_summary"]["identity_search"]["global_windows_attempted"]
+        )
+        self.assertEqual(
+            output["reid_summary"]["identity_search"][
+                "windows_without_identity_search"
+            ],
+            0,
+        )
+
+        # A broken anchor or a forged/non-independent reading cannot bypass
+        # the final graph guard, even when the association said ACCEPTED.
+        for change in ("anchor", "number", "digest", "time", "kit", "observation"):
+            altered = copy.deepcopy(segments)
+            readings = altered[3]["reid"]["candidates"][0]["jersey_evidence"][
+                "readings"
+            ]
+            if change == "anchor":
+                altered[1]["bboxes"] = []
+            elif change == "number":
+                readings[1]["number"] = 6
+            elif change == "digest":
+                readings[1]["image_sha256"] = readings[0]["image_sha256"]
+            elif change == "time":
+                readings[1]["time_sec"] = readings[0]["time_sec"] + 0.1
+            elif change == "kit":
+                readings[1]["kit_compatible"] = False
+            else:
+                readings[1]["time_sec"] = 140
+            self.assertNotIn(3, retained_autonomous_chain_indices(altered), change)
 
     def test_clear_identity_is_linked_across_both_directions(self):
         type(self).track_maps = {
