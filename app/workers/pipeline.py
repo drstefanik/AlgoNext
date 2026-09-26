@@ -3577,6 +3577,7 @@ def run_analysis(
                 "mode": tracking_output.get("mode"),
                 "identity_mode": tracking_output.get("identity_mode"),
                 "method": tracking_output.get("method"),
+                "tracker": tracking_output.get("tracker"),
                 "fps": tracking_output.get("fps"),
                 "window_sec": tracking_output.get("window_sec"),
                 "overlap_sec": tracking_output.get("overlap_sec"),
