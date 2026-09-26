@@ -220,12 +220,12 @@ class JerseyReader:
             self.elapsed += max(0.0, self.clock() - started)
 
     def read_many(self, crops: Sequence[JerseyCrop]) -> list[dict[str, Any]]:
-        """Read at most 24 isolated crops in one strictly indexed request.
+        """Read at most 48 isolated crops in one strictly indexed request.
 
         This is a search pass. Repeated numbers in the same API response are
         correlated evidence and cannot alone confirm a player's identity.
         """
-        if len(crops) > 24:
+        if len(crops) > 48:
             raise ValueError("JERSEY_BATCH_TOO_LARGE")
         if not crops:
             return []

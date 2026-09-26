@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Verify 3-fps motion tracking, kit boundaries, and disjoint jersey fragments.
+# Verify camera-relative continuity and expanded crop coverage at 3 fps.
 on:
   push:
     branches: [fix/batched-identity-search-20260926]
@@ -32,7 +32,7 @@ jobs:
               docker exec "$worker_id" rm -rf "$container_stage" || true
             }
             trap cleanup EXIT
-            for module in association window_logic jersey_vision jersey_search windowed_tracking; do
+            for module in association window_logic jersey_vision jersey_search tracklet_motion windowed_tracking; do
               git show "FETCH_HEAD:app/reid/$module.py" > "$stage/$module.py"
             done
             git show FETCH_HEAD:scripts/jersey_global_probe.py > "$stage/probe.py"

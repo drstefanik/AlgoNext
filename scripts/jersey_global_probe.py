@@ -13,6 +13,7 @@ for short in (
     "window_logic",
     "jersey_vision",
     "jersey_search",
+    "tracklet_motion",
     "windowed_tracking",
 ):
     name = "app.reid." + short

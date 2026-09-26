@@ -16,6 +16,7 @@ from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.core.workspace import InsufficientWorkspaceError, require_free_space
 from app.reid.jersey_vision import JerseyVerifier
 from app.reid.jersey_search import scout_jerseys, trim_kit_component
+from app.reid.tracklet_motion import annotate_motion_context, camera_relative_continuity
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
     configured_descriptor_version,
@@ -358,6 +359,9 @@ def _motion_continuous(
     area_similarity, aspect_similarity = _shape_ratios(previous_bbox, current_bbox)
     if area_similarity < 0.25 or aspect_similarity < 0.40:
         return False
+    camera_continuity = camera_relative_continuity(previous, current)
+    if camera_continuity is not None:
+        return camera_continuity
     return (
         bbox_iou(previous_bbox, current_bbox) >= 0.02
         or center_distance(previous_bbox, current_bbox) <= maximum_center_distance
@@ -1015,7 +1019,11 @@ def _build_candidate_profiles(
         overlap = overlap_by_track.get(int(raw_track_id))
         candidate_boundary = _boundary_detection(detections, direction)
         geometry = None
-        if previous_boundary is not None and candidate_boundary is not None:
+        if (
+            overlap is not None
+            and previous_boundary is not None
+            and candidate_boundary is not None
+        ):
             bbox = candidate_boundary.get("bbox")
             if isinstance(bbox, Mapping):
                 geometry = geometry_similarity(previous_boundary, bbox)
@@ -1098,7 +1106,11 @@ def _build_candidate_profiles(
         overlap = overlap_by_track.get(track_id)
         candidate_boundary = _boundary_detection(raw_detections, direction)
         geometry = None
-        if previous_boundary is not None and candidate_boundary is not None:
+        if (
+            overlap is not None
+            and previous_boundary is not None
+            and candidate_boundary is not None
+        ):
             bbox = candidate_boundary.get("bbox")
             if isinstance(bbox, Mapping):
                 geometry = geometry_similarity(previous_boundary, bbox)
@@ -1728,6 +1740,8 @@ def track_player_windowed_reid(
             )
         finally:
             _reset_tracker(selected_model)
+        if batch_search and not is_anchor_window:
+            annotate_motion_context(samples, track_map)
         collected = (segment_path, samples, track_map, sample_fps)
         window_cache[index] = collected
         return collected
@@ -2772,6 +2786,45 @@ def track_player_windowed_reid(
                 # display smoothing lags camera/player motion and must not move
                 # the identity crop off the player before the final kit guard.
                 bboxes = [dict(box) for box in next_link_bboxes]
+            jersey_components = []
+            if (
+                batch_search
+                and decision.accepted
+                and _verified_jersey_reacquisition(selected_profile)
+            ):
+                for profile in candidates:
+                    if not _verified_jersey_reacquisition(profile):
+                        continue
+                    # The joint decision has already rejected concurrent
+                    # matches. Each retained fragment must also pass the
+                    # appearance/quality gates independently.
+                    if not associate_identity(
+                        base_profile,
+                        [profile],
+                        thresholds=replace(thresholds, require_strong_overlap=True),
+                    ).accepted:
+                        continue
+                    metadata = profile.metadata or {}
+                    component_boxes = _absolute_link_bboxes(
+                        metadata["tracklet_detections"], window_start=window_start
+                    )
+                    jersey_components.append(
+                        {
+                            "candidate_id": profile.candidate_id,
+                            "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                            "bboxes": component_boxes,
+                        }
+                    )
+                if len(jersey_components) > 1:
+                    bboxes = sorted(
+                        [
+                            dict(box)
+                            for component in jersey_components
+                            for box in component["bboxes"]
+                        ],
+                        key=lambda box: box["t"],
+                    )
+                    next_link_bboxes = [dict(box) for box in bboxes]
             if (
                 decision.accepted
                 and selected_track_id is not None
@@ -2810,11 +2863,23 @@ def track_player_windowed_reid(
                     "tracklet_detection_count": len(tracklet_sample_indices),
                 }
             )
+            if len(jersey_components) > 1:
+                reid_payload["tracklet_scope"] = "INDEPENDENT_JERSEY_TRACKLETS"
+                reid_payload["jersey_components"] = jersey_components
             if jersey_search:
                 reid_payload["search_mode"] = "GLOBAL_JERSEY_SEARCH"
                 if identity_status == "ACCEPTED":
                     reid_payload["identity_link"] = "JERSEY_REACQUISITION"
                     reid_payload["reason_codes"].append("JERSEY_GLOBAL_REACQUISITION")
+            if (
+                batch_search
+                and identity_status == "ACCEPTED"
+                and _verified_jersey_reacquisition(selected_profile)
+            ):
+                # This fragment has its own evidence. A later rejection of an
+                # unrelated neighbour must not erase its independent anchor link.
+                parent_window_index = int(jersey_anchor_index)
+                reid_payload["identity_link"] = "JERSEY_REACQUISITION"
             candidate_segment = {
                 "window_index": int(index),
                 "parent_window_index": int(parent_window_index),
@@ -3113,11 +3178,14 @@ def track_player_windowed_reid(
             if configured_descriptor_version() != DESCRIPTOR_VERSION
             else "appearance_reid_v1"
         ),
-        "method": (
-            "yolo+bytetrack+osnet_reid"
+        "method": "yolo+"
+        + ("botsort" if batch_search else "bytetrack")
+        + (
+            "+osnet_reid"
             if configured_descriptor_version() != DESCRIPTOR_VERSION
-            else "yolo+bytetrack+appearance_reid"
+            else "+appearance_reid"
         ),
+        "tracker": "botsort" if batch_search else "bytetrack",
         "fps": fps,
         "window_sec": window_sec,
         "overlap_sec": overlap_sec,

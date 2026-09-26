@@ -124,7 +124,7 @@ def scout_jerseys(
         bins[int(float(item[2]["t"]) // 5)].append(item)
     chosen = []
     used = defaultdict(list)
-    while bins and len(chosen) < 24:
+    while bins and len(chosen) < 48:
         for key in sorted(list(bins)):
             pool = bins[key]
             while pool:
@@ -139,7 +139,7 @@ def scout_jerseys(
                 break
             if not pool:
                 del bins[key]
-            if len(chosen) == 24:
+            if len(chosen) == 48:
                 break
     readings = verifier.reader.read_many([item[3] for item in chosen])
     summary["crops_read"] = len(readings)

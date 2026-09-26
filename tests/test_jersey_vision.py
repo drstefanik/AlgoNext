@@ -29,6 +29,91 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_composite_jersey_link_requires_individual_proof_and_exact_box_ownership(
+        self,
+    ):
+        from app.reid.window_logic import _verified_jersey_anchor_link
+
+        evidence = copy.deepcopy(self.jersey_candidate().metadata["jersey_evidence"])
+        anchor = {
+            "direction": "anchor",
+            "identity_id": "player",
+            "reid": {"jersey_anchor_reading": {"number": 8, "legible": True}},
+        }
+        components, candidates = [], []
+        for index, start in enumerate((10.0, 20.0)):
+            current = copy.deepcopy(evidence)
+            for n, reading in enumerate(current["readings"]):
+                reading["time_sec"] = start + n
+            boxes = [
+                {"t": start + n, "x": 0.2, "y": 0.3, "w": 0.04, "h": 0.15}
+                for n in range(3)
+            ]
+            components.append(
+                {
+                    "candidate_id": str(index),
+                    "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                    "bboxes": boxes,
+                }
+            )
+            candidates.append({"candidate_id": str(index), "jersey_evidence": current})
+        segment = {
+            "identity_id": "player",
+            "bboxes": [b for c in components for b in c["bboxes"]],
+            "reid": {
+                "tracklet_scope": "INDEPENDENT_JERSEY_TRACKLETS",
+                "identity_link": "JERSEY_REACQUISITION",
+                "reason_codes": ["JERSEY_AIDED_REACQUISITION_EXPERIMENTAL"],
+                "jersey_components": components,
+                "candidates": candidates,
+            },
+        }
+        self.assertTrue(_verified_jersey_anchor_link(segment, anchor))
+        extra = copy.deepcopy(segment)
+        extra["bboxes"].append({"t": 25.0, "x": 0.9})
+        self.assertFalse(_verified_jersey_anchor_link(extra, anchor))
+        wrong = copy.deepcopy(segment)
+        wrong["reid"]["candidates"][1]["jersey_evidence"]["readings"][0]["number"] = 9
+        self.assertFalse(_verified_jersey_anchor_link(wrong, anchor))
+        duplicate = copy.deepcopy(segment)
+        duplicate["reid"]["jersey_components"][1]["candidate_id"] = "0"
+        self.assertFalse(_verified_jersey_anchor_link(duplicate, anchor))
+        malformed = copy.deepcopy(segment)
+        malformed["reid"]["jersey_components"][1]["bboxes"].append(None)
+        self.assertFalse(_verified_jersey_anchor_link(malformed, anchor))
+        self.assertFalse(
+            _verified_jersey_anchor_link(
+                segment, {**anchor, "identity_id": "someone_else"}
+            )
+        )
+
+    def test_camera_relative_continuity_rejects_spatial_switch_and_crowding(self):
+        from app.reid.tracklet_motion import camera_relative_continuity
+
+        first = {
+            "t": 1.0,
+            "bbox": {"x": 0.1, "y": 0.3, "w": 0.03, "h": 0.1},
+            "_motion_context": {"group": 0, "x": 0.0, "y": 0.0, "crowded": False},
+        }
+        panning = {
+            "t": 1.2,
+            "bbox": {**first["bbox"], "x": 0.2},
+            "_motion_context": {"group": 0, "x": 0.1, "y": 0.0, "crowded": False},
+        }
+        self.assertTrue(camera_relative_continuity(first, panning))
+        switched = {**panning, "bbox": {**panning["bbox"], "x": 0.28}}
+        self.assertFalse(camera_relative_continuity(first, switched))
+        crowded = {
+            **panning,
+            "_motion_context": {**panning["_motion_context"], "crowded": True},
+        }
+        self.assertFalse(camera_relative_continuity(first, crowded))
+        unsupported = {
+            **panning,
+            "_motion_context": {**panning["_motion_context"], "group": 1},
+        }
+        self.assertFalse(camera_relative_continuity(first, unsupported))
+
     def test_kit_component_stops_at_unknown_or_opponent_without_rejoining(self):
         from app.reid.jersey_search import trim_kit_component
         from unittest.mock import MagicMock
