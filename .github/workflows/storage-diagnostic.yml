@@ -73,3 +73,19 @@ jobs:
             docker compose exec -T db psql -U postgres -d app -v ON_ERROR_STOP=1 -c 'SELECT 1 AS database_ready;'
             docker compose exec -T redis redis-cli INFO persistence | grep -E 'rdb_last_bgsave_status|rdb_bgsave_in_progress|rdb_last_save_time'
             docker compose ps
+            docker compose exec -T worker du -h -d 2 /tmp/fnh_jobs
+            docker compose exec -T worker python - <<'PY'
+            import json
+            from app.workers.celery_app import celery
+            inspector = celery.control.inspect(timeout=5)
+            for kind in ('active', 'reserved', 'scheduled'):
+                snapshot = getattr(inspector, kind)()
+                compact = None if snapshot is None else {
+                    worker: [
+                        {key: (item.get('request') or item).get(key) for key in ('id', 'name')}
+                        for item in items
+                    ]
+                    for worker, items in snapshot.items()
+                }
+                print(json.dumps({'queue_state': kind, 'tasks': compact}))
+            PY
