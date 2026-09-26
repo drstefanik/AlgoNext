@@ -387,6 +387,30 @@ def _verified_physical_continuity(
     return len(distinct_indices) >= 2
 
 
+def independent_jersey_reads(readings: Sequence[Mapping[str, Any]]) -> bool:
+    """Separate images and times; batched OCR also requires separate requests."""
+    unique = {
+        item.get("image_sha256"): item for item in readings if item.get("image_sha256")
+    }
+    values = list(unique.values())
+    grouped = any(item.get("request_id") is not None for item in values)
+    for index, first in enumerate(values):
+        for second in values[index + 1 :]:
+            if grouped and (
+                not first.get("request_id")
+                or not second.get("request_id")
+                or first["request_id"] == second["request_id"]
+            ):
+                continue
+            try:
+                gap = abs(float(first["time_sec"]) - float(second["time_sec"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(gap) and gap >= 0.6:
+                return True
+    return False
+
+
 def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
     """Independent number evidence can bridge a cut, never a disconnected raw ID."""
     if candidate is None or candidate.detection_count < 3:
@@ -430,9 +454,8 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
         t = item.get("time_sec")
         if not isinstance(t, (int, float)) or not math.isfinite(t):
             continue
-        matching[digest] = float(t)
-    times = list(matching.values())
-    return len(times) >= 2 and max(times) - min(times) >= 0.6
+        matching[digest] = item
+    return independent_jersey_reads(list(matching.values()))
 
 
 def associate_identity(

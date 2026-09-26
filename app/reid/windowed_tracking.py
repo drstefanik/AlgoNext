@@ -15,6 +15,7 @@ from ultralytics import YOLO
 from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.core.workspace import InsufficientWorkspaceError, require_free_space
 from app.reid.jersey_vision import JerseyVerifier
+from app.reid.jersey_search import scout_jerseys
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
     configured_descriptor_version,
@@ -1591,6 +1592,10 @@ def track_player_windowed_reid(
         jersey_target_number, input_video_path, player_ref_norm
     )
     thresholds = _association_thresholds()
+    batch_search = _env_bool("JERSEY_OCR_BATCH_SEARCH", False)
+    search_diagnostics = []
+    if batch_search:
+        tracker = "botsort.yaml"
     anchor_tracklet_radius = _env_float(
         "PLAYER_REID_MANUAL_ANCHOR_RADIUS_SEC",
         max(2.0, min(10.0, float(overlap_sec))),
@@ -2558,6 +2563,13 @@ def track_player_windowed_reid(
                 continue
 
             dense_hints = []
+            scout_hints = []
+            if batch_search and jersey_verifier.can_reacquire():
+                scout_hints, scout_summary = scout_jerseys(
+                    jersey_verifier, segment_path, track_map, window_start
+                )
+                search_diagnostics.append({"window_index": index, **scout_summary})
+                dense_hints = scout_hints
             for density_pass in range(2):
                 candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
                     segment_path,
@@ -2573,6 +2585,12 @@ def track_player_windowed_reid(
                     candidates = jersey_verifier.prioritize_dense_candidates(
                         candidates, dense_hints
                     )
+                # One batch explores the whole window. Spend individual reads
+                # on actual matching hints or physical continuity candidates.
+                if batch_search and not scout_hints and not state["link_bboxes"]:
+                    read_budget = 0
+                else:
+                    read_budget = 8 if jersey_search else None
                 candidates = jersey_verifier.enrich(
                     segment_path,
                     candidates,
@@ -2580,7 +2598,7 @@ def track_player_windowed_reid(
                     rescope=lambda path, candidate, start: _scope_jersey_candidate(
                         path, candidate, start, fps=sample_fps
                     ),
-                    max_calls=8 if jersey_search else None,
+                    max_calls=read_budget,
                 )
                 descriptor_lookup.update(
                     {
@@ -2601,7 +2619,8 @@ def track_player_windowed_reid(
                     decision.accepted
                     or density_pass
                     or sample_fps >= 3
-                    or dense_windows_used >= 4
+                    or dense_windows_used
+                    >= _env_int("JERSEY_DENSE_MAX_WINDOWS", 4, 0, 48)
                     or not jersey_verifier.should_retry_densely(candidates)
                 ):
                     break
@@ -3105,6 +3124,7 @@ def track_player_windowed_reid(
         "reid_summary": {
             "status": "EXPERIMENTAL",
             "jersey_vision": jersey_verifier.summary(),
+            "jersey_search_windows": search_diagnostics,
             "identity_search": {
                 "global_windows_attempted": searched_windows,
                 "windows_with_association_attempt": len(association_proposals),

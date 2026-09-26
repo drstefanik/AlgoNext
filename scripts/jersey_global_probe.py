@@ -8,7 +8,13 @@ import shutil
 import sys
 
 staged = Path(sys.argv[1])
-for short in ("association", "window_logic", "jersey_vision", "windowed_tracking"):
+for short in (
+    "association",
+    "window_logic",
+    "jersey_vision",
+    "jersey_search",
+    "windowed_tracking",
+):
     name = "app.reid." + short
     spec = importlib.util.spec_from_file_location(name, staged / (short + ".py"))
     module = importlib.util.module_from_spec(spec)
@@ -31,7 +37,9 @@ os.environ.update(
     JERSEY_OCR_ENABLED="1",
     JERSEY_OCR_MAX_CALLS="128",
     JERSEY_OCR_MAX_SECONDS="240",
-    TRACKING_TIMEOUT_SECONDS="480",
+    JERSEY_OCR_BATCH_SEARCH="1",
+    JERSEY_DENSE_MAX_WINDOWS="8",
+    TRACKING_TIMEOUT_SECONDS="660",
 )
 starts = [1100, 1155, 1210, 1265, 1925, 1980, 2035, 3300]
 if os.getenv("GLOBAL_PROBE_FOCUSED") == "1":
@@ -151,11 +159,13 @@ try:
         "status": guarded.get("tracking_status"),
         "jersey": guarded.get("reid_summary", {}).get("jersey_vision"),
         "identity_search": guarded.get("reid_summary", {}).get("identity_search"),
+        "batch_search": guarded.get("reid_summary", {}).get("jersey_search_windows"),
         "windows": [
             {
                 "start": s["window_start"],
                 "status": s.get("identity_status"),
                 "observations": len(s.get("bboxes", [])),
+                "bboxes": s.get("bboxes", []),
                 "reasons": s.get("reid", {}).get("reason_codes"),
                 "search_mode": s.get("reid", {}).get("search_mode"),
                 "candidates": [

@@ -29,6 +29,106 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def batch_response(self, rows):
+        return Mock(
+            status_code=200,
+            json=lambda: {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps({"readings": rows})},
+                    }
+                ],
+                "usage": {"total_tokens": 50},
+            },
+        )
+
+    def test_batch_ids_cache_and_independent_confirmation(self):
+        rows = [
+            dict(
+                crop_id=str(i), number=8, legible=True, single_player=True, view="back"
+            )
+            for i in (1, 0)
+        ]
+        transport = Mock(side_effect=[self.batch_response(rows), self.response()])
+        with patch.dict(
+            "os.environ", {"JERSEY_OCR_ENABLED": "1", "OPENAI_API_KEY": "test"}
+        ):
+            reader = JerseyReader(transport=transport)
+        crops = [JerseyCrop(b"one", 1, 0.9, True), JerseyCrop(b"two", 2, 0.9, True)]
+        results = [{**r, "kit_compatible": True} for r in reader.read_many(crops)]
+        self.assertEqual([r["time_sec"] for r in results], [1, 2])
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(evaluate_readings(results, 8)["status"], "UNVERIFIED")
+        cached = reader.read(crops[0])
+        self.assertTrue(cached["cache_hit"])
+        self.assertEqual(reader.calls, 1)
+        results.append(
+            {**reader.read(JerseyCrop(b"three", 3, 0.9, True)), "kit_compatible": True}
+        )
+        self.assertEqual(evaluate_readings(results, 8)["status"], "MATCH")
+        self.assertEqual(reader.calls, 2)
+        body = transport.call_args_list[0].kwargs["json"]
+        self.assertNotIn("target", json.dumps(body))
+        self.assertFalse(body["store"])
+
+    def test_duplicate_or_unknown_batch_ids_fail_closed_atomically(self):
+        row = dict(crop_id="0", number=8, legible=True, single_player=True, view="back")
+        for rows in [[row, row], [row, {**row, "crop_id": "99"}], [row]]:
+            with self.subTest(rows=rows), patch.dict(
+                "os.environ", {"JERSEY_OCR_ENABLED": "1", "OPENAI_API_KEY": "test"}
+            ):
+                reader = JerseyReader(
+                    transport=Mock(return_value=self.batch_response(rows))
+                )
+                result = reader.read_many(
+                    [JerseyCrop(b"one", 1, 0.9), JerseyCrop(b"two", 2, 0.9)]
+                )
+                self.assertTrue(
+                    all(
+                        r["status"] == "API_ERROR" and r["number"] is None
+                        for r in result
+                    )
+                )
+                self.assertEqual(reader.errors, 1)
+
+    def test_same_batch_cannot_bypass_identity_gate(self):
+        candidate = self.jersey_candidate()
+        evidence = copy.deepcopy(candidate.metadata["jersey_evidence"])
+        for reading in evidence["readings"]:
+            reading["request_id"] = "one-batch"
+        decision = associate_identity(
+            IdentityProfile("player", candidate.descriptor),
+            [self.jersey_candidate(evidence_changes=evidence)],
+            thresholds=AssociationThresholds(require_strong_overlap=True),
+        )
+        self.assertFalse(decision.accepted)
+
+    def test_batch_honors_shared_budget_and_deduplicates_images(self):
+        rows = [
+            dict(crop_id="0", number=8, legible=True, single_player=True, view="back")
+        ]
+        transport = Mock(return_value=self.batch_response(rows))
+        with patch.dict(
+            "os.environ",
+            {
+                "JERSEY_OCR_ENABLED": "1",
+                "OPENAI_API_KEY": "test",
+                "JERSEY_OCR_MAX_CALLS": "1",
+            },
+        ):
+            reader = JerseyReader(transport=transport)
+        result = reader.read_many(
+            [JerseyCrop(b"one", 1, 0.9), JerseyCrop(b"one", 2, 0.9)]
+        )
+        self.assertEqual(result[0]["image_sha256"], result[1]["image_sha256"])
+        self.assertEqual(reader.images_read, 1)
+        self.assertEqual(
+            reader.read_many([JerseyCrop(b"two", 3, 0.9)])[0]["status"],
+            "BUDGET_EXHAUSTED",
+        )
+        self.assertEqual(transport.call_count, 1)
+
     def test_dense_sampling_retains_readable_location_without_transferring_identity(
         self,
     ):
