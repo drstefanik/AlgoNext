@@ -1,0 +1,55 @@
+name: Diagnose AlgoNext storage incident
+
+on:
+  push:
+    branches: ["ops/storage-incident-20260926"]
+    paths: [".github/workflows/storage-diagnostic.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: algonext-storage-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect storage and service errors without changing runtime state
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          timeout: 2m
+          command_timeout: 7m
+          script: |
+            set -uo pipefail
+            cd /opt/AlgoNext
+            date -u
+            df -hT / /var/lib/docker /opt/AlgoNext
+            df -i / /var/lib/docker
+            free -m
+            docker compose ps
+            docker system df
+            for service in db redis minio api worker; do
+              container_id="$(docker compose ps -q "$service")"
+              if [ -n "$container_id" ]; then
+                docker inspect --size --format 'service={{.Name}} writable_bytes={{.SizeRw}} status={{.State.Status}} oom_killed={{.State.OOMKilled}} restarts={{.RestartCount}} log={{.LogPath}}' "$container_id"
+                log_path="$(docker inspect --format '{{.LogPath}}' "$container_id")"
+                if [ -n "$log_path" ] && [ -f "$log_path" ]; then
+                  du -h "$log_path"
+                fi
+                docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Source}}{{end}}{{end}}' "$container_id" | while IFS= read -r volume_path; do
+                  if [ -n "$volume_path" ]; then
+                    du -sh "$volume_path"
+                  fi
+                done
+              fi
+            done
+            docker compose logs --no-color --tail=300 db redis 2>&1 | grep -Ei 'no space|disk|read.only|permission denied|cannot allocate|out of memory|FATAL|PANIC|snapshot|saving error' | tail -n 60 || true
+            docker compose logs --no-color --tail=500 api 2>&1 | grep -F '84a8b83c-9920-4ec4-88cd-e3cab5f88920' | tail -n 5 || true
+            docker compose exec -T worker sh -c 'du -sh /tmp/fnh_jobs /tmp/fnh_jobs_candidates /tmp/fnh_jobs_previews 2>/dev/null' || true
