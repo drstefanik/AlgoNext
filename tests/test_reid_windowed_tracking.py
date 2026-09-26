@@ -100,6 +100,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                     "window_number": window_number,
                     "fps": kwargs.get("fps"),
                     "model": getattr(kwargs.get("model"), "model_name", None),
+                    "tracker": kwargs.get("tracker"),
                 }
             )
             track_map = cls.track_maps[window_number]
@@ -1356,6 +1357,52 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             self.assertEqual(segment["identity_status"], "ACCEPTED")
             self.assertTrue(segment["bboxes"])
             self.assertTrue(all(box["x"] == _bbox()["x"] for box in segment["bboxes"]))
+
+    def test_dense_confirmation_compensates_camera_motion_without_promoting_identity(
+        self,
+    ):
+        from types import SimpleNamespace
+
+        type(self).track_maps = {i: self._track([i * 10]) for i in (1, 2, 3)}
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        verifier = SimpleNamespace(
+            enrich=lambda path, candidates, start, **kwargs: candidates,
+            should_retry_densely=lambda _: True,
+            dense_hints=lambda *args: [],
+            can_reacquire=lambda: False,
+            summary=lambda: {},
+        )
+        with patch.object(
+            self.module, "JerseyVerifier", return_value=verifier
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda path, tracks, ids: {i: descriptor for i in ids},
+        ), patch.dict(
+            os.environ,
+            {
+                "S3_BUCKET": "bucket",
+                "S3_ACCESS_KEY": "key",
+                "S3_SECRET_KEY": "secret",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "1",
+                "PLAYER_REID_ANCHOR_FPS": "5",
+            },
+        ):
+            output = self.module.track_player_windowed_reid(
+                "dense-camera",
+                "/tmp/input.mp4",
+                {"t": 50.0, **_bbox()},
+                [],
+                video_duration_sec=115.0,
+                jersey_target_number=8,
+                fps=1,
+            )
+        dense = [
+            p for p in type(self).collection_profiles if p["tracker"] == "botsort.yaml"
+        ]
+        self.assertEqual({p["window_number"] for p in dense}, {1, 3})
+        self.assertTrue(all(p["fps"] == 5 for p in dense))
+        self.assertEqual(output["autonomous_segments_with_player"], 0)
 
     def test_global_jersey_search_reaches_a_later_window_after_two_abstentions(self):
         from dataclasses import replace

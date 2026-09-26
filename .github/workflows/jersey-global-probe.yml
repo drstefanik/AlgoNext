@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Verify fresh OCR on the neighboring confirmed dense detection.
+# Verify camera-compensated dense confirmation of readable shirt evidence.
 on:
   push:
     branches: [fix/global-jersey-search-20260926]

@@ -58,6 +58,16 @@ def trace_enrich(self, path, candidates, start, **kwargs):
                         "id": c.candidate_id,
                         "preferred": (c.metadata or {}).get("jersey_preferred_times"),
                         "evidence": (c.metadata or {}).get("jersey_evidence"),
+                        "read_boxes": [
+                            {"t": d["t"], "bbox": d["bbox"]}
+                            for d in (c.metadata or {}).get("tracklet_detections", [])
+                            if any(
+                                abs(start + d["t"] - r["time_sec"]) <= 0.05
+                                for r in (c.metadata or {})
+                                .get("jersey_evidence", {})
+                                .get("readings", [])
+                            )
+                        ],
                     }
                     for c in result
                 ],

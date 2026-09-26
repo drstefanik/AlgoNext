@@ -1611,6 +1611,7 @@ def track_player_windowed_reid(
         tracking_detector_model=detector_model,
     )
     anchor_model: YOLO | None = None
+    confirmation_model: YOLO | None = None
     attempt_component = _analysis_attempt_component(analysis_attempt_id)
     windows_dir = (
         Path("/tmp/fnh_jobs")
@@ -1642,7 +1643,7 @@ def track_player_windowed_reid(
         dict[int, list[dict[str, Any]]],
         int,
     ]:
-        nonlocal anchor_model
+        nonlocal anchor_model, confirmation_model
         cached = window_cache.get(index)
         if cached is not None and cached[3] >= minimum_fps:
             return cached
@@ -1659,16 +1660,25 @@ def track_player_windowed_reid(
         )
         sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
+        selected_tracker = tracker
         if is_anchor_window and anchor_detector_model != detector_model:
             if anchor_model is None:
                 anchor_model = YOLO(anchor_detector_model)
             selected_model = anchor_model
+        elif minimum_fps > fps and not is_anchor_window:
+            # A fresh tracker is required: Ultralytics keeps the existing
+            # tracker instance when persist=True. Compensate camera pans in
+            # the bounded confirmation pass without changing the coarse run.
+            if confirmation_model is None:
+                confirmation_model = YOLO(detector_model)
+            selected_model = confirmation_model
+            selected_tracker = "botsort.yaml"
         try:
             samples, track_map = legacy._collect_window_samples(
                 str(segment_path),
                 fps=sample_fps,
                 model=selected_model,
-                tracker=tracker,
+                tracker=selected_tracker,
                 job_id=job_id,
                 analysis_attempt_id=analysis_attempt_id,
                 tracking_started_at=started_at,
@@ -2599,7 +2609,7 @@ def track_player_windowed_reid(
                 dense_hints = jersey_verifier.dense_hints(candidates, window_start)
                 try:
                     segment_path, samples, track_map, sample_fps = collect(
-                        index, minimum_fps=3
+                        index, minimum_fps=max(3, anchor_fps)
                     )
                 except (
                     legacy.TrackingTimeoutError,
