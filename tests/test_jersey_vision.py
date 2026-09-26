@@ -29,6 +29,143 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_dense_sampling_retains_readable_location_without_transferring_identity(
+        self,
+    ):
+        from dataclasses import replace
+
+        box = {"x": 0.2, "y": 0.3, "w": 0.1, "h": 0.2}
+        coarse = replace(
+            self.jersey_candidate(),
+            metadata={
+                "jersey_evidence": {
+                    "target_number": 8,
+                    "readings": [
+                        {
+                            "number": 8,
+                            "legible": True,
+                            "kit_compatible": True,
+                            "time_sec": 150.025,
+                        },
+                        {
+                            "number": 6,
+                            "legible": True,
+                            "kit_compatible": True,
+                            "time_sec": 155,
+                        },
+                    ],
+                },
+                "tracklet_detections": [
+                    {"t": 50.025, "bbox": box},
+                    {"t": 55, "bbox": box},
+                ],
+            },
+        )
+        hints = JerseyVerifier.dense_hints([coarse], 100)
+        self.assertEqual(len(hints), 1)
+        self.assertAlmostEqual(hints[0]["t"], 50.025)
+        self.assertEqual(hints[0]["bbox"], box)
+        nearby = replace(
+            coarse,
+            candidate_id="new_id",
+            metadata={
+                "tracklet_detections": [{"t": 50.025, "bbox": box}],
+            },
+        )
+        other = replace(
+            nearby,
+            candidate_id="teammate",
+            metadata={
+                "tracklet_detections": [{"t": 50.025, "bbox": {**box, "x": 0.7}}],
+            },
+        )
+        reordered = JerseyVerifier.prioritize_dense_candidates([other, nearby], hints)
+        self.assertEqual(reordered[0].candidate_id, "new_id")
+        self.assertEqual(reordered[0].metadata["jersey_preferred_times"], [50.025])
+        self.assertNotIn("jersey_evidence", reordered[0].metadata)
+        self.assertNotIn("jersey_preferred_times", reordered[1].metadata)
+
+        # A track can be unconfirmed on the original frame and become
+        # observable one 3-fps sample later during a camera pan.
+        shifted = replace(
+            nearby,
+            metadata={
+                "tracklet_detections": [
+                    {"t": 50.358, "bbox": {**box, "x": 0.24}},
+                    {"t": 51.358, "bbox": box},
+                ],
+            },
+        )
+        result = JerseyVerifier.prioritize_dense_candidates([other, shifted], hints)
+        self.assertEqual(result[0].metadata["jersey_preferred_times"], [50.358])
+        self.assertNotIn("jersey_evidence", result[0].metadata)
+
+    def test_global_search_requires_read_anchor_kit_and_available_budget(self):
+        verifier = JerseyVerifier.__new__(JerseyVerifier)
+        verifier.target = 8
+        verifier.anchor_signature = {"dominant_family": "WHITE"}
+        verifier.anchor_reading = {"number": 8, "legible": True}
+        verifier.reader = SimpleNamespace(
+            enabled=True, errors=0, max_calls=64, calls=40, max_seconds=240, elapsed=61
+        )
+        self.assertTrue(verifier.can_reacquire())
+        for field, value in [
+            ("calls", 63),
+            ("elapsed", 238),
+            ("errors", 3),
+            ("enabled", False),
+        ]:
+            with patch.object(verifier.reader, field, value):
+                self.assertFalse(verifier.can_reacquire())
+        for field, value in [
+            ("anchor_reading", {"number": 6, "legible": True}),
+            ("anchor_signature", None),
+        ]:
+            with patch.object(verifier, field, value):
+                self.assertFalse(verifier.can_reacquire())
+
+    def test_global_window_budget_is_enforced_across_candidates_and_confirmation(self):
+        import numpy as np
+        from unittest.mock import MagicMock
+        from dataclasses import replace
+
+        verifier = JerseyVerifier.__new__(JerseyVerifier)
+        verifier.target = 8
+        verifier.anchor_signature = {"dominant_family": "WHITE"}
+        verifier.anchor_reading = {"number": 8, "legible": True}
+        transport = Mock(return_value=self.response())
+        with patch.dict(
+            "os.environ", {"JERSEY_OCR_ENABLED": "1", "OPENAI_API_KEY": "test"}
+        ):
+            verifier.reader = JerseyReader(transport=transport)
+        cap = MagicMock()
+        frames = iter(np.full((100, 40, 3), i, dtype=np.uint8) for i in range(30))
+        cap.read.side_effect = lambda: (True, next(frames))
+        candidate = replace(
+            self.jersey_candidate(),
+            metadata={"tracklet_detections": [{"t": i, "bbox": {}} for i in range(8)]},
+        )
+        with patch("cv2.VideoCapture", return_value=cap), patch(
+            "app.reid.appearance.crop_from_normalized_bbox",
+            side_effect=lambda frame, _: frame,
+        ), patch(
+            "app.reid.appearance.evaluate_crop_quality",
+            return_value=SimpleNamespace(
+                width=40, height=100, sharpness=100, score=0.9
+            ),
+        ), patch(
+            "app.reid.team_color_guard.extract_kit_color_signature",
+            return_value={"kit": "white"},
+        ), patch(
+            "app.reid.team_color_guard.signatures_compatible", return_value=True
+        ):
+            result = verifier.enrich(
+                "video", [candidate, candidate, candidate], 100, max_calls=2
+            )
+        self.assertEqual(transport.call_count, 2)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(verifier.reader.calls, 2)
+
     def test_dense_retry_requires_verified_anchor_matching_read_and_remaining_budget(
         self,
     ):

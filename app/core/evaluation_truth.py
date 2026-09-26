@@ -493,9 +493,16 @@ def build_tracking_evaluation(
         tracking_confidence = "none"
         continuity_pct = 0.0
         continuity_source = "not_applicable"
-        sample_sufficiency_pct = 0.0
-        samples_used = 0
-        largest_gap_sec = None
+        # Sparse, completed tracking still contains real observations. It is
+        # not a timeout, and hiding those samples misrepresents the evidence.
+        sparse_evidence = (
+            "SPARSE_CROSS_WINDOW_EVIDENCE" in incomplete_codes
+            and not _TRACKING_INCOMPLETE_STATUSES.intersection(incomplete_codes)
+        )
+        if not sparse_evidence:
+            sample_sufficiency_pct = 0.0
+            samples_used = 0
+            largest_gap_sec = None
         reason_codes = list(dict.fromkeys(incomplete_codes))
     else:
         evaluation_status = "TRACKING_ONLY"
@@ -858,6 +865,17 @@ def apply_evaluation_truth_gate(
                     "Riprova l'analisi senza cambiare selezione."
                 )
                 if evaluation["status"] == "TRACKING_FAILED"
+                else (
+                    "L'elaborazione è terminata, ma il giocatore è stato riconosciuto "
+                    "solo in pochi tratti del video. Le osservazioni mostrate sono "
+                    "parziali e non consentono una valutazione attendibile."
+                )
+                if (
+                    "SPARSE_CROSS_WINDOW_EVIDENCE" in evaluation["reason_codes"]
+                    and not _TRACKING_INCOMPLETE_STATUSES.intersection(
+                        evaluation["reason_codes"]
+                    )
+                )
                 else (
                     "Il budget operativo del tracking è terminato prima di produrre "
                     "un risultato completo. Riprova l'analisi; nessuna metrica del "

@@ -105,7 +105,7 @@ class JerseyReader:
             "yes",
         }
         self.enabled = self.enabled and bool(self.api_key)
-        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 64, 0, 128))
+        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 128))
         self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 600)
         self.timeout = bounded_env("JERSEY_OCR_TIMEOUT_SECONDS", 20, 1, 30)
         self.clock = clock
@@ -281,6 +281,62 @@ def nearby_confirmation_detections(
 
 
 class JerseyVerifier:
+    @staticmethod
+    def dense_hints(candidates, window_start):
+        """Carry only sampling coordinates across a denser detector pass."""
+        hints = []
+        for candidate in candidates:
+            metadata = candidate.metadata or {}
+            evidence = metadata.get("jersey_evidence") or {}
+            for reading in evidence.get("readings", []):
+                if (
+                    reading.get("legible") is not True
+                    or reading.get("number") != evidence.get("target_number")
+                    or reading.get("kit_compatible") is not True
+                ):
+                    continue
+                local_time = float(reading["time_sec"]) - window_start
+                for detection in metadata.get("tracklet_detections", []):
+                    if abs(float(detection["t"]) - local_time) <= 0.05:
+                        hints.append({"t": local_time, "bbox": detection["bbox"]})
+                        break
+        return hints
+
+    @staticmethod
+    def preferred_sampling_times(detections, hints):
+        from app.reid.window_logic import bbox_iou
+
+        return [
+            float(d["t"])
+            for d in detections
+            if any(
+                # The coarse frame may have no confirmed tracker ID in the
+                # dense pass. An adjacent frame is a fresh OCR sampling hint,
+                # never evidence that these detections share an identity.
+                abs(float(d["t"]) - hint["t"]) <= 0.4
+                and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.25
+                for hint in hints
+            )
+        ]
+
+    @staticmethod
+    def prioritize_dense_candidates(candidates, hints):
+        """Hints guide fresh reads; they cannot transfer a number or identity."""
+        prioritized = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata or {})
+            preferred = JerseyVerifier.preferred_sampling_times(
+                metadata.get("tracklet_detections", []), hints
+            )
+            if preferred:
+                metadata["jersey_preferred_times"] = preferred
+                candidate = replace(candidate, metadata=metadata)
+            prioritized.append(candidate)
+        return sorted(
+            prioritized,
+            key=lambda c: not bool((c.metadata or {}).get("jersey_preferred_times")),
+        )
+
     def __init__(
         self, target_number: Any, input_path: str, player_ref: Mapping[str, Any]
     ):
@@ -329,6 +385,7 @@ class JerseyVerifier:
         window_start: float,
         *,
         rescope=None,
+        max_calls: int | None = None,
     ):
         if (
             self.target is None
@@ -345,6 +402,9 @@ class JerseyVerifier:
         from app.reid.window_logic import choose_descriptor_detections
 
         enriched = []
+        call_limit = (
+            self.reader.calls + max(0, max_calls) if max_calls is not None else None
+        )
         cap = cv2.VideoCapture(str(path))
 
         def sample(detection):
@@ -384,28 +444,59 @@ class JerseyVerifier:
 
         try:
             for candidate in candidates:
+                if call_limit is not None and self.reader.calls >= call_limit:
+                    enriched.append(candidate)
+                    continue
                 metadata = dict(candidate.metadata or {})
                 # OCR may inspect a raw ID, but only a subsequently verified
                 # motion-continuous component can become a reacquisition candidate.
                 detections = metadata.get("tracklet_detections") or ()
+                preferred_times = metadata.get("jersey_preferred_times") or []
                 crops = []
                 if detections:
-                    for detection in choose_descriptor_detections(detections, 8):
+                    chosen = choose_descriptor_detections(detections, 8)
+                    for t in preferred_times:
+                        detection = min(
+                            detections, key=lambda d: abs(float(d["t"]) - t)
+                        )
+                        if detection not in chosen:
+                            chosen.append(detection)
+                    for detection in chosen:
                         crop = sample(detection)
                         if crop is not None:
                             crops.append(crop)
                 selected = []
-                for crop in sorted(crops, key=lambda c: c.quality, reverse=True):
+                for crop in sorted(
+                    crops,
+                    key=lambda c: (
+                        any(
+                            abs(c.time_sec - window_start - t) <= 0.08
+                            for t in preferred_times
+                        ),
+                        c.quality,
+                    ),
+                    reverse=True,
+                ):
                     if all(
                         abs(crop.time_sec - other.time_sec) >= 0.6 for other in selected
                     ):
                         selected.append(crop)
                     if len(selected) == 3:
                         break
-                readings = [
-                    {**self.reader.read(crop), "kit_compatible": crop.kit_compatible}
-                    for crop in selected
-                ]
+                readings = []
+                for crop in selected:
+                    if call_limit is not None and self.reader.calls >= call_limit:
+                        break
+                    readings.append(
+                        {
+                            **self.reader.read(crop),
+                            "kit_compatible": crop.kit_compatible,
+                        }
+                    )
+                    # A clearly conflicting number already rejects this raw
+                    # candidate; reserve further calls for independent tracks.
+                    if evaluate_readings(readings, self.target)["status"] == "CONFLICT":
+                        break
                 # A readable back often lasts only a few seconds. Once a digit
                 # is clear, seek independent confirmation nearby rather than
                 # spending the remaining budget on distant front views.
@@ -422,6 +513,8 @@ class JerseyVerifier:
                         [c.time_sec for c in selected],
                         window_start,
                     ):
+                        if call_limit is not None and self.reader.calls >= call_limit:
+                            break
                         crop = sample(detection)
                         if crop is None:
                             continue
@@ -461,6 +554,20 @@ class JerseyVerifier:
             "target_number": self.target,
             "anchor_reading": self.anchor_reading,
         }
+
+    def can_reacquire(self) -> bool:
+        """A new search requires a read anchor and room for independent evidence."""
+        anchor = self.anchor_reading or {}
+        return bool(
+            self.target is not None
+            and anchor.get("number") == self.target
+            and anchor.get("legible") is True
+            and self.anchor_signature is not None
+            and self.reader.enabled
+            and self.reader.errors < 3
+            and self.reader.max_calls - self.reader.calls >= 2
+            and self.reader.max_seconds - self.reader.elapsed >= 5
+        )
 
     def should_retry_densely(self, candidates):
         """Spend bounded CV work only after a real, unprompted matching read."""

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
@@ -28,6 +29,7 @@ from app.reid.association import (
     CandidateProfile,
     IdentityProfile,
     associate_identity,
+    _verified_jersey_reacquisition,
     update_identity_profile,
 )
 from app.reid.full_match_runtime import persist_fail_closed_legacy_fallback
@@ -39,6 +41,7 @@ from app.reid.window_logic import (
     choose_descriptor_detections,
     geometry_similarity,
     largest_tracking_gap_sec,
+    reacquisition_window_order,
     temporal_overlap_score,
     tracking_coverage_pct,
 )
@@ -962,6 +965,7 @@ def _build_candidate_profiles(
     direction: str,
     fps: int,
     strong_overlap_score: float | None = None,
+    sampling_hints: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[
     list[CandidateProfile],
     dict[str, int],
@@ -1071,10 +1075,17 @@ def _build_candidate_profiles(
     # a near-threshold runner hidden below the cap cannot be ignored.
     selected = list(ranked[:max_candidates])
     selected_track_ids = {item[1] for item in selected}
+    hinted_ids = {
+        int(track_id)
+        for track_id, detections in track_map.items()
+        if sampling_hints
+        and JerseyVerifier.preferred_sampling_times(detections, sampling_hints)
+    }
     selected.extend(
         item
         for item in ranked
-        if item[1] in plausible_overlap_ids and item[1] not in selected_track_ids
+        if item[1] in plausible_overlap_ids | hinted_ids
+        and item[1] not in selected_track_ids
     )
     selected_track_ids = {item[1] for item in selected}
     for track_id in sorted(plausible_overlap_ids - selected_track_ids):
@@ -1600,6 +1611,7 @@ def track_player_windowed_reid(
         tracking_detector_model=detector_model,
     )
     anchor_model: YOLO | None = None
+    confirmation_model: YOLO | None = None
     attempt_component = _analysis_attempt_component(analysis_attempt_id)
     windows_dir = (
         Path("/tmp/fnh_jobs")
@@ -1631,7 +1643,7 @@ def track_player_windowed_reid(
         dict[int, list[dict[str, Any]]],
         int,
     ]:
-        nonlocal anchor_model
+        nonlocal anchor_model, confirmation_model
         cached = window_cache.get(index)
         if cached is not None and cached[3] >= minimum_fps:
             return cached
@@ -1648,16 +1660,25 @@ def track_player_windowed_reid(
         )
         sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
+        selected_tracker = tracker
         if is_anchor_window and anchor_detector_model != detector_model:
             if anchor_model is None:
                 anchor_model = YOLO(anchor_detector_model)
             selected_model = anchor_model
+        elif minimum_fps > fps and not is_anchor_window:
+            # A fresh tracker is required: Ultralytics keeps the existing
+            # tracker instance when persist=True. Compensate camera pans in
+            # the bounded confirmation pass without changing the coarse run.
+            if confirmation_model is None:
+                confirmation_model = YOLO(detector_model)
+            selected_model = confirmation_model
+            selected_tracker = "botsort.yaml"
         try:
             samples, track_map = legacy._collect_window_samples(
                 str(segment_path),
                 fps=sample_fps,
                 model=selected_model,
-                tracker=tracker,
+                tracker=selected_tracker,
                 job_id=job_id,
                 analysis_attempt_id=analysis_attempt_id,
                 tracking_started_at=started_at,
@@ -2185,6 +2206,11 @@ def track_player_windowed_reid(
                         )
                     ],
                     "descriptor": _descriptor_metadata(local_profile.descriptor),
+                    "jersey_anchor_reading": (
+                        jersey_verifier.summary().get("anchor_reading")
+                        if root_index == primary_anchor.get("window_index")
+                        else None
+                    ),
                     "candidates": [],
                 },
             }
@@ -2448,7 +2474,36 @@ def track_player_windowed_reid(
 
         attempted_edges: set[tuple[int, int, str]] = set()
         dense_windows_used = 0
-        while frontier:
+        jersey_anchor_index = primary_anchor.get("window_index")
+        search_order = (
+            reacquisition_window_order(len(windows), root_indices)
+            if jersey_anchor_index in manual_roots
+            else []
+        )
+        searched_windows: list[int] = []
+        while frontier or (search_order and jersey_verifier.can_reacquire()):
+            if not frontier:
+                # A camera cut ends physical continuity, not the search. Probe
+                # disjoint parts of the match with no borrowed overlap boxes.
+                while search_order:
+                    index = search_order.pop(0)
+                    if index not in segments_by_index:
+                        break
+                else:
+                    break
+                assigned_root = nearest_manual_roots(index)[0]
+                frontier.append(
+                    {
+                        "root_index": assigned_root,
+                        "parent_index": jersey_anchor_index,
+                        "index": index,
+                        "direction": "backward" if index < assigned_root else "forward",
+                        "distance": abs(index - assigned_root),
+                        "link_bboxes": [],
+                        "jersey_search": True,
+                    }
+                )
+                searched_windows.append(index)
             frontier.sort(
                 key=lambda item: (
                     int(item["distance"]),
@@ -2461,6 +2516,7 @@ def track_player_windowed_reid(
             index = int(state["index"])
             parent_window_index = int(state["parent_index"])
             direction = str(state["direction"])
+            jersey_search = state.get("jersey_search") is True
             edge = (parent_window_index, index, direction)
             if edge in attempted_edges:
                 continue
@@ -2501,6 +2557,7 @@ def track_player_windowed_reid(
                 segments_by_index[index] = resolved_window_proposal(index)
                 continue
 
+            dense_hints = []
             for density_pass in range(2):
                 candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
                     segment_path,
@@ -2510,7 +2567,12 @@ def track_player_windowed_reid(
                     direction=direction,
                     fps=sample_fps,
                     strong_overlap_score=thresholds.strong_overlap_score,
+                    sampling_hints=dense_hints,
                 )
+                if dense_hints:
+                    candidates = jersey_verifier.prioritize_dense_candidates(
+                        candidates, dense_hints
+                    )
                 candidates = jersey_verifier.enrich(
                     segment_path,
                     candidates,
@@ -2518,6 +2580,7 @@ def track_player_windowed_reid(
                     rescope=lambda path, candidate, start: _scope_jersey_candidate(
                         path, candidate, start, fps=sample_fps
                     ),
+                    max_calls=8 if jersey_search else None,
                 )
                 descriptor_lookup.update(
                     {
@@ -2526,7 +2589,13 @@ def track_player_windowed_reid(
                     }
                 )
                 decision = associate_identity(
-                    base_profile, candidates, thresholds=thresholds
+                    base_profile,
+                    candidates,
+                    thresholds=(
+                        replace(thresholds, require_strong_overlap=True)
+                        if jersey_search
+                        else thresholds
+                    ),
                 )
                 if (
                     decision.accepted
@@ -2537,9 +2606,10 @@ def track_player_windowed_reid(
                 ):
                     break
                 dense_windows_used += 1
+                dense_hints = jersey_verifier.dense_hints(candidates, window_start)
                 try:
                     segment_path, samples, track_map, sample_fps = collect(
-                        index, minimum_fps=3
+                        index, minimum_fps=max(3, anchor_fps)
                     )
                 except (
                     legacy.TrackingTimeoutError,
@@ -2563,6 +2633,20 @@ def track_player_windowed_reid(
                 ),
                 None,
             )
+            if (
+                jersey_search
+                and decision.accepted
+                and not _verified_jersey_reacquisition(selected_profile)
+            ):
+                decision = replace(
+                    decision,
+                    status="ABSTAINED",
+                    selected_candidate_id=None,
+                    reason_codes=(
+                        *decision.reason_codes,
+                        "JERSEY_REACQUISITION_NOT_PROVEN",
+                    ),
+                )
             selected_track_id = (
                 id_lookup.get(decision.selected_candidate_id or "")
                 if decision.accepted
@@ -2648,6 +2732,11 @@ def track_player_windowed_reid(
                     "tracklet_detection_count": len(tracklet_sample_indices),
                 }
             )
+            if jersey_search:
+                reid_payload["search_mode"] = "GLOBAL_JERSEY_SEARCH"
+                if identity_status == "ACCEPTED":
+                    reid_payload["identity_link"] = "JERSEY_REACQUISITION"
+                    reid_payload["reason_codes"].append("JERSEY_GLOBAL_REACQUISITION")
             candidate_segment = {
                 "window_index": int(index),
                 "parent_window_index": int(parent_window_index),
@@ -3016,6 +3105,13 @@ def track_player_windowed_reid(
         "reid_summary": {
             "status": "EXPERIMENTAL",
             "jersey_vision": jersey_verifier.summary(),
+            "identity_search": {
+                "global_windows_attempted": searched_windows,
+                "windows_with_association_attempt": len(association_proposals),
+                "windows_without_identity_search": len(windows)
+                - len(manual_roots)
+                - len(association_proposals),
+            },
             "validated": False,
             "identity_id": identity_id,
             "descriptor_version": configured_descriptor_version(),

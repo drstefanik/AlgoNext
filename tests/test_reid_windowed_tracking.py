@@ -100,6 +100,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                     "window_number": window_number,
                     "fps": kwargs.get("fps"),
                     "model": getattr(kwargs.get("model"), "model_name", None),
+                    "tracker": kwargs.get("tracker"),
                 }
             )
             track_map = cls.track_maps[window_number]
@@ -673,6 +674,37 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertTrue(
             all(item.metadata["strong_overlap_unique"] is False for item in profiles)
         )
+
+    def test_readable_sampling_hint_keeps_candidate_below_rank_cap(self):
+        def detections(x, confidence):
+            return [
+                {
+                    "t": t,
+                    "sample_index": i,
+                    "bbox": {**_bbox(), "x": x},
+                    "conf": confidence,
+                }
+                for i, t in enumerate((1.0, 2.0, 3.0))
+            ]
+
+        with patch.dict(os.environ, {"PLAYER_REID_MAX_CANDIDATES": "1"}), patch.object(
+            self.module, "_extract_descriptors_for_tracks", return_value={}
+        ):
+            profiles, ids, _ = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {
+                    1: detections(0.6, 0.99),
+                    2: detections(0.2, 0.5),
+                    3: detections(0.8, 0.4),
+                },
+                previous_bboxes=[],
+                window_start=100,
+                direction="forward",
+                fps=3,
+                sampling_hints=[{"t": 2.0, "bbox": _bbox()}],
+            )
+        self.assertEqual(set(ids), {"1", "2"})
+        self.assertTrue(all("jersey_evidence" not in p.metadata for p in profiles))
 
     def test_two_hit_overlap_runner_blocks_physical_uniqueness(self):
         main = [
@@ -1293,6 +1325,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         verifier = SimpleNamespace(
             enrich=verified_jersey,
             should_retry_densely=lambda _: False,
+            can_reacquire=lambda: False,
             summary=lambda: {},
         )
         with patch.object(
@@ -1324,6 +1357,166 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             self.assertEqual(segment["identity_status"], "ACCEPTED")
             self.assertTrue(segment["bboxes"])
             self.assertTrue(all(box["x"] == _bbox()["x"] for box in segment["bboxes"]))
+
+    def test_dense_confirmation_compensates_camera_motion_without_promoting_identity(
+        self,
+    ):
+        from types import SimpleNamespace
+
+        type(self).track_maps = {i: self._track([i * 10]) for i in (1, 2, 3)}
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        verifier = SimpleNamespace(
+            enrich=lambda path, candidates, start, **kwargs: candidates,
+            should_retry_densely=lambda _: True,
+            dense_hints=lambda *args: [],
+            can_reacquire=lambda: False,
+            summary=lambda: {},
+        )
+        with patch.object(
+            self.module, "JerseyVerifier", return_value=verifier
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda path, tracks, ids: {i: descriptor for i in ids},
+        ), patch.dict(
+            os.environ,
+            {
+                "S3_BUCKET": "bucket",
+                "S3_ACCESS_KEY": "key",
+                "S3_SECRET_KEY": "secret",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "1",
+                "PLAYER_REID_ANCHOR_FPS": "5",
+            },
+        ):
+            output = self.module.track_player_windowed_reid(
+                "dense-camera",
+                "/tmp/input.mp4",
+                {"t": 50.0, **_bbox()},
+                [],
+                video_duration_sec=115.0,
+                jersey_target_number=8,
+                fps=1,
+            )
+        dense = [
+            p for p in type(self).collection_profiles if p["tracker"] == "botsort.yaml"
+        ]
+        self.assertEqual({p["window_number"] for p in dense}, {1, 3})
+        self.assertTrue(all(p["fps"] == 5 for p in dense))
+        self.assertEqual(output["autonomous_segments_with_player"], 0)
+
+    def test_global_jersey_search_reaches_a_later_window_after_two_abstentions(self):
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from app.reid.window_logic import retained_autonomous_chain_indices
+        import copy
+
+        windows = [(0, 45), (35, 80), (70, 115), (105, 150), (140, 185)]
+        type(self).track_maps = {i: self._track([i * 10]) for i in range(1, 6)}
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        searched = []
+
+        def enrich(path, candidates, start, **kwargs):
+            searched.append(start)
+            if start != 105:
+                return candidates
+            return [
+                replace(
+                    c,
+                    metadata={
+                        **c.metadata,
+                        "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                        "jersey_evidence": {
+                            "status": "MATCH",
+                            "target_number": 8,
+                            "anchor_number": 8,
+                            "anchor_legible": True,
+                            "component_match_samples": 2,
+                            "readings": [
+                                dict(
+                                    number=8,
+                                    legible=True,
+                                    kit_compatible=True,
+                                    image_sha256=digest * 64,
+                                    time_sec=start + offset,
+                                )
+                                for digest, offset in [("a", 0), ("b", 1)]
+                            ],
+                        },
+                    },
+                )
+                for c in candidates
+            ]
+
+        verifier = SimpleNamespace(
+            enrich=enrich,
+            should_retry_densely=lambda _: False,
+            can_reacquire=lambda: True,
+            summary=lambda: {"anchor_reading": {"number": 8, "legible": True}},
+        )
+        with patch.object(
+            self.module, "JerseyVerifier", return_value=verifier
+        ), patch.object(
+            self.module.legacy, "iter_windows", return_value=windows
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda path, tracks, ids: {i: descriptor for i in ids},
+        ), patch.dict(
+            os.environ,
+            {
+                "S3_BUCKET": "bucket",
+                "S3_ACCESS_KEY": "key",
+                "S3_SECRET_KEY": "secret",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "1",
+            },
+        ):
+            output = self.module.track_player_windowed_reid(
+                "global-jersey-gap",
+                "/tmp/input.mp4",
+                {"t": 50.0, **_bbox()},
+                [],
+                video_duration_sec=185,
+                jersey_target_number=8,
+            )
+        segments = output["segments"]
+        self.assertEqual(searched[:2], [0, 70])
+        self.assertIn(105, searched)
+        self.assertEqual(segments[2]["identity_status"], "ABSTAINED")
+        self.assertEqual(segments[3]["identity_status"], "ACCEPTED")
+        self.assertEqual(segments[3]["parent_window_index"], 1)
+        self.assertEqual(segments[3]["reid"]["identity_link"], "JERSEY_REACQUISITION")
+        self.assertIn(3, retained_autonomous_chain_indices(segments))
+        self.assertEqual(output["windows_processed"], 5)
+        self.assertIn(
+            3, output["reid_summary"]["identity_search"]["global_windows_attempted"]
+        )
+        self.assertEqual(
+            output["reid_summary"]["identity_search"][
+                "windows_without_identity_search"
+            ],
+            0,
+        )
+
+        # A broken anchor or a forged/non-independent reading cannot bypass
+        # the final graph guard, even when the association said ACCEPTED.
+        for change in ("anchor", "number", "digest", "time", "kit", "observation"):
+            altered = copy.deepcopy(segments)
+            readings = altered[3]["reid"]["candidates"][0]["jersey_evidence"][
+                "readings"
+            ]
+            if change == "anchor":
+                altered[1]["bboxes"] = []
+            elif change == "number":
+                readings[1]["number"] = 6
+            elif change == "digest":
+                readings[1]["image_sha256"] = readings[0]["image_sha256"]
+            elif change == "time":
+                readings[1]["time_sec"] = readings[0]["time_sec"] + 0.1
+            elif change == "kit":
+                readings[1]["kit_compatible"] = False
+            else:
+                readings[1]["time_sec"] = 140
+            self.assertNotIn(3, retained_autonomous_chain_indices(altered), change)
 
     def test_clear_identity_is_linked_across_both_directions(self):
         type(self).track_maps = {
