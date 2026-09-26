@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 staged = Path(sys.argv[1])
 for short in (
@@ -45,12 +46,45 @@ os.environ.update(
 starts = [1100, 1155, 1210, 1265, 1925, 1980, 2035, 3300]
 if os.getenv("GLOBAL_PROBE_FOCUSED") == "1":
     starts = [1155, 1265, 1925]
+held_out = os.getenv("GLOBAL_PROBE_HELD_OUT") == "1"
+if held_out:
+    starts = [180, 550, 1155, 3850, 4400, 4950, 5500, 6050]
 tracking.legacy.iter_windows = lambda *a, **k: [
     (float(s), float(s + 60)) for s in starts
 ]
 tracking.legacy._update_tracking_progress = lambda *a, **k: None
 tracking.legacy._mark_tracking_timeout = lambda *a, **k: None
 tracking._persist_tracking_output = lambda job, output, **kwargs: output
+timings = {}
+
+
+def timed_stage(owner, name):
+    original = getattr(owner, name)
+
+    def measured(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            elapsed = time.monotonic() - started
+            timings[name] = timings.get(name, 0) + elapsed
+            print(
+                "PROBE_TIMING "
+                + json.dumps({"stage": name, "seconds": round(elapsed, 3)}),
+                flush=True,
+            )
+
+    setattr(owner, name, measured)
+
+
+for owner, name in (
+    (tracking.legacy, "_extract_segment"),
+    (tracking.legacy, "_collect_window_samples"),
+    (tracking, "_extract_descriptors_for_tracks"),
+    (tracking, "scout_jerseys"),
+    (tracking, "trim_kit_component"),
+):
+    timed_stage(owner, name)
 original_enrich = tracking.JerseyVerifier.enrich
 
 
@@ -156,6 +190,8 @@ try:
     )
     segments = guarded.get("segments", [])
     diagnostics = {
+        "held_out": held_out,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
         "runtime_call_limit": runtime_call_limit,
         "status": guarded.get("tracking_status"),
         "jersey": guarded.get("reid_summary", {}).get("jersey_vision"),
@@ -199,5 +235,9 @@ try:
         and s.get("reid", {}).get("identity_link") == "JERSEY_REACQUISITION"
         for s in segments
     ), "No independent reacquisition survived the kit and graph guards"
+    if held_out:
+        assert not any(
+            s.get("bboxes") and s.get("window_start") in (180, 550) for s in segments
+        ), "Unrelated introductory footage retained as target player"
 finally:
     shutil.rmtree(probe_root, ignore_errors=True)

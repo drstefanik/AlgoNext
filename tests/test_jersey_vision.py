@@ -32,7 +32,10 @@ class JerseyVisionTests(unittest.TestCase):
     def test_composite_jersey_link_requires_individual_proof_and_exact_box_ownership(
         self,
     ):
-        from app.reid.window_logic import _verified_jersey_anchor_link
+        from app.reid.window_logic import (
+            _verified_jersey_anchor_link,
+            retained_autonomous_chain_indices,
+        )
 
         evidence = copy.deepcopy(self.jersey_candidate().metadata["jersey_evidence"])
         anchor = {
@@ -72,6 +75,22 @@ class JerseyVisionTests(unittest.TestCase):
         extra = copy.deepcopy(segment)
         extra["bboxes"].append({"t": 25.0, "x": 0.9})
         self.assertFalse(_verified_jersey_anchor_link(extra, anchor))
+        graph_anchor = {
+            **anchor,
+            "window_index": 0,
+            "identity_status": "ACCEPTED",
+            "bboxes": [{"t": 1.0}],
+        }
+        graph_extra = {
+            **extra,
+            "window_index": 1,
+            "parent_window_index": 0,
+            "direction": "forward",
+            "identity_status": "ACCEPTED",
+        }
+        self.assertEqual(
+            retained_autonomous_chain_indices([graph_anchor, graph_extra]), set()
+        )
         wrong = copy.deepcopy(segment)
         wrong["reid"]["candidates"][1]["jersey_evidence"]["readings"][0]["number"] = 9
         self.assertFalse(_verified_jersey_anchor_link(wrong, anchor))

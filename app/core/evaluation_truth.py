@@ -134,9 +134,7 @@ def _collect_tracking_bboxes(tracking: Mapping[str, Any]) -> List[Mapping[str, A
                     collected.append(bbox)
         return collected
     return [
-        bbox
-        for bbox in (tracking.get("bboxes") or [])
-        if isinstance(bbox, Mapping)
+        bbox for bbox in (tracking.get("bboxes") or []) if isinstance(bbox, Mapping)
     ]
 
 
@@ -173,9 +171,11 @@ def _tracking_failure_codes(
         )
         if str(code).strip()
     ]
-    status = str(
-        tracking.get("tracking_status") or summary.get("status") or ""
-    ).strip().upper()
+    status = (
+        str(tracking.get("tracking_status") or summary.get("status") or "")
+        .strip()
+        .upper()
+    )
     partial_reason = str(tracking.get("partial_reason") or "").strip().upper()
     incomplete_tracking = bool(
         tracking.get("partial") is True
@@ -187,17 +187,13 @@ def _tracking_failure_codes(
     )
     anchor_failure = (
         status in _TRACKING_FAILURE_STATUSES
-        or str(tracking.get("action_required") or "").upper()
-        == "RESELECT_PLAYER"
+        or str(tracking.get("action_required") or "").upper() == "RESELECT_PLAYER"
         or any(
-            code.startswith("REID_ANCHOR")
-            or code.startswith("REID_ALL_ANCHORS")
+            code.startswith("REID_ANCHOR") or code.startswith("REID_ALL_ANCHORS")
             for code in codes
         )
     )
-    segments_total = int(
-        max(0.0, _safe_float(tracking.get("segments_total")) or 0.0)
-    )
+    segments_total = int(max(0.0, _safe_float(tracking.get("segments_total")) or 0.0))
     segments_with_player = int(
         max(0.0, _safe_float(tracking.get("segments_with_player")) or 0.0)
     )
@@ -218,9 +214,11 @@ def _tracking_failure_codes(
 
 def _tracking_incomplete_codes(tracking: Mapping[str, Any]) -> List[str]:
     summary = _as_mapping(tracking.get("reid_summary"))
-    status = str(
-        tracking.get("tracking_status") or summary.get("status") or ""
-    ).strip().upper()
+    status = (
+        str(tracking.get("tracking_status") or summary.get("status") or "")
+        .strip()
+        .upper()
+    )
     partial_reason = str(tracking.get("partial_reason") or "").strip().upper()
     incomplete = bool(
         tracking.get("partial") is True
@@ -289,12 +287,8 @@ def compute_image_motion_metrics(
             motion_bursts += 1
         above_threshold = is_above
 
-    tracked_span_sec = (
-        points[-1][0] - points[0][0] if len(points) >= 2 else 0.0
-    )
-    average_speed = (
-        path_length / tracked_span_sec if tracked_span_sec > 0 else 0.0
-    )
+    tracked_span_sec = points[-1][0] - points[0][0] if len(points) >= 2 else 0.0
+    average_speed = path_length / tracked_span_sec if tracked_span_sec > 0 else 0.0
     sorted_speeds = sorted(speeds)
     if sorted_speeds:
         p95_index = min(
@@ -350,9 +344,7 @@ def compute_image_motion_metrics(
             {
                 "metric_space": "camera_compensated_image_plane_normalized",
                 "camera_motion_compensated": True,
-                "camera_motion_validated": bool(
-                    camera_motion.get("validated") is True
-                ),
+                "camera_motion_validated": bool(camera_motion.get("validated") is True),
                 "normalized_path_length": round(reported_path_length, 6),
                 "raw_normalized_path_length": round(path_length, 6),
                 "avg_center_speed_norm_per_sec": round(
@@ -375,9 +367,7 @@ def sanitize_evidence_metrics(
         for key, value in source.items()
         if key not in _UNVALIDATED_PHYSICAL_METRICS
     }
-    removed = sorted(
-        key for key in _UNVALIDATED_PHYSICAL_METRICS if key in source
-    )
+    removed = sorted(key for key in _UNVALIDATED_PHYSICAL_METRICS if key in source)
     if removed:
         sanitized["removed_unvalidated_metrics"] = removed
     return sanitized
@@ -418,9 +408,7 @@ def build_tracking_evaluation(
             or 0.0,
         )
     )
-    sample_sufficiency_pct = _clamp(
-        (samples_used / _TRACKING_SAMPLE_TARGET) * 100.0
-    )
+    sample_sufficiency_pct = _clamp((samples_used / _TRACKING_SAMPLE_TARGET) * 100.0)
 
     continuity_pct = _ratio_or_percent(
         _first_present(
@@ -439,10 +427,7 @@ def build_tracking_evaluation(
     elif (
         has_tracking_contract
         and samples_used >= 2
-        and (
-            "lost_segments" in tracking_source
-            or "segments" in tracking_source
-        )
+        and ("lost_segments" in tracking_source or "segments" in tracking_source)
     ):
         continuity_pct = _clamp(100.0 - len(lost_segments) * 12.5)
         continuity_source = "lost_segments_proxy"
@@ -515,11 +500,7 @@ def build_tracking_evaluation(
             ),
             1,
         )
-        if (
-            coverage_pct >= 50.0
-            and continuity_pct >= 70.0
-            and samples_used >= 60
-        ):
+        if coverage_pct >= 50.0 and continuity_pct >= 70.0 and samples_used >= 60:
             tracking_confidence = "medium"
         else:
             tracking_confidence = "low"
@@ -554,9 +535,7 @@ def build_tracking_evaluation(
         pitch_calibration.get("available") is True
         or pitch_calibration.get("validated") is True
     )
-    pitch_calibration_validated = bool(
-        pitch_calibration.get("validated") is True
-    )
+    pitch_calibration_validated = bool(pitch_calibration.get("validated") is True)
     ball_tracking = _as_mapping(tracking_source.get("ball_tracking"))
     ball_tracking_operational = bool(ball_tracking.get("available") is True)
     ball_tracking_validated = bool(ball_tracking.get("validated") is True)
@@ -564,12 +543,8 @@ def build_tracking_evaluation(
     event_detection_operational = bool(event_detection.get("available") is True)
     event_detection_validated = bool(event_detection.get("validated") is True)
     athletic_metrics = _as_mapping(tracking_source.get("athletic_metrics"))
-    athletic_metrics_operational = bool(
-        athletic_metrics.get("available") is True
-    )
-    athletic_metrics_validated = bool(
-        athletic_metrics.get("validated") is True
-    )
+    athletic_metrics_operational = bool(athletic_metrics.get("available") is True)
+    athletic_metrics_validated = bool(athletic_metrics.get("validated") is True)
 
     if not reid_validated:
         reason_codes.append("IDENTITY_NOT_VERIFIED_ACROSS_SHOTS")
@@ -610,7 +585,7 @@ def build_tracking_evaluation(
             "status": "available",
             "available": True,
             "validated": True,
-            "method": "bytetrack",
+            "method": tracking_source.get("tracker") or "bytetrack",
         },
         "cross_shot_player_reidentification": {
             "status": (
@@ -626,9 +601,7 @@ def build_tracking_evaluation(
             "status": (
                 "available"
                 if camera_motion_validated
-                else "experimental"
-                if camera_motion_operational
-                else "unavailable"
+                else "experimental" if camera_motion_operational else "unavailable"
             ),
             "available": camera_motion_operational,
             "validated": camera_motion_validated,
@@ -638,9 +611,7 @@ def build_tracking_evaluation(
             "status": (
                 "available"
                 if pitch_calibration_validated
-                else "experimental"
-                if pitch_calibration_operational
-                else "foundation"
+                else "experimental" if pitch_calibration_operational else "foundation"
             ),
             "available": pitch_calibration_validated,
             "validated": pitch_calibration_validated,
@@ -650,9 +621,7 @@ def build_tracking_evaluation(
             "status": (
                 "available"
                 if ball_tracking_validated
-                else "experimental"
-                if ball_tracking_operational
-                else "unavailable"
+                else "experimental" if ball_tracking_operational else "unavailable"
             ),
             "available": ball_tracking_operational,
             "validated": ball_tracking_validated,
@@ -662,9 +631,7 @@ def build_tracking_evaluation(
             "status": (
                 "available"
                 if event_detection_validated
-                else "experimental"
-                if event_detection_operational
-                else "unavailable"
+                else "experimental" if event_detection_operational else "unavailable"
             ),
             "available": event_detection_operational,
             "validated": event_detection_validated,
@@ -674,9 +641,7 @@ def build_tracking_evaluation(
             "status": (
                 "available"
                 if athletic_metrics_validated
-                else "experimental"
-                if athletic_metrics_operational
-                else "foundation"
+                else "experimental" if athletic_metrics_operational else "foundation"
             ),
             "available": athletic_metrics_validated,
             "validated": athletic_metrics_validated,
@@ -737,9 +702,7 @@ def build_tracking_evaluation(
                 else None
             ),
             "largest_gap_sec": (
-                round(largest_gap_sec, 2)
-                if largest_gap_sec is not None
-                else None
+                round(largest_gap_sec, 2) if largest_gap_sec is not None else None
             ),
             "image_motion": image_motion,
         },
@@ -754,9 +717,7 @@ def build_tracking_evaluation(
             "metric_space": "image_plane_normalized",
             "coverage_unit": "percentage_points",
             "metrics_scope": (
-                "selected_player"
-                if has_tracking_contract
-                else "preview_candidate"
+                "selected_player" if has_tracking_contract else "preview_candidate"
             ),
         },
     }
@@ -776,15 +737,11 @@ def apply_evaluation_truth_gate(
     if candidate_metrics:
         if isinstance(tracking, Mapping):
             sanitized_evidence.pop("candidate_metrics", None)
-            sanitized_evidence[
-                "preview_candidate_metrics"
-            ] = dict(candidate_metrics)
+            sanitized_evidence["preview_candidate_metrics"] = dict(candidate_metrics)
         else:
             sanitized_evidence["candidate_metrics"] = dict(candidate_metrics)
     if tracking:
-        sanitized_evidence["image_motion"] = compute_image_motion_metrics(
-            tracking
-        )
+        sanitized_evidence["image_motion"] = compute_image_motion_metrics(tracking)
 
     evaluation = build_tracking_evaluation(
         candidate_metrics=candidate_metrics,
@@ -820,9 +777,7 @@ def apply_evaluation_truth_gate(
         {
             "evaluation_status": evaluation["status"],
             "player_evaluation_available": False,
-            "tracking_quality_index": evaluation[
-                "tracking_quality_index"
-            ],
+            "tracking_quality_index": evaluation["tracking_quality_index"],
             "match_rating_10": None,
             "impact_100": None,
             "overall_score": None,
@@ -838,9 +793,7 @@ def apply_evaluation_truth_gate(
             "score_kind": evaluation["score_kind"],
             "player_evaluation_available": False,
             "legacy_scores_suppressed": True,
-            "tracking_quality_index": evaluation[
-                "tracking_quality_index"
-            ],
+            "tracking_quality_index": evaluation["tracking_quality_index"],
             "tracking_quality": evaluation,
             "tracking_signals": evaluation["signals"],
             "score_provenance": evaluation["provenance"],
@@ -861,32 +814,38 @@ def apply_evaluation_truth_gate(
                     != "RETRY_ANALYSIS"
                 )
                 else (
-                    "Il tracking del giocatore si è interrotto per un errore tecnico. "
-                    "Riprova l'analisi senza cambiare selezione."
-                )
-                if evaluation["status"] == "TRACKING_FAILED"
-                else (
-                    "L'elaborazione è terminata, ma il giocatore è stato riconosciuto "
-                    "solo in pochi tratti del video. Le osservazioni mostrate sono "
-                    "parziali e non consentono una valutazione attendibile."
-                )
-                if (
-                    "SPARSE_CROSS_WINDOW_EVIDENCE" in evaluation["reason_codes"]
-                    and not _TRACKING_INCOMPLETE_STATUSES.intersection(
-                        evaluation["reason_codes"]
+                    (
+                        "Il tracking del giocatore si è interrotto per un errore tecnico. "
+                        "Riprova l'analisi senza cambiare selezione."
                     )
-                )
-                else (
-                    "Il budget operativo del tracking è terminato prima di produrre "
-                    "un risultato completo. Riprova l'analisi; nessuna metrica del "
-                    "giocatore è stata inferita dai dati parziali."
-                )
-                if evaluation["status"] == "TRACKING_INCOMPLETE"
-                else (
-                    "Diagnostica di computer vision: il numero mostrato misura la "
-                    "qualità dell'evidenza di tracking, non la qualità calcistica del "
-                    "giocatore. La valutazione del calciatore è sospesa finché ReID, "
-                    "calibrazione del campo ed eventi palla non saranno validati."
+                    if evaluation["status"] == "TRACKING_FAILED"
+                    else (
+                        (
+                            "L'elaborazione è terminata, ma il giocatore è stato riconosciuto "
+                            "solo in pochi tratti del video. Le osservazioni mostrate sono "
+                            "parziali e non consentono una valutazione attendibile."
+                        )
+                        if (
+                            "SPARSE_CROSS_WINDOW_EVIDENCE" in evaluation["reason_codes"]
+                            and not _TRACKING_INCOMPLETE_STATUSES.intersection(
+                                evaluation["reason_codes"]
+                            )
+                        )
+                        else (
+                            (
+                                "Il budget operativo del tracking è terminato prima di produrre "
+                                "un risultato completo. Riprova l'analisi; nessuna metrica del "
+                                "giocatore è stata inferita dai dati parziali."
+                            )
+                            if evaluation["status"] == "TRACKING_INCOMPLETE"
+                            else (
+                                "Diagnostica di computer vision: il numero mostrato misura la "
+                                "qualità dell'evidenza di tracking, non la qualità calcistica del "
+                                "giocatore. La valutazione del calciatore è sospesa finché ReID, "
+                                "calibrazione del campo ed eventi palla non saranno validati."
+                            )
+                        )
+                    )
                 )
             ),
         }

@@ -565,6 +565,12 @@ def _explicit_retained_autonomous_chain_indices(
             ):
                 reachable.add(segment_index)
                 break
+            if (current.get("reid") or {}).get(
+                "identity_link"
+            ) == "JERSEY_REACQUISITION":
+                # An invalid explicit jersey proof cannot silently fall back
+                # to an adjacent-window physical-continuity claim.
+                break
             if parent_window_index != expected_parent:
                 break
             if parent_index is None:
