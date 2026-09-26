@@ -106,7 +106,7 @@ class JerseyReader:
         }
         self.enabled = self.enabled and bool(self.api_key)
         self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 256))
-        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 600)
+        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 1200)
         self.timeout = bounded_env("JERSEY_OCR_TIMEOUT_SECONDS", 20, 1, 30)
         self.clock = clock
         self.transport = transport or requests.post

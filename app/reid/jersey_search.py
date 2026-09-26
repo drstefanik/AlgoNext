@@ -1,6 +1,7 @@
 """Bounded whole-window jersey search, independent of ReID candidate ranking."""
 
 from collections import defaultdict
+import math
 from typing import Any
 
 import cv2
@@ -75,10 +76,22 @@ def scout_jerseys(
             requests[float(detection["t"])].append((track_id, detection))
     cap = cv2.VideoCapture(str(path))
     usable = []
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(source_fps) or source_fps <= 0:
+        source_fps = 25.0
+    frame_index = -1
     try:
         for t in sorted(requests):
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ok, frame = cap.read()
+            # Times are ordered and come from this video's frame grid. Decode
+            # once instead of repeatedly seeking and decoding the same GOP.
+            target_index = max(0, round(t * source_fps))
+            while frame_index < target_index:
+                if not cap.grab():
+                    break
+                frame_index += 1
+            if frame_index != target_index:
+                break
+            ok, frame = cap.retrieve()
             if not ok:
                 continue
             for track_id, detection in requests[t]:

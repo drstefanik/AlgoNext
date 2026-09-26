@@ -1638,6 +1638,7 @@ def track_player_windowed_reid(
     thresholds = _association_thresholds()
     batch_search = _env_bool("JERSEY_OCR_BATCH_SEARCH", False)
     search_diagnostics = []
+    scout_cache = {}
     if batch_search:
         tracker = "botsort.yaml"
     anchor_tracklet_radius = _env_float(
@@ -2616,9 +2617,12 @@ def track_player_windowed_reid(
             dense_hints = []
             scout_hints = []
             if batch_search and jersey_verifier.can_reacquire():
-                scout_hints, scout_summary = scout_jerseys(
-                    jersey_verifier, segment_path, track_map, window_start
-                )
+                scout_key = (index, sample_fps)
+                if scout_key not in scout_cache:
+                    scout_cache[scout_key] = scout_jerseys(
+                        jersey_verifier, segment_path, track_map, window_start
+                    )
+                scout_hints, scout_summary = scout_cache[scout_key]
                 search_diagnostics.append({"window_index": index, **scout_summary})
                 dense_hints = scout_hints
             for density_pass in range(2):

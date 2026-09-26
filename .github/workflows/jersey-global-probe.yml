@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Verify held-out second-half footage and unrelated intro negatives at 3 fps.
+# Verify identical sequential decoding, a known positive, and unseen windows.
 on:
   push:
     branches: [fix/batched-identity-search-20260926]
@@ -37,4 +37,4 @@ jobs:
             done
             git show FETCH_HEAD:scripts/jersey_global_probe.py > "$stage/probe.py"
             docker cp "$stage" "$worker_id:$container_stage"
-            docker exec -e PYTHONPATH=/app -e GLOBAL_PROBE_HELD_OUT=1 "$worker_id" python "$container_stage/probe.py" "$container_stage"
+            docker exec -e PYTHONPATH=/app -e GLOBAL_PROBE_RELEASE=1 "$worker_id" python "$container_stage/probe.py" "$container_stage"

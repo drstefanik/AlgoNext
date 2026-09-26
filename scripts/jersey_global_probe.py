@@ -49,6 +49,12 @@ if os.getenv("GLOBAL_PROBE_FOCUSED") == "1":
 held_out = os.getenv("GLOBAL_PROBE_HELD_OUT") == "1"
 if held_out:
     starts = [180, 550, 1155, 3850, 4400, 4950, 5500, 6050]
+release_validation = os.getenv("GLOBAL_PROBE_RELEASE") == "1"
+if release_validation:
+    # Keep an independently inspected positive control, an unrelated-match
+    # negative, and four previously untested first-half windows. Visibility in
+    # the latter is unknown; abstention must not be reported as proven absence.
+    starts = [180, 1155, 1430, 1680, 1925, 2750, 3025, 4400]
 tracking.legacy.iter_windows = lambda *a, **k: [
     (float(s), float(s + 60)) for s in starts
 ]
@@ -191,6 +197,7 @@ try:
     segments = guarded.get("segments", [])
     diagnostics = {
         "held_out": held_out,
+        "release_validation": release_validation,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "runtime_call_limit": runtime_call_limit,
         "status": guarded.get("tracking_status"),
@@ -235,7 +242,7 @@ try:
         and s.get("reid", {}).get("identity_link") == "JERSEY_REACQUISITION"
         for s in segments
     ), "No independent reacquisition survived the kit and graph guards"
-    if held_out:
+    if held_out or release_validation:
         assert not any(
             s.get("bboxes") and s.get("window_start") in (180, 550) for s in segments
         ), "Unrelated introductory footage retained as target player"
