@@ -297,7 +297,14 @@ class JerseyVerifier:
         finally:
             capture.release()
 
-    def enrich(self, path, candidates: Sequence[CandidateProfile], window_start: float):
+    def enrich(
+        self,
+        path,
+        candidates: Sequence[CandidateProfile],
+        window_start: float,
+        *,
+        rescope=None,
+    ):
         if (
             self.target is None
             or not self.reader.enabled
@@ -317,10 +324,11 @@ class JerseyVerifier:
         try:
             for candidate in candidates:
                 metadata = dict(candidate.metadata or {})
-                # Never OCR disconnected raw IDs or use a number to assert continuity.
+                # OCR may inspect a raw ID, but only a subsequently verified
+                # motion-continuous component can become a reacquisition candidate.
                 detections = metadata.get("tracklet_detections") or ()
                 crops = []
-                if metadata.get("tracklet_scope", "").startswith("MOTION_CONTINUOUS"):
+                if detections:
                     for detection in choose_descriptor_detections(detections, 8):
                         t = float(detection.get("t") or 0)
                         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
@@ -375,7 +383,23 @@ class JerseyVerifier:
                     for crop in selected
                 ]
                 metadata["jersey_evidence"] = evaluate_readings(readings, self.target)
-                enriched.append(replace(candidate, metadata=metadata))
+                evidence = metadata["jersey_evidence"]
+                evidence["anchor_number"] = (self.anchor_reading or {}).get("number")
+                evidence["anchor_legible"] = (self.anchor_reading or {}).get(
+                    "legible"
+                ) is True
+                enriched_candidate = replace(candidate, metadata=metadata)
+                if (
+                    rescope is not None
+                    and evidence["status"] == "MATCH"
+                    and evidence["anchor_legible"]
+                    and evidence["anchor_number"] == self.target
+                    and not metadata.get("tracklet_scope", "").startswith(
+                        "MOTION_CONTINUOUS_STRONG"
+                    )
+                ):
+                    enriched_candidate = rescope(path, enriched_candidate, window_start)
+                enriched.append(enriched_candidate)
         finally:
             cap.release()
         return enriched

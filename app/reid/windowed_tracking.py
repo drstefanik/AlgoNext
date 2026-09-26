@@ -1185,6 +1185,67 @@ def _build_candidate_profiles(
     return profiles, id_lookup, descriptor_lookup
 
 
+def _scope_jersey_candidate(segment_path, candidate, window_start):
+    """Keep only the component containing two independent matching shirt reads."""
+    from dataclasses import replace
+
+    metadata = dict(candidate.metadata or {})
+    evidence = metadata.get("jersey_evidence") or {}
+    matches = [
+        item
+        for item in evidence.get("readings", [])
+        if item.get("legible") is True
+        and item.get("number") == evidence.get("target_number")
+        and item.get("kit_compatible") is True
+    ]
+    detections = list(metadata.get("tracklet_detections") or ())
+    if len(matches) < 2 or not detections:
+        return candidate
+    first_time = float(matches[0]["time_sec"]) - window_start
+    seed = min(detections, key=lambda item: abs(float(item["t"]) - first_time))
+    if abs(float(seed["t"]) - first_time) > 0.05:
+        return candidate
+    component = _anchor_tracklet_detections(
+        detections,
+        anchor_time_local=first_time,
+        anchor_bbox=seed["bbox"],
+        radius_sec=0.1,
+    )
+    component_times = [float(item["t"]) for item in component]
+    if len(component) < 3 or any(
+        not any(
+            abs(t - (float(reading["time_sec"]) - window_start)) <= 0.05
+            for t in component_times
+        )
+        for reading in matches
+    ):
+        return candidate
+    track_id = int(metadata["local_track_id"])
+    descriptor = _extract_descriptors_for_tracks(
+        segment_path, {track_id: component}, [track_id]
+    ).get(track_id)
+    metadata.update(
+        tracklet_scope="MOTION_CONTINUOUS_JERSEY",
+        tracklet_detections=tuple(dict(item) for item in component),
+        tracklet_sample_indices=tuple(int(item["sample_index"]) for item in component),
+    )
+    metadata["jersey_evidence"] = {**evidence, "component_match_samples": len(matches)}
+    metadata["benchmark_evidence"] = [
+        item
+        for item in (metadata.get("benchmark_evidence") or [])
+        if any(
+            abs(float(item.get("time_sec", -1)) - window_start - t) <= 0.05
+            for t in component_times
+        )
+    ]
+    return replace(
+        candidate,
+        metadata=metadata,
+        descriptor=descriptor,
+        detection_count=len(component),
+    )
+
+
 def _empty_segment(
     *,
     window_index: int,
@@ -2437,7 +2498,15 @@ def track_player_windowed_reid(
                 fps=sample_fps,
                 strong_overlap_score=thresholds.strong_overlap_score,
             )
-            candidates = jersey_verifier.enrich(segment_path, candidates, window_start)
+            candidates = jersey_verifier.enrich(
+                segment_path, candidates, window_start, rescope=_scope_jersey_candidate
+            )
+            descriptor_lookup.update(
+                {
+                    candidate.candidate_id: candidate.descriptor
+                    for candidate in candidates
+                }
+            )
             decision = associate_identity(
                 base_profile,
                 candidates,

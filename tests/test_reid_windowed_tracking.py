@@ -190,6 +190,63 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             for track_id in track_ids
         }
 
+    def test_number_reads_must_belong_to_the_same_motion_component(self):
+        from app.reid.association import CandidateProfile
+
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        first = [
+            {"t": float(t), "bbox": _bbox(), "conf": 0.9, "sample_index": t}
+            for t in (1, 2, 3)
+        ]
+        second = [
+            {
+                "t": float(t),
+                "bbox": {**_bbox(), "x": 0.8},
+                "conf": 0.9,
+                "sample_index": t,
+            }
+            for t in (8, 9, 10)
+        ]
+
+        def candidate(times):
+            readings = [
+                {
+                    "time_sec": 100 + t,
+                    "legible": True,
+                    "number": 8,
+                    "kit_compatible": True,
+                }
+                for t in times
+            ]
+            return CandidateProfile(
+                "7",
+                descriptor,
+                detection_count=6,
+                metadata={
+                    "local_track_id": 7,
+                    "tracklet_scope": "FULL_WINDOW",
+                    "tracklet_detections": first + second,
+                    "jersey_evidence": {
+                        "status": "MATCH",
+                        "target_number": 8,
+                        "readings": readings,
+                    },
+                },
+            )
+
+        with patch.object(
+            self.module, "_extract_descriptors_for_tracks", return_value={7: descriptor}
+        ):
+            scoped = self.module._scope_jersey_candidate(
+                Path("video.mp4"), candidate([1, 2]), 100
+            )
+            self.assertEqual(scoped.detection_count, 3)
+            self.assertEqual(scoped.metadata["tracklet_sample_indices"], (1, 2, 3))
+            disconnected = self.module._scope_jersey_candidate(
+                Path("video.mp4"), candidate([1, 9]), 100
+            )
+            self.assertEqual(disconnected.metadata["tracklet_scope"], "FULL_WINDOW")
+
     def test_early_fallback_rewrites_persisted_legacy_asset_fail_closed(self):
         uploaded = {}
 
@@ -668,10 +725,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             {"326", "927"},
         )
         self.assertTrue(
-            all(
-                item.metadata["strong_overlap_unique"] is False
-                for item in profiles
-            )
+            all(item.metadata["strong_overlap_unique"] is False for item in profiles)
         )
 
     def test_unique_two_hit_physical_track_is_surfaceable(self):
@@ -767,16 +821,14 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 fps=2,
                 strong_overlap_score=0.65,
             )
-            lagged_profiles, _ids, _descriptors = (
-                self.module._build_candidate_profiles(
-                    Path("/tmp/window.mp4"),
-                    {326: current},
-                    previous_bboxes=ema_lagged_previous,
-                    window_start=660.0,
-                    direction="backward",
-                    fps=2,
-                    strong_overlap_score=0.65,
-                )
+            lagged_profiles, _ids, _descriptors = self.module._build_candidate_profiles(
+                Path("/tmp/window.mp4"),
+                {326: current},
+                previous_bboxes=ema_lagged_previous,
+                window_start=660.0,
+                direction="backward",
+                fps=2,
+                strong_overlap_score=0.65,
             )
 
         self.assertTrue(raw_profiles[0].metadata["strong_overlap_unique"])
@@ -827,23 +879,21 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             "_build_window_bboxes",
             return_value=(lagged, [], lagged[-1]),
         ):
-            display, raw_links, track_ids = (
-                self.module._stitch_manual_anchor_bboxes(
-                    [
-                        {
-                            "anchor": {
-                                "anchor_id": 1,
-                                "t": anchor_time,
-                                **anchor_bbox,
-                            },
-                            "track_id": 7,
-                        }
-                    ],
-                    samples,
-                    fps=5,
-                    window_start=window_start,
-                    radius_sec=2.0,
-                )
+            display, raw_links, track_ids = self.module._stitch_manual_anchor_bboxes(
+                [
+                    {
+                        "anchor": {
+                            "anchor_id": 1,
+                            "t": anchor_time,
+                            **anchor_bbox,
+                        },
+                        "track_id": 7,
+                    }
+                ],
+                samples,
+                fps=5,
+                window_start=window_start,
+                radius_sec=2.0,
             )
 
         nearest = min(
@@ -1625,11 +1675,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 window_number = int(Path(segment_path).stem.split("_")[-1])
                 if window_number != 3:
                     return [], {}, {}
-                indices = (
-                    (0, 1, 2)
-                    if direction == "forward"
-                    else tuple(right_indices)
-                )
+                indices = (0, 1, 2) if direction == "forward" else tuple(right_indices)
                 detections = tuple(
                     {
                         **dict(track_map[7][index]),
@@ -1645,9 +1691,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                     detection_count=len(detections),
                     metadata={
                         "local_track_id": 7,
-                        "tracklet_scope": (
-                            "MOTION_CONTINUOUS_STRONG_OVERLAP"
-                        ),
+                        "tracklet_scope": ("MOTION_CONTINUOUS_STRONG_OVERLAP"),
                         "tracklet_sample_indices": indices,
                         "tracklet_detections": detections,
                         "overlap_link_samples": len(detections),
@@ -1763,9 +1807,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
             def descriptors(path, _track_map, track_ids):
                 window_number = int(Path(path).stem.split("_")[-1])
                 return {
-                    track_id: (
-                        descriptor if window_number in {2, 5} else None
-                    )
+                    track_id: (descriptor if window_number in {2, 5} else None)
                     for track_id in track_ids
                 }
 
@@ -1810,10 +1852,7 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
 
         converged = run(left_bbox)
         self.assertEqual(
-            [
-                converged["segments"][index]["identity_status"]
-                for index in (2, 3)
-            ],
+            [converged["segments"][index]["identity_status"] for index in (2, 3)],
             ["ACCEPTED", "ACCEPTED"],
         )
 

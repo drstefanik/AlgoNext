@@ -387,6 +387,48 @@ def _verified_physical_continuity(
     return len(distinct_indices) >= 2
 
 
+def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
+    """Independent number evidence can bridge a cut, never a disconnected raw ID."""
+    if candidate is None or candidate.detection_count < 3:
+        return False
+    metadata = candidate.metadata or {}
+    if metadata.get("tracklet_scope") != "MOTION_CONTINUOUS_JERSEY":
+        return False
+    evidence = metadata.get("jersey_evidence") or {}
+    if (
+        not isinstance(evidence, Mapping)
+        or int(evidence.get("component_match_samples") or 0) < 2
+    ):
+        return False
+    target = evidence.get("target_number")
+    if (
+        type(target) is not int
+        or not 0 <= target <= 99
+        or evidence.get("status") != "MATCH"
+        or evidence.get("anchor_legible") is not True
+        or evidence.get("anchor_number") != target
+    ):
+        return False
+    readings = evidence.get("readings") or []
+    matching = {}
+    for item in readings:
+        if item.get("legible") is not True:
+            continue
+        if item.get("number") != target:
+            return False
+        if item.get("kit_compatible") is not True:
+            continue
+        digest = item.get("image_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            continue
+        t = item.get("time_sec")
+        if not isinstance(t, (int, float)) or not math.isfinite(t):
+            continue
+        matching[digest] = float(t)
+    times = list(matching.values())
+    return len(times) >= 2 and max(times) - min(times) >= 0.6
+
+
 def associate_identity(
     identity: IdentityProfile,
     candidates: Iterable[CandidateProfile],
@@ -408,6 +450,9 @@ def associate_identity(
                 _verified_physical_continuity(
                     profiles_by_id.get(candidate.candidate_id),
                     thresholds,
+                ),
+                _verified_jersey_reacquisition(
+                    profiles_by_id.get(candidate.candidate_id)
                 ),
                 candidate.combined_score,
                 candidate.appearance_similarity or 0.0,
@@ -441,6 +486,13 @@ def associate_identity(
             for candidate in scored[1:]
         )
     )
+    unique_jersey = bool(
+        _verified_jersey_reacquisition(best_profile)
+        and sum(
+            _verified_jersey_reacquisition(profile) for profile in candidate_profiles
+        )
+        == 1
+    )
     physical_only_reasons = {
         "MISSING_APPEARANCE_DESCRIPTOR",
         "LOW_DESCRIPTOR_QUALITY",
@@ -453,13 +505,24 @@ def associate_identity(
     )
     if unique_strong_overlap:
         reasons = [reason for reason in reasons if reason not in physical_only_reasons]
+    if unique_jersey:
+        # Appearance quality/similarity and combined-score gates still apply.
+        # Only cross-window overlap is replaced by independently read shirt identity.
+        reasons = [
+            reason for reason in reasons if reason != "STRONG_TEMPORAL_OVERLAP_REQUIRED"
+        ]
     if (
         thresholds.require_strong_overlap
         and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
         and best_metadata.get("strong_overlap_unique") is not True
     ):
         reasons.append("AMBIGUOUS_STRONG_OVERLAP")
-    if len(scored) > 1 and margin < thresholds.min_margin and not unique_strong_overlap:
+    if (
+        len(scored) > 1
+        and margin < thresholds.min_margin
+        and not unique_strong_overlap
+        and not unique_jersey
+    ):
         reasons.append("AMBIGUOUS_CANDIDATE_MARGIN")
 
     hard_failures = {
@@ -478,6 +541,7 @@ def associate_identity(
     if accepted:
         accepted_reasons = [
             "ASSOCIATION_ACCEPTED",
+            *(["JERSEY_AIDED_REACQUISITION_EXPERIMENTAL"] if unique_jersey else []),
             *(
                 ["JERSEY_NUMBER_CORROBORATED"]
                 if best.jersey_evidence
