@@ -20,6 +20,7 @@ from app.reid.team_color_guard import apply_team_color_guard
 from app.reid.appearance import crop_from_normalized_bbox, evaluate_crop_quality
 from app.reid.team_color_guard import extract_kit_color_signature, signatures_compatible
 import cv2
+import copy
 
 neighbor_diagnostics = []
 verifier_class = sys.modules["app.reid.jersey_vision"].JerseyVerifier
@@ -75,6 +76,17 @@ def diagnostic_enrich(self, path, candidates, start, **kwargs):
 
 
 verifier_class.enrich = diagnostic_enrich
+smoothed_boxes = {}
+original_build_boxes = tracking.legacy._build_window_bboxes
+
+
+def record_smoothed_boxes(samples, selected_track_id, **kwargs):
+    result = original_build_boxes(samples, selected_track_id, **kwargs)
+    smoothed_boxes[(kwargs["time_offset"], selected_track_id)] = result[0]
+    return result
+
+
+tracking.legacy._build_window_bboxes = record_smoothed_boxes
 
 job_id = "796f8c0f-94cd-4d2d-b8b1-a0f6ee5a5b60"
 attempt = "92f4305d-adb7-44b7-ba63-fe629bbc92f8"
@@ -133,6 +145,15 @@ try:
     guarded = apply_team_color_guard(
         result, input_video_path=source, player_ref=reference
     )
+    legacy_display_result = copy.deepcopy(result)
+    for segment in legacy_display_result.get("segments", []):
+        if segment.get("reid", {}).get("tracklet_scope") == "MOTION_CONTINUOUS_JERSEY":
+            segment["bboxes"] = smoothed_boxes[
+                (segment["window_start"], segment["selected_track_id"])
+            ]
+    legacy_display_guard = apply_team_color_guard(
+        legacy_display_result, input_video_path=source, player_ref=reference
+    )
     diagnostic = {
         "raw_tracking_success": result.get("tracking_success"),
         "guarded_tracking_success": guarded.get("tracking_success"),
@@ -141,6 +162,13 @@ try:
         "jersey": result.get("reid_summary", {}).get("jersey_vision"),
         "windows": [],
         "neighbor_diagnostics": neighbor_diagnostics,
+        "guard_decisions": guarded.get("reid_summary", {})
+        .get("team_color_guard", {})
+        .get("decisions"),
+        "smoothed_guard_status": legacy_display_guard.get("tracking_status"),
+        "smoothed_guard_decisions": legacy_display_guard.get("reid_summary", {})
+        .get("team_color_guard", {})
+        .get("decisions"),
     }
     for segment in result.get("segments", []):
         reid = segment.get("reid", {})

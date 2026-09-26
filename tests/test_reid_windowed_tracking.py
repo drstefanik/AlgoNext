@@ -1241,6 +1241,90 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
         self.assertTrue(proven["proven"])
         self.assertEqual(proven["bboxes_count"], 2)
 
+    def test_jersey_identity_boxes_stay_on_observed_pixels_after_display_smoothing(
+        self,
+    ):
+        from dataclasses import replace
+        from types import SimpleNamespace
+
+        type(self).track_maps = {
+            1: self._track([30]),
+            2: self._track([10]),
+            3: self._track([20]),
+        }
+        descriptor = AppearanceDescriptor((1, 0), 3, 0.9)
+        original_build = self.module.legacy._build_window_bboxes
+
+        def lagged_display(samples, track_id, **kwargs):
+            boxes, lost, last = original_build(samples, track_id, **kwargs)
+            if kwargs["time_offset"] != 35.0:
+                boxes = [{**box, "x": box["x"] - 0.1} for box in boxes]
+            return boxes, lost, last
+
+        def verified_jersey(path, candidates, start, **kwargs):
+            return [
+                replace(
+                    c,
+                    metadata={
+                        **c.metadata,
+                        "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                        "jersey_evidence": {
+                            "status": "MATCH",
+                            "target_number": 8,
+                            "anchor_number": 8,
+                            "anchor_legible": True,
+                            "component_match_samples": 2,
+                            "readings": [
+                                {
+                                    "number": 8,
+                                    "legible": True,
+                                    "kit_compatible": True,
+                                    "image_sha256": digest * 64,
+                                    "time_sec": start + delta,
+                                }
+                                for digest, delta in [("a", 0), ("b", 1)]
+                            ],
+                        },
+                    },
+                )
+                for c in candidates
+            ]
+
+        verifier = SimpleNamespace(
+            enrich=verified_jersey,
+            should_retry_densely=lambda _: False,
+            summary=lambda: {},
+        )
+        with patch.object(
+            self.module, "JerseyVerifier", return_value=verifier
+        ), patch.object(
+            self.module,
+            "_extract_descriptors_for_tracks",
+            side_effect=lambda path, tracks, ids: {i: descriptor for i in ids},
+        ), patch.object(
+            self.module.legacy, "_build_window_bboxes", side_effect=lagged_display
+        ), patch.dict(
+            os.environ,
+            {
+                "S3_BUCKET": "bucket",
+                "S3_ACCESS_KEY": "key",
+                "S3_SECRET_KEY": "secret",
+                "PLAYER_REID_REQUIRE_STRONG_OVERLAP": "1",
+            },
+        ):
+            output = self.module.track_player_windowed_reid(
+                "jersey-pixels",
+                "/tmp/input.mp4",
+                {"t": 50.0, **_bbox()},
+                [],
+                video_duration_sec=115.0,
+                jersey_target_number=8,
+            )
+        for segment in (output["segments"][0], output["segments"][2]):
+            self.assertEqual(segment["identity_status"], "ACCEPTED")
+            self.assertTrue(segment["bboxes"])
+            self.assertTrue(all(box["x"] == _bbox()["x"] for box in segment["bboxes"]))
+
     def test_clear_identity_is_linked_across_both_directions(self):
         type(self).track_maps = {
             1: self._track([30]),

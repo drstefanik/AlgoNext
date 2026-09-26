@@ -2605,6 +2605,11 @@ def track_player_windowed_reid(
                 tracklet_detections,
                 window_start=window_start,
             )
+            if selected_metadata.get("tracklet_scope") == "MOTION_CONTINUOUS_JERSEY":
+                # Shirt evidence was read at these exact coordinates. Legacy
+                # display smoothing lags camera/player motion and must not move
+                # the identity crop off the player before the final kit guard.
+                bboxes = [dict(box) for box in next_link_bboxes]
             if (
                 decision.accepted
                 and selected_track_id is not None
