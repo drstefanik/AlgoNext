@@ -6,9 +6,18 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 staged = Path(sys.argv[1])
-for short in ("association", "window_logic", "jersey_vision", "windowed_tracking"):
+for short in (
+    "association",
+    "window_logic",
+    "jersey_vision",
+    "match_context",
+    "jersey_search",
+    "tracklet_motion",
+    "windowed_tracking",
+):
     name = "app.reid." + short
     spec = importlib.util.spec_from_file_location(name, staged / (short + ".py"))
     module = importlib.util.module_from_spec(spec)
@@ -31,17 +40,86 @@ os.environ.update(
     JERSEY_OCR_ENABLED="1",
     JERSEY_OCR_MAX_CALLS="128",
     JERSEY_OCR_MAX_SECONDS="240",
-    TRACKING_TIMEOUT_SECONDS="480",
+    JERSEY_OCR_BATCH_SEARCH="1",
+    JERSEY_DENSE_MAX_WINDOWS="8",
+    TRACKING_TIMEOUT_SECONDS="660",
 )
 starts = [1100, 1155, 1210, 1265, 1925, 1980, 2035, 3300]
 if os.getenv("GLOBAL_PROBE_FOCUSED") == "1":
     starts = [1155, 1265, 1925]
+held_out = os.getenv("GLOBAL_PROBE_HELD_OUT") == "1"
+if held_out:
+    starts = [180, 550, 1155, 3850, 4400, 4950, 5500, 6050]
+release_validation = os.getenv("GLOBAL_PROBE_RELEASE") == "1"
+if release_validation:
+    # Keep an independently inspected positive control, an unrelated-match
+    # negative, and four previously untested first-half windows. Visibility in
+    # the latter is unknown; abstention must not be reported as proven absence.
+    starts = [180, 1155, 1430, 1680, 1925, 2750, 3025, 4400]
 tracking.legacy.iter_windows = lambda *a, **k: [
     (float(s), float(s + 60)) for s in starts
 ]
 tracking.legacy._update_tracking_progress = lambda *a, **k: None
 tracking.legacy._mark_tracking_timeout = lambda *a, **k: None
 tracking._persist_tracking_output = lambda job, output, **kwargs: output
+timings = {}
+original_verifier_init = tracking.JerseyVerifier.__init__
+
+
+def check_context(self, *args, **kwargs):
+    original_verifier_init(self, *args, **kwargs)
+    from app.reid.match_context import read_scoreboard_context, same_match_context
+    import cv2
+
+    cap = cv2.VideoCapture(str(source))
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, 198000)
+        ok, frame = cap.read()
+        unrelated = read_scoreboard_context(self.reader, frame if ok else None, 198)
+    finally:
+        cap.release()
+    print(
+        "PROBE_MATCH_CONTEXT "
+        + json.dumps({"anchor": self.anchor_context, "unrelated": unrelated}),
+        flush=True,
+    )
+    assert self.anchor_context and self.anchor_context.get("legible") is True
+    assert unrelated.get("legible") is True
+    assert not same_match_context(
+        self.anchor_context, unrelated
+    ), "Foreign match has not been distinguished"
+
+
+tracking.JerseyVerifier.__init__ = check_context
+
+
+def timed_stage(owner, name):
+    original = getattr(owner, name)
+
+    def measured(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            elapsed = time.monotonic() - started
+            timings[name] = timings.get(name, 0) + elapsed
+            print(
+                "PROBE_TIMING "
+                + json.dumps({"stage": name, "seconds": round(elapsed, 3)}),
+                flush=True,
+            )
+
+    setattr(owner, name, measured)
+
+
+for owner, name in (
+    (tracking.legacy, "_extract_segment"),
+    (tracking.legacy, "_collect_window_samples"),
+    (tracking, "_extract_descriptors_for_tracks"),
+    (tracking, "scout_jerseys"),
+    (tracking, "trim_kit_component"),
+):
+    timed_stage(owner, name)
 original_enrich = tracking.JerseyVerifier.enrich
 
 
@@ -139,7 +217,7 @@ try:
         video_duration_sec=6559.339,
         window_sec=60,
         overlap_sec=5,
-        fps=1,
+        fps=3,
         max_windows=len(starts),
     )
     guarded = apply_team_color_guard(
@@ -147,15 +225,28 @@ try:
     )
     segments = guarded.get("segments", [])
     diagnostics = {
+        "held_out": held_out,
+        "release_validation": release_validation,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
         "runtime_call_limit": runtime_call_limit,
         "status": guarded.get("tracking_status"),
         "jersey": guarded.get("reid_summary", {}).get("jersey_vision"),
         "identity_search": guarded.get("reid_summary", {}).get("identity_search"),
+        "batch_search": guarded.get("reid_summary", {}).get("jersey_search_windows"),
+        "kit_guard": guarded.get("reid_summary", {}).get("team_color_guard"),
+        "observed_seconds": round(
+            sum(
+                len(s.get("bboxes", [])) / max(1, s.get("sample_fps", 1))
+                for s in segments
+            ),
+            3,
+        ),
         "windows": [
             {
                 "start": s["window_start"],
                 "status": s.get("identity_status"),
                 "observations": len(s.get("bboxes", [])),
+                "bboxes": s.get("bboxes", []),
                 "reasons": s.get("reid", {}).get("reason_codes"),
                 "search_mode": s.get("reid", {}).get("search_mode"),
                 "candidates": [
@@ -180,5 +271,9 @@ try:
         and s.get("reid", {}).get("identity_link") == "JERSEY_REACQUISITION"
         for s in segments
     ), "No independent reacquisition survived the kit and graph guards"
+    if held_out or release_validation:
+        assert not any(
+            s.get("bboxes") and s.get("window_start") in (180, 550) for s in segments
+        ), "Unrelated introductory footage retained as target player"
 finally:
     shutil.rmtree(probe_root, ignore_errors=True)

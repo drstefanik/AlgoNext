@@ -1,6 +1,6 @@
 """Bounded, unprompted jersey OCR. Numbers supplement CV; they never prove identity.
 
-Only isolated player crops leave the worker. The desired number, player name,
+Only isolated player crops and scoreboard strips leave the worker. The desired number, player name,
 team and video URL are deliberately absent from the model prompt. No API result
 can bypass continuity within a tracklet, kit checks, appearance checks, or the
 player-scoring benchmark gate. Two independent reads can help bridge a cut.
@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 
 import requests
 
-from app.reid.association import CandidateProfile
+from app.reid.association import CandidateProfile, independent_jersey_reads
 
 logger = logging.getLogger(__name__)
 VERSION = "jersey-vision-v1"
@@ -105,8 +105,8 @@ class JerseyReader:
             "yes",
         }
         self.enabled = self.enabled and bool(self.api_key)
-        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 128))
-        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 600)
+        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 256))
+        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 1800)
         self.timeout = bounded_env("JERSEY_OCR_TIMEOUT_SECONDS", 20, 1, 30)
         self.clock = clock
         self.transport = transport or requests.post
@@ -114,11 +114,23 @@ class JerseyReader:
         self.elapsed = 0.0
         self.tokens = 0
         self.cache: dict[str, dict[str, Any]] = {}
+        self.batch_calls = 0
+        self.images_read = 0
+        self.context_reads = 0
         self.reason = "READY" if self.enabled else "DISABLED_OR_KEY_MISSING"
 
-    def read(self, crop: JerseyCrop) -> dict[str, Any]:
+    def read(
+        self,
+        crop: JerseyCrop,
+        *,
+        prompt=PROMPT,
+        schema=SCHEMA,
+        parser=parse_reading,
+        cache_version=VERSION,
+        context=False,
+    ) -> dict[str, Any]:
         digest = hashlib.sha256(crop.jpeg).hexdigest()
-        identity = f"{VERSION}:{self.model}:{digest}"
+        identity = f"{cache_version}:{self.model}:{digest}"
         provenance = {"image_sha256": digest, "time_sec": round(crop.time_sec, 3)}
         if identity in self.cache:
             self.cache_hits += 1
@@ -142,7 +154,7 @@ class JerseyReader:
                 "model": self.model,
                 "store": False,
                 "messages": [
-                    {"role": "system", "content": PROMPT},
+                    {"role": "system", "content": prompt},
                     {
                         "role": "user",
                         "content": [
@@ -161,9 +173,9 @@ class JerseyReader:
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "jersey_reading",
+                        "name": "match_context" if context else "jersey_reading",
                         "strict": True,
-                        "schema": SCHEMA,
+                        "schema": schema,
                     },
                 },
             }
@@ -193,12 +205,17 @@ class JerseyReader:
                 "refusal"
             ):
                 raise ValueError("INCOMPLETE_OR_REFUSED")
-            result = parse_reading(json.loads(choice["message"]["content"]))
+            result = parser(json.loads(choice["message"]["content"]))
+            result["request_id"] = str(self.calls)
+            self.images_read += 1
             self.tokens += max(
                 0, int((envelope.get("usage") or {}).get("total_tokens") or 0)
             )
             result["status"] = "READ" if result["legible"] else "UNREADABLE"
-            self.legible += int(result["legible"])
+            if context:
+                self.context_reads += 1
+            else:
+                self.legible += int(result["legible"])
             self.cache[identity] = result
             return {**result, **provenance, "cache_hit": False}
         except Exception as exc:
@@ -215,6 +232,182 @@ class JerseyReader:
         finally:
             self.elapsed += max(0.0, self.clock() - started)
 
+    def read_many(self, crops: Sequence[JerseyCrop]) -> list[dict[str, Any]]:
+        """Read at most 48 isolated crops in one strictly indexed request.
+
+        This is a search pass. Repeated numbers in the same API response are
+        correlated evidence and cannot alone confirm a player's identity.
+        """
+        if len(crops) > 48:
+            raise ValueError("JERSEY_BATCH_TOO_LARGE")
+        if not crops:
+            return []
+        digests = [hashlib.sha256(c.jpeg).hexdigest() for c in crops]
+        keys = [f"{VERSION}:{self.model}:{d}" for d in digests]
+        pending = list(dict.fromkeys(k for k in keys if k not in self.cache))
+        remaining = self.max_seconds - self.elapsed
+        if (
+            pending
+            and self.enabled
+            and self.calls < self.max_calls
+            and remaining >= 1
+            and self.errors < 3
+        ):
+            indices = [keys.index(k) for k in pending]
+            ids = [str(i) for i in range(len(indices))]
+            item_schema = {
+                **SCHEMA,
+                "properties": {
+                    "crop_id": {"type": "string", "enum": ids},
+                    **SCHEMA["properties"],
+                },
+                "required": ["crop_id", *SCHEMA["required"]],
+            }
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"readings": {"type": "array", "items": item_schema}},
+                "required": ["readings"],
+            }
+            content = []
+            for crop_id, index in zip(ids, indices):
+                content.extend(
+                    [
+                        {"type": "text", "text": "crop_id=" + crop_id},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/jpeg;base64,"
+                                + base64.b64encode(crops[index].jpeg).decode("ascii"),
+                                "detail": "high",
+                            },
+                        },
+                    ]
+                )
+            self.calls += 1
+            self.batch_calls += 1
+            started = self.clock()
+            try:
+                body = {
+                    "model": self.model,
+                    "store": False,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": PROMPT
+                            + " Read EACH labelled crop independently. Return exactly one reading for every crop_id. Never copy or infer a digit from another crop.",
+                        },
+                        {"role": "user", "content": content},
+                    ],
+                    "max_completion_tokens": 500 + len(indices) * 180,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "jersey_batch",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                }
+                if self.model.startswith("gpt-5"):
+                    body["reasoning_effort"] = "low"
+                response = self.transport(
+                    self.base_url + "/chat/completions",
+                    headers={
+                        "Authorization": "Bearer " + self.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=(min(5, remaining / 2), min(30, remaining / 2)),
+                    allow_redirects=False,
+                )
+                try:
+                    if response.status_code != 200:
+                        if response.status_code in {400, 401, 403, 404}:
+                            self.enabled = False
+                            self.reason = "API_CONFIGURATION_ERROR"
+                        raise ValueError("API_HTTP_" + str(response.status_code))
+                    envelope = response.json()
+                finally:
+                    response.close()
+                choice = envelope["choices"][0]
+                if choice.get("finish_reason") != "stop" or choice["message"].get(
+                    "refusal"
+                ):
+                    raise ValueError("INCOMPLETE_OR_REFUSED")
+                payload = json.loads(choice["message"]["content"])
+                if not isinstance(payload, dict) or set(payload) != {"readings"}:
+                    raise ValueError("INVALID_BATCH_SCHEMA")
+                rows = payload["readings"]
+                if not isinstance(rows, list) or len(rows) != len(ids):
+                    raise ValueError("INVALID_BATCH_COUNT")
+                parsed = {}
+                for row in rows:
+                    if not isinstance(row, dict) or set(row) != {
+                        "crop_id",
+                        *SCHEMA["required"],
+                    }:
+                        raise ValueError("INVALID_BATCH_ROW")
+                    crop_id = row["crop_id"]
+                    if (
+                        not isinstance(crop_id, str)
+                        or crop_id not in ids
+                        or crop_id in parsed
+                    ):
+                        raise ValueError("INVALID_BATCH_ID")
+                    parsed[crop_id] = parse_reading(
+                        {k: v for k, v in row.items() if k != "crop_id"}
+                    )
+                # Commit cache entries only after validating the entire response.
+                for crop_id, key in zip(ids, pending):
+                    result = parsed[crop_id]
+                    result.update(
+                        status="READ" if result["legible"] else "UNREADABLE",
+                        request_id=str(self.calls),
+                    )
+                    self.cache[key] = result
+                    self.legible += int(result["legible"])
+                self.images_read += len(pending)
+                self.tokens += max(
+                    0, int((envelope.get("usage") or {}).get("total_tokens") or 0)
+                )
+            except Exception as exc:
+                self.errors += 1
+                logger.warning(
+                    "Jersey batch unavailable error_type=%s calls=%s",
+                    type(exc).__name__,
+                    self.calls,
+                )
+                for key in pending:
+                    self.cache[key] = {
+                        "number": None,
+                        "legible": False,
+                        "status": "API_ERROR",
+                    }
+            finally:
+                self.elapsed += max(0.0, self.clock() - started)
+        elif pending:
+            self.reason = (
+                "CIRCUIT_OPEN"
+                if self.errors >= 3
+                else "BUDGET_EXHAUSTED" if self.enabled else self.reason
+            )
+        results = []
+        for crop, digest, key in zip(crops, digests, keys):
+            cached = key in self.cache and key not in pending
+            self.cache_hits += int(cached)
+            results.append(
+                {
+                    **self.cache.get(
+                        key, {"number": None, "legible": False, "status": self.reason}
+                    ),
+                    "image_sha256": digest,
+                    "time_sec": round(crop.time_sec, 3),
+                    "cache_hit": cached,
+                }
+            )
+        return results
+
     def summary(self) -> dict[str, Any]:
         return {
             "version": VERSION,
@@ -223,6 +416,8 @@ class JerseyReader:
             "role": "SUPPLEMENTAL_IDENTITY_EVIDENCE",
             "status": self.reason,
             "calls": self.calls,
+            "batch_calls": self.batch_calls,
+            "images_read": self.images_read,
             "errors": self.errors,
             "cache_hits": self.cache_hits,
             "legible_readings": self.legible,
@@ -244,9 +439,7 @@ def evaluate_readings(
     matching = [
         r for r in usable if r["number"] == target and r.get("kit_compatible") is True
     ]
-    unique = {r["image_sha256"]: r for r in matching}
-    times = sorted(float(r["time_sec"]) for r in unique.values())
-    confirmed = len(times) >= 2 and times[-1] - times[0] >= 0.6
+    confirmed = independent_jersey_reads(matching)
     status = "CONFLICT" if conflicting else "MATCH" if confirmed else "UNVERIFIED"
     return {
         "status": status,
@@ -344,6 +537,10 @@ class JerseyVerifier:
         self.reader = JerseyReader()
         self.anchor_signature = None
         self.anchor_reading = None
+        self.match_context_guard = os.getenv(
+            "JERSEY_OCR_BATCH_SEARCH", "0"
+        ).lower() in {"1", "true", "yes"}
+        self.anchor_context = None
         if self.target is None or not self.reader.enabled:
             return
         import cv2
@@ -375,6 +572,14 @@ class JerseyVerifier:
                                 encoded.tobytes(), float(player_ref.get("t", 0)), 1.0
                             )
                         )
+                if self.match_context_guard and (self.anchor_reading or {}).get(
+                    "legible"
+                ):
+                    from app.reid.match_context import read_scoreboard_context
+
+                    self.anchor_context = read_scoreboard_context(
+                        self.reader, frame, float(player_ref.get("t", 0))
+                    )
         finally:
             capture.release()
 
@@ -386,6 +591,7 @@ class JerseyVerifier:
         *,
         rescope=None,
         max_calls: int | None = None,
+        hinted_only: bool = False,
     ):
         if (
             self.target is None
@@ -448,6 +654,15 @@ class JerseyVerifier:
                     enriched.append(candidate)
                     continue
                 metadata = dict(candidate.metadata or {})
+                if (
+                    hinted_only
+                    and not metadata.get("jersey_preferred_times")
+                    and not metadata.get("tracklet_scope", "").startswith(
+                        "MOTION_CONTINUOUS_STRONG"
+                    )
+                ):
+                    enriched.append(candidate)
+                    continue
                 # OCR may inspect a raw ID, but only a subsequently verified
                 # motion-continuous component can become a reacquisition candidate.
                 detections = metadata.get("tracklet_detections") or ()
@@ -495,7 +710,10 @@ class JerseyVerifier:
                     )
                     # A clearly conflicting number already rejects this raw
                     # candidate; reserve further calls for independent tracks.
-                    if evaluate_readings(readings, self.target)["status"] == "CONFLICT":
+                    if evaluate_readings(readings, self.target)["status"] in {
+                        "CONFLICT",
+                        "MATCH",
+                    }:
                         break
                 # A readable back often lasts only a few seconds. Once a digit
                 # is clear, seek independent confirmation nearby rather than
@@ -532,6 +750,26 @@ class JerseyVerifier:
                 evidence["anchor_legible"] = (self.anchor_reading or {}).get(
                     "legible"
                 ) is True
+                if evidence["status"] == "MATCH" and getattr(
+                    self, "match_context_guard", False
+                ):
+                    from app.reid.match_context import confirm_match_context
+
+                    evidence["match_context"] = confirm_match_context(
+                        self.reader,
+                        path,
+                        window_start,
+                        self.anchor_context,
+                        [
+                            r["time_sec"]
+                            for r in readings
+                            if r.get("legible") is True
+                            and r.get("number") == self.target
+                        ],
+                        call_limit=call_limit,
+                    )
+                    if evidence["match_context"]["matched"] is not True:
+                        evidence["status"] = "CONTEXT_UNVERIFIED"
                 enriched_candidate = replace(candidate, metadata=metadata)
                 if (
                     rescope is not None
@@ -553,6 +791,8 @@ class JerseyVerifier:
             **self.reader.summary(),
             "target_number": self.target,
             "anchor_reading": self.anchor_reading,
+            "anchor_match_context": getattr(self, "anchor_context", None),
+            "match_context_reads": getattr(self.reader, "context_reads", 0),
         }
 
     def can_reacquire(self) -> bool:
@@ -563,6 +803,10 @@ class JerseyVerifier:
             and anchor.get("number") == self.target
             and anchor.get("legible") is True
             and self.anchor_signature is not None
+            and (
+                not getattr(self, "match_context_guard", False)
+                or (getattr(self, "anchor_context", None) or {}).get("legible") is True
+            )
             and self.reader.enabled
             and self.reader.errors < 3
             and self.reader.max_calls - self.reader.calls >= 2

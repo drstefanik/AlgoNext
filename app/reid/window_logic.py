@@ -337,6 +337,57 @@ def _verified_jersey_anchor_link(
 
     reid = segment.get("reid") or {}
     anchor_reid = anchor.get("reid") or {}
+    components = reid.get("jersey_components")
+    if components is not None:
+        # A window may contain several independently proved fragments. Keep
+        # their evidence separate and require exact ownership of every box.
+        if (
+            reid.get("tracklet_scope") != "INDEPENDENT_JERSEY_TRACKLETS"
+            or not isinstance(components, list)
+            or not 2 <= len(components) <= 48
+        ):
+            return False
+        owned = []
+        ranges = []
+        ids = set()
+        for component in components:
+            if (
+                not isinstance(component, Mapping)
+                or not isinstance(component.get("candidate_id"), str)
+                or component.get("candidate_id") in ids
+            ):
+                return False
+            ids.add(component.get("candidate_id"))
+            boxes = component.get("bboxes")
+            if not isinstance(boxes, list) or len(boxes) < 3:
+                return False
+            if any(
+                not isinstance(box, Mapping)
+                or type(box.get("t")) not in (int, float)
+                or not math.isfinite(box["t"])
+                for box in boxes
+            ):
+                return False
+            child_reid = {
+                **reid,
+                "tracklet_scope": component.get("tracklet_scope"),
+                "selected_candidate_id": component.get("candidate_id"),
+            }
+            child_reid.pop("jersey_components", None)
+            if not _verified_jersey_anchor_link(
+                {**segment, "bboxes": boxes, "reid": child_reid}, anchor
+            ):
+                return False
+            owned.extend(boxes)
+            ranges.append(
+                (min(float(b["t"]) for b in boxes), max(float(b["t"]) for b in boxes))
+            )
+        ranges.sort()
+        if any(ranges[i][0] - ranges[i - 1][1] <= 0.05 for i in range(1, len(ranges))):
+            return False
+        return sorted(owned, key=lambda b: float(b["t"])) == sorted(
+            segment.get("bboxes") or [], key=lambda b: float(b["t"])
+        )
     if (
         str(anchor.get("direction") or "").lower() != "anchor"
         or not segment.get("identity_id")
@@ -357,6 +408,11 @@ def _verified_jersey_anchor_link(
     )
     evidence = selected.get("jersey_evidence") or {}
     reading = anchor_reid.get("jersey_anchor_reading") or {}
+    anchor_context = anchor_reid.get("jersey_anchor_match_context")
+    context = evidence.get("match_context") if isinstance(evidence, Mapping) else None
+    if anchor_context is not None or context is not None:
+        if not isinstance(context, Mapping) or context.get("anchor") != anchor_context:
+            return False
     if (
         not isinstance(evidence, Mapping)
         or not isinstance(reading, Mapping)
@@ -513,6 +569,12 @@ def _explicit_retained_autonomous_chain_indices(
                 and _verified_jersey_anchor_link(current, segments[parent_index])
             ):
                 reachable.add(segment_index)
+                break
+            if (current.get("reid") or {}).get(
+                "identity_link"
+            ) == "JERSEY_REACQUISITION":
+                # An invalid explicit jersey proof cannot silently fall back
+                # to an adjacent-window physical-continuity claim.
                 break
             if parent_window_index != expected_parent:
                 break

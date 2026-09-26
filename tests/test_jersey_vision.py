@@ -29,6 +29,387 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_context_preserves_order_and_rejects_uncertainty_or_score_digits(self):
+        from app.reid.match_context import parse_context, same_match_context
+
+        anchor = parse_context(
+            {"legible": True, "left_team": " BOL ", "right_team": "FIO"}
+        )
+        self.assertTrue(same_match_context(anchor, dict(anchor)))
+        for other in [
+            {**anchor, "left_team": "FIO", "right_team": "BOL"},
+            {**anchor, "legible": False},
+            {**anchor, "right_team": "ROM"},
+            None,
+        ]:
+            self.assertFalse(same_match_context(anchor, other))
+        for left, right in [("0", "0"), ("11", "20"), ("BOL", None), ("BOL", "BOL")]:
+            self.assertFalse(
+                parse_context(
+                    {"legible": True, "left_team": left, "right_team": right}
+                )["legible"]
+            )
+        with self.assertRaises(ValueError):
+            parse_context({"legible": True, "left_team": 8, "right_team": "FIO"})
+
+    def test_context_cannot_reuse_jersey_cache_or_exceed_shared_budget(self):
+        from app.reid.match_context import PROMPT, SCHEMA, VERSION, parse_context
+
+        response = Mock(
+            status_code=200,
+            json=lambda: {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "legible": True,
+                                    "left_team": "BOL",
+                                    "right_team": "FIO",
+                                }
+                            )
+                        },
+                    }
+                ],
+                "usage": {"total_tokens": 30},
+            },
+        )
+        transport = Mock(side_effect=[response, self.response()])
+        with patch.dict(
+            "os.environ",
+            {
+                "JERSEY_OCR_ENABLED": "1",
+                "OPENAI_API_KEY": "test",
+                "JERSEY_OCR_MAX_CALLS": "2",
+            },
+        ):
+            reader = JerseyReader(transport=transport)
+            crop = JerseyCrop(b"same-image", 1, 1)
+            kwargs = dict(
+                prompt=PROMPT,
+                schema=SCHEMA,
+                parser=parse_context,
+                cache_version=VERSION,
+                context=True,
+            )
+            context = reader.read(crop, **kwargs)
+            jersey = reader.read(crop)
+            self.assertEqual(context["left_team"], "BOL")
+            self.assertEqual(jersey["number"], 8)
+            self.assertEqual(reader.context_reads, 1)
+            self.assertEqual(reader.legible, 1)
+            self.assertEqual(
+                reader.read(JerseyCrop(b"another", 2, 1), **kwargs)["status"],
+                "BUDGET_EXHAUSTED",
+            )
+            self.assertEqual(transport.call_count, 2)
+
+    def test_context_proof_must_match_the_jersey_observation_times(self):
+        from app.reid.association import _verified_jersey_reacquisition
+
+        anchor = {"legible": True, "left_team": "BOL", "right_team": "FIO"}
+        context = {
+            "required": True,
+            "matched": True,
+            "anchor": anchor,
+            "readings": [{**anchor, "time_sec": t} for t in (1, 2)],
+        }
+        candidate = self.jersey_candidate(evidence_changes={"match_context": context})
+        self.assertTrue(_verified_jersey_reacquisition(candidate))
+        for changes in [
+            {"matched": False},
+            {"readings": [{**anchor, "time_sec": 50}, {**anchor, "time_sec": 51}]},
+            {"readings": [{**anchor, "time_sec": 1}]},
+            {
+                "readings": [
+                    {**anchor, "time_sec": 1},
+                    {**anchor, "time_sec": 2, "left_team": "FIO", "right_team": "BOL"},
+                ]
+            },
+        ]:
+            invalid = self.jersey_candidate(
+                evidence_changes={"match_context": {**context, **changes}}
+            )
+            self.assertFalse(_verified_jersey_reacquisition(invalid))
+
+    def test_context_conflict_vetoes_even_strong_overlap(self):
+        from dataclasses import replace
+
+        candidate = self.jersey_candidate(
+            evidence_changes={"status": "CONTEXT_UNVERIFIED"}
+        )
+        candidate = replace(
+            candidate,
+            overlap_score=0.99,
+            metadata={
+                **candidate.metadata,
+                "strong_overlap_unique": True,
+                "tracklet_scope": "MOTION_CONTINUOUS_STRONG_OVERLAP",
+                "overlap_link_samples": 3,
+                "overlap_previous_samples": 3,
+                "tracklet_sample_indices": [1, 2, 3],
+            },
+        )
+        result = associate_identity(
+            IdentityProfile("target", candidate.descriptor),
+            [candidate],
+            thresholds=AssociationThresholds(require_strong_overlap=True),
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn("MATCH_CONTEXT_UNVERIFIED", result.reason_codes)
+
+    def test_composite_jersey_link_requires_individual_proof_and_exact_box_ownership(
+        self,
+    ):
+        from app.reid.window_logic import (
+            _verified_jersey_anchor_link,
+            retained_autonomous_chain_indices,
+        )
+
+        evidence = copy.deepcopy(self.jersey_candidate().metadata["jersey_evidence"])
+        anchor = {
+            "direction": "anchor",
+            "identity_id": "player",
+            "reid": {"jersey_anchor_reading": {"number": 8, "legible": True}},
+        }
+        components, candidates = [], []
+        for index, start in enumerate((10.0, 20.0)):
+            current = copy.deepcopy(evidence)
+            for n, reading in enumerate(current["readings"]):
+                reading["time_sec"] = start + n
+            boxes = [
+                {"t": start + n, "x": 0.2, "y": 0.3, "w": 0.04, "h": 0.15}
+                for n in range(3)
+            ]
+            components.append(
+                {
+                    "candidate_id": str(index),
+                    "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                    "bboxes": boxes,
+                }
+            )
+            candidates.append({"candidate_id": str(index), "jersey_evidence": current})
+        segment = {
+            "identity_id": "player",
+            "bboxes": [b for c in components for b in c["bboxes"]],
+            "reid": {
+                "tracklet_scope": "INDEPENDENT_JERSEY_TRACKLETS",
+                "identity_link": "JERSEY_REACQUISITION",
+                "reason_codes": ["JERSEY_AIDED_REACQUISITION_EXPERIMENTAL"],
+                "jersey_components": components,
+                "candidates": candidates,
+            },
+        }
+        self.assertTrue(_verified_jersey_anchor_link(segment, anchor))
+        context_anchor = {"legible": True, "left_team": "BOL", "right_team": "FIO"}
+        bound_anchor = {
+            **anchor,
+            "reid": {**anchor["reid"], "jersey_anchor_match_context": context_anchor},
+        }
+        self.assertFalse(_verified_jersey_anchor_link(segment, bound_anchor))
+        contextual = copy.deepcopy(segment)
+        for c in contextual["reid"]["candidates"]:
+            c["jersey_evidence"]["match_context"] = {
+                "required": True,
+                "matched": True,
+                "anchor": context_anchor,
+                "readings": [
+                    {**context_anchor, "time_sec": r["time_sec"]}
+                    for r in c["jersey_evidence"]["readings"]
+                ],
+            }
+        self.assertTrue(_verified_jersey_anchor_link(contextual, bound_anchor))
+        self.assertFalse(_verified_jersey_anchor_link(contextual, anchor))
+        extra = copy.deepcopy(segment)
+        extra["bboxes"].append({"t": 25.0, "x": 0.9})
+        self.assertFalse(_verified_jersey_anchor_link(extra, anchor))
+        graph_anchor = {
+            **anchor,
+            "window_index": 0,
+            "identity_status": "ACCEPTED",
+            "bboxes": [{"t": 1.0}],
+        }
+        graph_extra = {
+            **extra,
+            "window_index": 1,
+            "parent_window_index": 0,
+            "direction": "forward",
+            "identity_status": "ACCEPTED",
+        }
+        self.assertEqual(
+            retained_autonomous_chain_indices([graph_anchor, graph_extra]), set()
+        )
+        wrong = copy.deepcopy(segment)
+        wrong["reid"]["candidates"][1]["jersey_evidence"]["readings"][0]["number"] = 9
+        self.assertFalse(_verified_jersey_anchor_link(wrong, anchor))
+        duplicate = copy.deepcopy(segment)
+        duplicate["reid"]["jersey_components"][1]["candidate_id"] = "0"
+        self.assertFalse(_verified_jersey_anchor_link(duplicate, anchor))
+        malformed = copy.deepcopy(segment)
+        malformed["reid"]["jersey_components"][1]["bboxes"].append(None)
+        self.assertFalse(_verified_jersey_anchor_link(malformed, anchor))
+        self.assertFalse(
+            _verified_jersey_anchor_link(
+                segment, {**anchor, "identity_id": "someone_else"}
+            )
+        )
+
+    def test_camera_relative_continuity_rejects_spatial_switch_and_crowding(self):
+        from app.reid.tracklet_motion import camera_relative_continuity
+
+        first = {
+            "t": 1.0,
+            "bbox": {"x": 0.1, "y": 0.3, "w": 0.03, "h": 0.1},
+            "_motion_context": {"group": 0, "x": 0.0, "y": 0.0, "crowded": False},
+        }
+        panning = {
+            "t": 1.2,
+            "bbox": {**first["bbox"], "x": 0.2},
+            "_motion_context": {"group": 0, "x": 0.1, "y": 0.0, "crowded": False},
+        }
+        self.assertTrue(camera_relative_continuity(first, panning))
+        switched = {**panning, "bbox": {**panning["bbox"], "x": 0.28}}
+        self.assertFalse(camera_relative_continuity(first, switched))
+        crowded = {
+            **panning,
+            "_motion_context": {**panning["_motion_context"], "crowded": True},
+        }
+        self.assertFalse(camera_relative_continuity(first, crowded))
+        unsupported = {
+            **panning,
+            "_motion_context": {**panning["_motion_context"], "group": 1},
+        }
+        self.assertFalse(camera_relative_continuity(first, unsupported))
+
+    def test_kit_component_stops_at_unknown_or_opponent_without_rejoining(self):
+        from app.reid.jersey_search import trim_kit_component
+        from unittest.mock import MagicMock
+
+        detections = [{"t": i, "bbox": {}} for i in range(6)]
+        for boundary in (False, None):
+            cap = MagicMock()
+            cap.set.side_effect = lambda _, time: setattr(cap, "time", int(time / 1000))
+            cap.read.side_effect = lambda: (True, cap.time)
+            with patch(
+                "app.reid.jersey_search.cv2.VideoCapture", return_value=cap
+            ), patch(
+                "app.reid.jersey_search.crop_from_normalized_bbox",
+                side_effect=lambda frame, _: frame,
+            ), patch(
+                "app.reid.jersey_search.extract_kit_color_signature",
+                side_effect=lambda frame: {"time": frame},
+            ), patch(
+                "app.reid.jersey_search.signatures_compatible",
+                side_effect=lambda _, sig: boundary if sig["time"] == 3 else True,
+            ):
+                result = trim_kit_component("clip", detections, [1, 2], "anchor")
+                self.assertEqual([r["t"] for r in result], [0, 1, 2])
+                self.assertEqual(
+                    trim_kit_component("clip", detections, [2, 4], "anchor"), []
+                )
+            cap.release.assert_called()
+
+    def batch_response(self, rows):
+        return Mock(
+            status_code=200,
+            json=lambda: {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps({"readings": rows})},
+                    }
+                ],
+                "usage": {"total_tokens": 50},
+            },
+        )
+
+    def test_batch_ids_cache_and_independent_confirmation(self):
+        rows = [
+            dict(
+                crop_id=str(i), number=8, legible=True, single_player=True, view="back"
+            )
+            for i in (1, 0)
+        ]
+        transport = Mock(side_effect=[self.batch_response(rows), self.response()])
+        with patch.dict(
+            "os.environ", {"JERSEY_OCR_ENABLED": "1", "OPENAI_API_KEY": "test"}
+        ):
+            reader = JerseyReader(transport=transport)
+        crops = [JerseyCrop(b"one", 1, 0.9, True), JerseyCrop(b"two", 2, 0.9, True)]
+        results = [{**r, "kit_compatible": True} for r in reader.read_many(crops)]
+        self.assertEqual([r["time_sec"] for r in results], [1, 2])
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(evaluate_readings(results, 8)["status"], "UNVERIFIED")
+        cached = reader.read(crops[0])
+        self.assertTrue(cached["cache_hit"])
+        self.assertEqual(reader.calls, 1)
+        results.append(
+            {**reader.read(JerseyCrop(b"three", 3, 0.9, True)), "kit_compatible": True}
+        )
+        self.assertEqual(evaluate_readings(results, 8)["status"], "MATCH")
+        self.assertEqual(reader.calls, 2)
+        body = transport.call_args_list[0].kwargs["json"]
+        self.assertNotIn("target", json.dumps(body))
+        self.assertFalse(body["store"])
+
+    def test_duplicate_or_unknown_batch_ids_fail_closed_atomically(self):
+        row = dict(crop_id="0", number=8, legible=True, single_player=True, view="back")
+        for rows in [[row, row], [row, {**row, "crop_id": "99"}], [row]]:
+            with self.subTest(rows=rows), patch.dict(
+                "os.environ", {"JERSEY_OCR_ENABLED": "1", "OPENAI_API_KEY": "test"}
+            ):
+                reader = JerseyReader(
+                    transport=Mock(return_value=self.batch_response(rows))
+                )
+                result = reader.read_many(
+                    [JerseyCrop(b"one", 1, 0.9), JerseyCrop(b"two", 2, 0.9)]
+                )
+                self.assertTrue(
+                    all(
+                        r["status"] == "API_ERROR" and r["number"] is None
+                        for r in result
+                    )
+                )
+                self.assertEqual(reader.errors, 1)
+
+    def test_same_batch_cannot_bypass_identity_gate(self):
+        candidate = self.jersey_candidate()
+        evidence = copy.deepcopy(candidate.metadata["jersey_evidence"])
+        for reading in evidence["readings"]:
+            reading["request_id"] = "one-batch"
+        decision = associate_identity(
+            IdentityProfile("player", candidate.descriptor),
+            [self.jersey_candidate(evidence_changes=evidence)],
+            thresholds=AssociationThresholds(require_strong_overlap=True),
+        )
+        self.assertFalse(decision.accepted)
+
+    def test_batch_honors_shared_budget_and_deduplicates_images(self):
+        rows = [
+            dict(crop_id="0", number=8, legible=True, single_player=True, view="back")
+        ]
+        transport = Mock(return_value=self.batch_response(rows))
+        with patch.dict(
+            "os.environ",
+            {
+                "JERSEY_OCR_ENABLED": "1",
+                "OPENAI_API_KEY": "test",
+                "JERSEY_OCR_MAX_CALLS": "1",
+            },
+        ):
+            reader = JerseyReader(transport=transport)
+        result = reader.read_many(
+            [JerseyCrop(b"one", 1, 0.9), JerseyCrop(b"one", 2, 0.9)]
+        )
+        self.assertEqual(result[0]["image_sha256"], result[1]["image_sha256"])
+        self.assertEqual(reader.images_read, 1)
+        self.assertEqual(
+            reader.read_many([JerseyCrop(b"two", 3, 0.9)])[0]["status"],
+            "BUDGET_EXHAUSTED",
+        )
+        self.assertEqual(transport.call_count, 1)
+
     def test_dense_sampling_retains_readable_location_without_transferring_identity(
         self,
     ):
@@ -291,6 +672,46 @@ class JerseyVisionTests(unittest.TestCase):
             thresholds=AssociationThresholds(require_strong_overlap=True),
         )
         self.assertFalse(decision.accepted)
+
+    def test_independently_confirmed_disjoint_tracklets_are_not_concurrent_rivals(self):
+        from dataclasses import replace
+
+        first = self.jersey_candidate()
+        first = replace(
+            first,
+            metadata={
+                **first.metadata,
+                "tracklet_detections": [{"t": t} for t in (1.0, 2.0, 3.0)],
+            },
+        )
+        second = replace(
+            first,
+            candidate_id="later_fragment",
+            metadata={
+                **first.metadata,
+                "tracklet_detections": [{"t": t} for t in (5.0, 6.0, 7.0)],
+            },
+        )
+        identity = IdentityProfile("player", first.descriptor)
+        thresholds = AssociationThresholds(require_strong_overlap=True)
+        self.assertTrue(
+            associate_identity(
+                identity, [first, second], thresholds=thresholds
+            ).accepted
+        )
+        for times in [(2.0, 3.0, 4.0), (3.01, 4.0, 5.0), (float("nan"), 4.0, 5.0)]:
+            overlapping = replace(
+                second,
+                metadata={
+                    **second.metadata,
+                    "tracklet_detections": [{"t": t} for t in times],
+                },
+            )
+            self.assertFalse(
+                associate_identity(
+                    identity, [first, overlapping], thresholds=thresholds
+                ).accepted
+            )
 
     def response(self, number=8, **changes):
         reading = dict(number=number, legible=True, single_player=True, view="back")

@@ -610,7 +610,7 @@ def build_tracking_evaluation(
             "status": "available",
             "available": True,
             "validated": True,
-            "method": "bytetrack",
+            "method": tracking_source.get("tracker") or "bytetrack",
         },
         "cross_shot_player_reidentification": {
             "status": (

@@ -905,6 +905,19 @@ class ReIDRuntimeTests(unittest.TestCase):
         self.assertEqual(profile.target_samples, 12000)
         self.assertEqual(profile.estimated_samples, 12943)
 
+    def test_batch_jersey_profile_keeps_three_fps_for_the_full_upload(self):
+        environment = {
+            "FULL_MATCH_TARGET_SAMPLES": "24000",
+            "FULL_MATCH_MIN_FPS": "1",
+            "FULL_MATCH_MAX_FPS": "3",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            profile = select_full_match_profile(
+                video_duration_sec=6559.339, requested_fps=5
+            )
+        self.assertEqual(profile.fps, 3)
+        self.assertLess(profile.estimated_samples, 24000)
+
     def test_long_match_explicit_quality_budget_overrides_remain_stable(self):
         environment = {
             "FULL_MATCH_TARGET_SAMPLES": "6000",

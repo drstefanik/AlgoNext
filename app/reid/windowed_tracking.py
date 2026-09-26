@@ -15,6 +15,8 @@ from ultralytics import YOLO
 from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.core.workspace import InsufficientWorkspaceError, require_free_space
 from app.reid.jersey_vision import JerseyVerifier
+from app.reid.jersey_search import scout_jerseys, trim_kit_component
+from app.reid.tracklet_motion import annotate_motion_context, camera_relative_continuity
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
     configured_descriptor_version,
@@ -357,6 +359,9 @@ def _motion_continuous(
     area_similarity, aspect_similarity = _shape_ratios(previous_bbox, current_bbox)
     if area_similarity < 0.25 or aspect_similarity < 0.40:
         return False
+    camera_continuity = camera_relative_continuity(previous, current)
+    if camera_continuity is not None:
+        return camera_continuity
     return (
         bbox_iou(previous_bbox, current_bbox) >= 0.02
         or center_distance(previous_bbox, current_bbox) <= maximum_center_distance
@@ -1014,7 +1019,11 @@ def _build_candidate_profiles(
         overlap = overlap_by_track.get(int(raw_track_id))
         candidate_boundary = _boundary_detection(detections, direction)
         geometry = None
-        if previous_boundary is not None and candidate_boundary is not None:
+        if (
+            overlap is not None
+            and previous_boundary is not None
+            and candidate_boundary is not None
+        ):
             bbox = candidate_boundary.get("bbox")
             if isinstance(bbox, Mapping):
                 geometry = geometry_similarity(previous_boundary, bbox)
@@ -1097,7 +1106,11 @@ def _build_candidate_profiles(
         overlap = overlap_by_track.get(track_id)
         candidate_boundary = _boundary_detection(raw_detections, direction)
         geometry = None
-        if previous_boundary is not None and candidate_boundary is not None:
+        if (
+            overlap is not None
+            and previous_boundary is not None
+            and candidate_boundary is not None
+        ):
             bbox = candidate_boundary.get("bbox")
             if isinstance(bbox, Mapping):
                 geometry = geometry_similarity(previous_boundary, bbox)
@@ -1142,6 +1155,29 @@ def _build_candidate_profiles(
             scoped_track_map[track_id] = raw_detections
             scope_by_track[track_id] = "FULL_WINDOW"
             effective_overlap_by_track[track_id] = overlap
+            preferred = (
+                JerseyVerifier.preferred_sampling_times(raw_detections, sampling_hints)
+                if sampling_hints
+                else []
+            )
+            if preferred:
+                # A raw ID can be reused after an occlusion. A readable hint
+                # only identifies where to search, not its distant occurrences.
+                components = []
+                for t in preferred:
+                    seed = min(raw_detections, key=lambda d: abs(float(d["t"]) - t))
+                    component = {
+                        _detection_key(d): d
+                        for direction_hint in ("forward", "backward")
+                        for d in _tracklet_detections_from_overlap(
+                            raw_detections, [seed], direction=direction_hint, fps=fps
+                        )
+                    }
+                    components.append(
+                        sorted(component.values(), key=lambda d: float(d["t"]))
+                    )
+                scoped_track_map[track_id] = max(components, key=len)
+                scope_by_track[track_id] = "JERSEY_SEARCH_COMPONENT"
     descriptor_by_track = _extract_descriptors_for_tracks(
         segment_path, scoped_track_map, selected_ids
     )
@@ -1196,7 +1232,9 @@ def _build_candidate_profiles(
     return profiles, id_lookup, descriptor_lookup
 
 
-def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
+def _scope_jersey_candidate(
+    segment_path, candidate, window_start, *, fps=1, anchor_signature=None
+):
     """Keep only the component containing two independent matching shirt reads."""
     from dataclasses import replace
 
@@ -1231,6 +1269,13 @@ def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
         _detection_key(item): item for part in components for item in part
     }
     component = sorted(component_by_key.values(), key=lambda item: float(item["t"]))
+    if anchor_signature is not None:
+        component = trim_kit_component(
+            segment_path,
+            component,
+            [float(reading["time_sec"]) - window_start for reading in matches],
+            anchor_signature,
+        )
     component_times = [float(item["t"]) for item in component]
     if len(component) < 3 or any(
         not any(
@@ -1591,6 +1636,11 @@ def track_player_windowed_reid(
         jersey_target_number, input_video_path, player_ref_norm
     )
     thresholds = _association_thresholds()
+    batch_search = _env_bool("JERSEY_OCR_BATCH_SEARCH", False)
+    search_diagnostics = []
+    scout_cache = {}
+    if batch_search:
+        tracker = "botsort.yaml"
     anchor_tracklet_radius = _env_float(
         "PLAYER_REID_MANUAL_ANCHOR_RADIUS_SEC",
         max(2.0, min(10.0, float(overlap_sec))),
@@ -1661,10 +1711,15 @@ def track_player_windowed_reid(
         sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
         selected_tracker = tracker
-        if is_anchor_window and anchor_detector_model != detector_model:
+        if is_anchor_window and (
+            anchor_detector_model != detector_model or batch_search
+        ):
             if anchor_model is None:
                 anchor_model = YOLO(anchor_detector_model)
             selected_model = anchor_model
+            # persist=True requires an isolated model for the manual tracker.
+            if batch_search:
+                selected_tracker = original_kwargs["tracker"]
         elif minimum_fps > fps and not is_anchor_window:
             # A fresh tracker is required: Ultralytics keeps the existing
             # tracker instance when persist=True. Compensate camera pans in
@@ -1686,6 +1741,8 @@ def track_player_windowed_reid(
             )
         finally:
             _reset_tracker(selected_model)
+        if batch_search and not is_anchor_window:
+            annotate_motion_context(samples, track_map)
         collected = (segment_path, samples, track_map, sample_fps)
         window_cache[index] = collected
         return collected
@@ -2211,6 +2268,11 @@ def track_player_windowed_reid(
                         if root_index == primary_anchor.get("window_index")
                         else None
                     ),
+                    "jersey_anchor_match_context": (
+                        jersey_verifier.summary().get("anchor_match_context")
+                        if root_index == primary_anchor.get("window_index")
+                        else None
+                    ),
                     "candidates": [],
                 },
             }
@@ -2558,6 +2620,16 @@ def track_player_windowed_reid(
                 continue
 
             dense_hints = []
+            scout_hints = []
+            if batch_search and jersey_verifier.can_reacquire():
+                scout_key = (index, sample_fps)
+                if scout_key not in scout_cache:
+                    scout_cache[scout_key] = scout_jerseys(
+                        jersey_verifier, segment_path, track_map, window_start
+                    )
+                scout_hints, scout_summary = scout_cache[scout_key]
+                search_diagnostics.append({"window_index": index, **scout_summary})
+                dense_hints = scout_hints
             for density_pass in range(2):
                 candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
                     segment_path,
@@ -2573,14 +2645,42 @@ def track_player_windowed_reid(
                     candidates = jersey_verifier.prioritize_dense_candidates(
                         candidates, dense_hints
                     )
+                # One batch explores the whole window. Spend individual reads
+                # on actual matching hints or physical continuity candidates.
+                if batch_search and not scout_hints and not state["link_bboxes"]:
+                    read_budget = 0
+                else:
+                    read_budget = 8 if jersey_search else None
+                if batch_search:
+                    remaining_windows = (
+                        len(windows)
+                        - len(manual_roots)
+                        - len({d["window_index"] for d in search_diagnostics})
+                    )
+                    read_budget = min(
+                        6,
+                        max(
+                            0,
+                            jersey_verifier.reader.max_calls
+                            - jersey_verifier.reader.calls
+                            - remaining_windows,
+                        ),
+                    )
                 candidates = jersey_verifier.enrich(
                     segment_path,
                     candidates,
                     window_start,
                     rescope=lambda path, candidate, start: _scope_jersey_candidate(
-                        path, candidate, start, fps=sample_fps
+                        path,
+                        candidate,
+                        start,
+                        fps=sample_fps,
+                        anchor_signature=(
+                            jersey_verifier.anchor_signature if batch_search else None
+                        ),
                     ),
-                    max_calls=8 if jersey_search else None,
+                    max_calls=read_budget,
+                    hinted_only=batch_search,
                 )
                 descriptor_lookup.update(
                     {
@@ -2601,7 +2701,8 @@ def track_player_windowed_reid(
                     decision.accepted
                     or density_pass
                     or sample_fps >= 3
-                    or dense_windows_used >= 4
+                    or dense_windows_used
+                    >= _env_int("JERSEY_DENSE_MAX_WINDOWS", 4, 0, 48)
                     or not jersey_verifier.should_retry_densely(candidates)
                 ):
                     break
@@ -2694,6 +2795,45 @@ def track_player_windowed_reid(
                 # display smoothing lags camera/player motion and must not move
                 # the identity crop off the player before the final kit guard.
                 bboxes = [dict(box) for box in next_link_bboxes]
+            jersey_components = []
+            if (
+                batch_search
+                and decision.accepted
+                and _verified_jersey_reacquisition(selected_profile)
+            ):
+                for profile in candidates:
+                    if not _verified_jersey_reacquisition(profile):
+                        continue
+                    # The joint decision has already rejected concurrent
+                    # matches. Each retained fragment must also pass the
+                    # appearance/quality gates independently.
+                    if not associate_identity(
+                        base_profile,
+                        [profile],
+                        thresholds=replace(thresholds, require_strong_overlap=True),
+                    ).accepted:
+                        continue
+                    metadata = profile.metadata or {}
+                    component_boxes = _absolute_link_bboxes(
+                        metadata["tracklet_detections"], window_start=window_start
+                    )
+                    jersey_components.append(
+                        {
+                            "candidate_id": profile.candidate_id,
+                            "tracklet_scope": "MOTION_CONTINUOUS_JERSEY",
+                            "bboxes": component_boxes,
+                        }
+                    )
+                if len(jersey_components) > 1:
+                    bboxes = sorted(
+                        [
+                            dict(box)
+                            for component in jersey_components
+                            for box in component["bboxes"]
+                        ],
+                        key=lambda box: box["t"],
+                    )
+                    next_link_bboxes = [dict(box) for box in bboxes]
             if (
                 decision.accepted
                 and selected_track_id is not None
@@ -2732,11 +2872,23 @@ def track_player_windowed_reid(
                     "tracklet_detection_count": len(tracklet_sample_indices),
                 }
             )
+            if len(jersey_components) > 1:
+                reid_payload["tracklet_scope"] = "INDEPENDENT_JERSEY_TRACKLETS"
+                reid_payload["jersey_components"] = jersey_components
             if jersey_search:
                 reid_payload["search_mode"] = "GLOBAL_JERSEY_SEARCH"
                 if identity_status == "ACCEPTED":
                     reid_payload["identity_link"] = "JERSEY_REACQUISITION"
                     reid_payload["reason_codes"].append("JERSEY_GLOBAL_REACQUISITION")
+            if (
+                batch_search
+                and identity_status == "ACCEPTED"
+                and _verified_jersey_reacquisition(selected_profile)
+            ):
+                # This fragment has its own evidence. A later rejection of an
+                # unrelated neighbour must not erase its independent anchor link.
+                parent_window_index = int(jersey_anchor_index)
+                reid_payload["identity_link"] = "JERSEY_REACQUISITION"
             candidate_segment = {
                 "window_index": int(index),
                 "parent_window_index": int(parent_window_index),
@@ -3035,11 +3187,14 @@ def track_player_windowed_reid(
             if configured_descriptor_version() != DESCRIPTOR_VERSION
             else "appearance_reid_v1"
         ),
-        "method": (
-            "yolo+bytetrack+osnet_reid"
+        "method": "yolo+"
+        + ("botsort" if batch_search else "bytetrack")
+        + (
+            "+osnet_reid"
             if configured_descriptor_version() != DESCRIPTOR_VERSION
-            else "yolo+bytetrack+appearance_reid"
+            else "+appearance_reid"
         ),
+        "tracker": "botsort" if batch_search else "bytetrack",
         "fps": fps,
         "window_sec": window_sec,
         "overlap_sec": overlap_sec,
@@ -3105,6 +3260,7 @@ def track_player_windowed_reid(
         "reid_summary": {
             "status": "EXPERIMENTAL",
             "jersey_vision": jersey_verifier.summary(),
+            "jersey_search_windows": search_diagnostics,
             "identity_search": {
                 "global_windows_attempted": searched_windows,
                 "windows_with_association_attempt": len(association_proposals),
