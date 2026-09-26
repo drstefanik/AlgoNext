@@ -397,7 +397,8 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
     evidence = metadata.get("jersey_evidence") or {}
     if (
         not isinstance(evidence, Mapping)
-        or int(evidence.get("component_match_samples") or 0) < 2
+        or type(evidence.get("component_match_samples")) is not int
+        or evidence["component_match_samples"] < 2
     ):
         return False
     target = evidence.get("target_number")
@@ -406,12 +407,17 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
         or not 0 <= target <= 99
         or evidence.get("status") != "MATCH"
         or evidence.get("anchor_legible") is not True
+        or type(evidence.get("anchor_number")) is not int
         or evidence.get("anchor_number") != target
     ):
         return False
     readings = evidence.get("readings") or []
+    if not isinstance(readings, (list, tuple)):
+        return False
     matching = {}
     for item in readings:
+        if not isinstance(item, Mapping):
+            return False
         if item.get("legible") is not True:
             continue
         if item.get("number") != target:

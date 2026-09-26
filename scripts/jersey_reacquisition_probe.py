@@ -21,16 +21,14 @@ from app.reid.team_color_guard import apply_team_color_guard
 job_id = "796f8c0f-94cd-4d2d-b8b1-a0f6ee5a5b60"
 attempt = "92f4305d-adb7-44b7-ba63-fe629bbc92f8"
 inputs = list((Path("/tmp/fnh_jobs") / job_id / attempt).glob("*/input.mp4"))
-if len(inputs) != 1:
-    raise SystemExit("Active attempt input is no longer available; probe not run")
-source = inputs[0]
-assert source.stat().st_size == 2386411460
 probe_id = "jersey-probe-20260926"
 probe_root = Path("/tmp/fnh_jobs") / probe_id
 assert not probe_root.exists(), "Probe workspace already exists"
+probe_root.mkdir()
+source = probe_root / "input.mp4"
 os.environ.update(
     JERSEY_OCR_ENABLED="1",
-    JERSEY_OCR_MAX_CALLS="25",
+    JERSEY_OCR_MAX_CALLS="36",
     JERSEY_OCR_MAX_SECONDS="90",
     TRACKING_TIMEOUT_SECONDS="240",
 )
@@ -50,6 +48,17 @@ reference = {
     "h": 0.10418120490180122,
 }
 try:
+    if len(inputs) == 1:
+        source.hardlink_to(inputs[0])
+    else:
+        from app.core.workspace import require_free_space
+        from app.workers.tracking import _get_s3_client, S3_ENDPOINT_URL
+
+        require_free_space(probe_root, incoming_bytes=2386411460)
+        _get_s3_client(S3_ENDPOINT_URL).download_file(
+            os.environ["S3_BUCKET"], f"jobs/{job_id}/input.mp4", str(source)
+        )
+    assert source.stat().st_size == 2386411460
     result = tracking.track_player_windowed_reid(
         probe_id,
         str(source),
@@ -94,5 +103,7 @@ try:
             }
         )
     print("JERSEY_PROBE_RESULT " + json.dumps(diagnostic, sort_keys=True))
+    if not guarded.get("tracking_success"):
+        raise SystemExit("Probe did not establish autonomous tracking")
 finally:
     shutil.rmtree(probe_root, ignore_errors=True)

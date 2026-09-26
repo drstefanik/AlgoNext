@@ -2,7 +2,8 @@
 
 Only isolated player crops leave the worker. The desired number, player name,
 team and video URL are deliberately absent from the model prompt. No API result
-can bypass temporal continuity, kit checks, or the player-scoring benchmark gate.
+can bypass continuity within a tracklet, kit checks, appearance checks, or the
+player-scoring benchmark gate. Two independent reads can help bridge a cut.
 """
 
 from __future__ import annotations
@@ -255,6 +256,30 @@ def evaluate_readings(
     }
 
 
+def nearby_confirmation_detections(
+    detections, positive_times, sampled_times, window_start
+):
+    """Bound extra reads to distinct nearby moments of the same candidate."""
+    selected = []
+    used_times = list(sampled_times)
+    ranked = sorted(
+        detections,
+        key=lambda d: min(
+            abs(window_start + float(d["t"]) - t) for t in positive_times
+        ),
+    )
+    for detection in ranked:
+        absolute_time = window_start + float(detection["t"])
+        distance = min(abs(absolute_time - t) for t in positive_times)
+        if distance > 3.0 or any(abs(absolute_time - t) < 0.6 for t in used_times):
+            continue
+        selected.append(detection)
+        used_times.append(absolute_time)
+        if len(selected) == 4:
+            break
+    return selected
+
+
 class JerseyVerifier:
     def __init__(
         self, target_number: Any, input_path: str, player_ref: Mapping[str, Any]
@@ -321,6 +346,42 @@ class JerseyVerifier:
 
         enriched = []
         cap = cv2.VideoCapture(str(path))
+
+        def sample(detection):
+            t = float(detection.get("t") or 0)
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                return None
+            crop = crop_from_normalized_bbox(frame, detection.get("bbox") or {})
+            quality = evaluate_crop_quality(crop)
+            if quality.width < 18 or quality.height < 36 or quality.sharpness < 40:
+                return None
+            signature = extract_kit_color_signature(crop)
+            compatible = (
+                signatures_compatible(self.anchor_signature, signature)
+                if signature
+                else None
+            )
+            if compatible is not True:
+                return None
+            h = crop.shape[0]
+            torso = cv2.resize(
+                crop[int(h * 0.12) : int(h * 0.70)],
+                None,
+                fx=3,
+                fy=3,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            ok, encoded = cv2.imencode(".jpg", torso, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            return (
+                JerseyCrop(
+                    encoded.tobytes(), window_start + t, quality.score, compatible
+                )
+                if ok
+                else None
+            )
+
         try:
             for candidate in candidates:
                 metadata = dict(candidate.metadata or {})
@@ -330,46 +391,9 @@ class JerseyVerifier:
                 crops = []
                 if detections:
                     for detection in choose_descriptor_detections(detections, 8):
-                        t = float(detection.get("t") or 0)
-                        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                        ok, frame = cap.read()
-                        if not ok:
-                            continue
-                        crop = crop_from_normalized_bbox(
-                            frame, detection.get("bbox") or {}
-                        )
-                        quality = evaluate_crop_quality(crop)
-                        if (
-                            quality.width < 18
-                            or quality.height < 36
-                            or quality.sharpness < 40
-                        ):
-                            continue
-                        signature = extract_kit_color_signature(crop)
-                        compatible = (
-                            signatures_compatible(self.anchor_signature, signature)
-                            if signature
-                            else None
-                        )
-                        if compatible is not True:
-                            continue
-                        h = crop.shape[0]
-                        torso = crop[int(h * 0.12) : int(h * 0.70)]
-                        torso = cv2.resize(
-                            torso, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC
-                        )
-                        ok, encoded = cv2.imencode(
-                            ".jpg", torso, [cv2.IMWRITE_JPEG_QUALITY, 92]
-                        )
-                        if ok:
-                            crops.append(
-                                JerseyCrop(
-                                    encoded.tobytes(),
-                                    window_start + t,
-                                    quality.score,
-                                    compatible,
-                                )
-                            )
+                        crop = sample(detection)
+                        if crop is not None:
+                            crops.append(crop)
                 selected = []
                 for crop in sorted(crops, key=lambda c: c.quality, reverse=True):
                     if all(
@@ -382,6 +406,33 @@ class JerseyVerifier:
                     {**self.reader.read(crop), "kit_compatible": crop.kit_compatible}
                     for crop in selected
                 ]
+                # A readable back often lasts only a few seconds. Once a digit
+                # is clear, seek independent confirmation nearby rather than
+                # spending the remaining budget on distant front views.
+                evidence = evaluate_readings(readings, self.target)
+                positives = [
+                    item["time_sec"]
+                    for item in readings
+                    if item.get("legible") is True and item.get("number") == self.target
+                ]
+                if evidence["status"] == "UNVERIFIED" and positives:
+                    for detection in nearby_confirmation_detections(
+                        detections,
+                        positives,
+                        [c.time_sec for c in selected],
+                        window_start,
+                    ):
+                        crop = sample(detection)
+                        if crop is None:
+                            continue
+                        readings.append(
+                            {**self.reader.read(crop), "kit_compatible": True}
+                        )
+                        if (
+                            evaluate_readings(readings, self.target)["status"]
+                            != "UNVERIFIED"
+                        ):
+                            break
                 metadata["jersey_evidence"] = evaluate_readings(readings, self.target)
                 evidence = metadata["jersey_evidence"]
                 evidence["anchor_number"] = (self.anchor_reading or {}).get("number")

@@ -1,4 +1,5 @@
 name: Probe jersey reacquisition on three cached windows
+# Adaptive neighboring-frame confirmation and fractional-fps continuity.
 on:
   push:
     branches: [feat/jersey-reacquisition-20260926]
@@ -8,7 +9,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - name: Execute isolated read-only three-window probe
         uses: appleboy/ssh-action@v1.0.3
@@ -16,7 +17,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: root
           key: ${{ secrets.VPS_SSH_KEY }}
-          command_timeout: 6m
+          command_timeout: 8m
           script: |
             set -euo pipefail
             cd /opt/AlgoNext

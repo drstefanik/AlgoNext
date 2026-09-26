@@ -23,10 +23,20 @@ from app.reid.jersey_vision import (
     JerseyReader,
     evaluate_readings,
     parse_reading,
+    nearby_confirmation_detections,
 )
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_confirmation_samples_are_nearby_and_temporally_independent(self):
+        detections = [
+            {"t": t} for t in [0, 10, 10.2, 11.001, 12.002, 13.003, 14.004, 15.005, 30]
+        ]
+        selected = nearby_confirmation_detections(
+            detections, [112.002], [112.002, 100, 130], 100
+        )
+        self.assertEqual({d["t"] for d in selected}, {10.2, 11.001, 13.003, 14.004})
+
     def jersey_candidate(self, *, vector=(1, 0), evidence_changes=None):
         readings = [
             dict(

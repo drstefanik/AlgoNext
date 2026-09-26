@@ -1185,7 +1185,7 @@ def _build_candidate_profiles(
     return profiles, id_lookup, descriptor_lookup
 
 
-def _scope_jersey_candidate(segment_path, candidate, window_start):
+def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
     """Keep only the component containing two independent matching shirt reads."""
     from dataclasses import replace
 
@@ -1201,16 +1201,25 @@ def _scope_jersey_candidate(segment_path, candidate, window_start):
     detections = list(metadata.get("tracklet_detections") or ())
     if len(matches) < 2 or not detections:
         return candidate
-    first_time = float(matches[0]["time_sec"]) - window_start
-    seed = min(detections, key=lambda item: abs(float(item["t"]) - first_time))
-    if abs(float(seed["t"]) - first_time) > 0.05:
-        return candidate
-    component = _anchor_tracklet_detections(
-        detections,
-        anchor_time_local=first_time,
-        anchor_bbox=seed["bbox"],
-        radius_sec=0.1,
-    )
+    seeds = []
+    for reading in matches:
+        local_time = float(reading["time_sec"]) - window_start
+        seed = min(detections, key=lambda item: abs(float(item["t"]) - local_time))
+        if abs(float(seed["t"]) - local_time) > 0.05:
+            return candidate
+        seeds.append(seed)
+    # Use the same fps-aware motion gate as physical-overlap propagation.
+    # Source 29.97 fps produces 1.001-second intervals at nominal 1 fps.
+    components = [
+        _tracklet_detections_from_overlap(
+            detections, seeds, direction=direction, fps=fps
+        )
+        for direction in ("forward", "backward")
+    ]
+    component_by_key = {
+        _detection_key(item): item for part in components for item in part
+    }
+    component = sorted(component_by_key.values(), key=lambda item: float(item["t"]))
     component_times = [float(item["t"]) for item in component]
     if len(component) < 3 or any(
         not any(
@@ -2499,7 +2508,12 @@ def track_player_windowed_reid(
                 strong_overlap_score=thresholds.strong_overlap_score,
             )
             candidates = jersey_verifier.enrich(
-                segment_path, candidates, window_start, rescope=_scope_jersey_candidate
+                segment_path,
+                candidates,
+                window_start,
+                rescope=lambda path, candidate, start: _scope_jersey_candidate(
+                    path, candidate, start, fps=sample_fps
+                ),
             )
             descriptor_lookup.update(
                 {

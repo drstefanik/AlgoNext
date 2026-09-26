@@ -246,6 +246,14 @@ class ReIDWindowedTrackingTests(unittest.TestCase):
                 Path("video.mp4"), candidate([1, 9]), 100
             )
             self.assertEqual(disconnected.metadata["tracklet_scope"], "FULL_WINDOW")
+            # Real video sampling drifts slightly above one second; this must
+            # preserve continuous motion without loosening the ID-switch gate.
+            for detection in first:
+                detection["t"] *= 1.001
+            fractional = self.module._scope_jersey_candidate(
+                Path("video.mp4"), candidate([1.001, 2.002]), 100, fps=1
+            )
+            self.assertEqual(fractional.metadata["tracklet_sample_indices"], (1, 2, 3))
 
     def test_early_fallback_rewrites_persisted_legacy_asset_fail_closed(self):
         uploaded = {}
