@@ -67,6 +67,7 @@ jobs:
             available_bytes="$(df -B1 --output=avail /var/lib/docker | tail -n 1 | tr -d ' ')"
             if [ "$available_bytes" -lt 16106127360 ]; then
               docker builder prune --all --force --filter 'until=1h' --keep-storage 2GB
+              docker image prune --force --filter 'label=com.docker.compose.project=algonext' --filter 'until=1h'
             fi
             df -hT /var/lib/docker
             docker system df
