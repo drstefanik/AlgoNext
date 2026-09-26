@@ -1,0 +1,62 @@
+name: Defer release fixture for the requested player analysis
+on:
+  push:
+    branches: ["ops/storage-incident-20260926"]
+    paths: [".github/workflows/defer-release-fixture.yml"]
+permissions:
+  contents: read
+jobs:
+  defer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cooperatively stop only the exact background fixture attempt
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 3m
+          script: |
+            set -euo pipefail
+            cd /opt/AlgoNext
+            docker compose exec -T worker python - <<'PY'
+            import json, os
+            from datetime import datetime, timezone
+            from celery import Celery
+            from sqlalchemy import select
+            from app.core.db import SessionLocal
+            from app.core.models import AnalysisJob
+            fixture_id = "6520b68b-8de6-43b7-88d2-41375bded0a0"
+            fixture_attempt = "bef51736-87b1-4f3c-b354-625a5a2abc22"
+            fixture_task = "8721098f-1ced-4903-809e-e0a3eaf5d2e2"
+            user_id = "796f8c0f-94cd-4d2d-b8b1-a0f6ee5a5b60"
+            app = Celery(broker=os.environ["CELERY_BROKER_URL"])
+            active = app.control.inspect(timeout=5).active()
+            if not active:
+                raise SystemExit("Cannot attest worker activity")
+            tasks = [task for values in active.values() for task in values]
+            if not any(task.get("id") == fixture_task for task in tasks):
+                print("Exact fixture is no longer active; no changes")
+                raise SystemExit(0)
+            with SessionLocal() as db:
+                user = db.get(AnalysisJob, user_id)
+                assert user.status == "QUEUED", "Requested analysis is no longer queued"
+                assert user.target.get("analysis_attempt_id") == "92f4305d-adb7-44b7-ba63-fe629bbc92f8"
+                assert user.target.get("player", {}).get("shirt_number") == 8
+                fixture = db.execute(select(AnalysisJob).where(AnalysisJob.id == fixture_id).with_for_update()).scalar_one()
+                assert fixture.status == "RUNNING"
+                assert fixture.target.get("analysis_attempt_id") == fixture_attempt
+                assert fixture.progress.get("analysis_task_id") == fixture_task
+                fixture.status = "FAILED"
+                fixture.failure_reason = "VALIDATION_DEFERRED_FOR_USER_JOB"
+                fixture.error = "Release fixture deferred to prioritize the requested player analysis; validation remains incomplete and must be rerun."
+                fixture.progress = {
+                    **fixture.progress,
+                    "step": "FAILED",
+                    "message": fixture.error,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                db.commit()
+                print(json.dumps({"fixture_attempt": fixture_attempt, "state": "VALIDATION_DEFERRED_FOR_USER_JOB", "mode": "cooperative attempt-state fence"}))
+            PY
