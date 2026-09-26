@@ -34,6 +34,17 @@ does not alter the job or upload its tracking result, and fails its workflow whe
 the final kit guard does not confirm autonomous tracking. Passing that probe is
 not equivalent to full-match identity validation.
 
+On 26 September at 10:15 UTC, isolated production-key probe run **36235093423**
+passed. The 3-fps retry read **8** at 1227.017, 1227.684 and 1228.352 seconds on
+one continuous component. All five final kit samples were compatible. The same
+component with legacy smoothed display coordinates failed: one compatible, two
+incompatible and two unknown samples. Jersey-confirmed tracks now retain exact
+detection coordinates for identity crops, avoiding that smoothing lag.
+
+The probe made 32 API calls, used 9,882 total tokens and 41.939 seconds of API
+time, with zero provider errors. The honest result is
+`SPARSE_CROSS_WINDOW_EVIDENCE`, not complete match coverage or a validated rating.
+
 ## Bounded operation
 
 - Existing server-side `OPENAI_API_KEY` and optional `OPENAI_BASE_URL` are reused.
