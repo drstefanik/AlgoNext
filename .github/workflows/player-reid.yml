@@ -5,6 +5,8 @@ on:
     paths:
       - "app/reid/**"
       - "app/core/preview_asset_policy.py"
+      - "app/core/workspace.py"
+      - "tests/test_jersey_vision.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "docker-compose.yml"
@@ -27,6 +29,8 @@ on:
     paths:
       - "app/reid/**"
       - "app/core/preview_asset_policy.py"
+      - "app/core/workspace.py"
+      - "tests/test_jersey_vision.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "docker-compose.yml"

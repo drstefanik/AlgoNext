@@ -185,6 +185,45 @@ class JerseyVisionTests(unittest.TestCase):
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_guard_keeps_only_safe_rejection_diagnostics(self):
+        from app.reid.team_color_guard import _team_color_guard_failure_output
+
+        output = _team_color_guard_failure_output(
+            {
+                "segments": [
+                    {
+                        "window_index": 1,
+                        "bboxes": [{"x": 0.2}],
+                        "reid": {
+                            "reason_codes": [
+                                "LOW_COMBINED_SCORE",
+                                "ASSOCIATION_ACCEPTED",
+                                "https://secret",
+                            ],
+                            "best_score": 0.3,
+                            "margin": float("nan"),
+                        },
+                    }
+                ],
+                "reid_summary": {
+                    "jersey_vision": {
+                        "calls": 3,
+                        "anchor_reading": {"number": 8},
+                        "url": "https://secret",
+                    }
+                },
+            },
+            status="ANCHOR_ONLY",
+            reason_code="TEAM_COLOR_GUARD_UNVERIFIED_FAILURE_OUTPUT",
+        )
+        diagnostics = output["pre_guard_reid_diagnostics"]
+        self.assertEqual(diagnostics["reason_counts"], {"LOW_COMBINED_SCORE": 1})
+        self.assertEqual(diagnostics["jersey_vision"]["anchor_number"], 8)
+        self.assertTrue(diagnostics["diagnostic_only"])
+        self.assertFalse(output["tracking_success"])
+        self.assertNotIn("secret", json.dumps(output))
+        self.assertEqual(output["segments"][0]["bboxes"], [])
+
     def test_cleanup_removes_only_attempt_and_refuses_traversal_or_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
