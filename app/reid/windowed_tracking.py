@@ -1185,6 +1185,76 @@ def _build_candidate_profiles(
     return profiles, id_lookup, descriptor_lookup
 
 
+def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
+    """Keep only the component containing two independent matching shirt reads."""
+    from dataclasses import replace
+
+    metadata = dict(candidate.metadata or {})
+    evidence = metadata.get("jersey_evidence") or {}
+    matches = [
+        item
+        for item in evidence.get("readings", [])
+        if item.get("legible") is True
+        and item.get("number") == evidence.get("target_number")
+        and item.get("kit_compatible") is True
+    ]
+    detections = list(metadata.get("tracklet_detections") or ())
+    if len(matches) < 2 or not detections:
+        return candidate
+    seeds = []
+    for reading in matches:
+        local_time = float(reading["time_sec"]) - window_start
+        seed = min(detections, key=lambda item: abs(float(item["t"]) - local_time))
+        if abs(float(seed["t"]) - local_time) > 0.05:
+            return candidate
+        seeds.append(seed)
+    # Use the same fps-aware motion gate as physical-overlap propagation.
+    # Source 29.97 fps produces 1.001-second intervals at nominal 1 fps.
+    components = [
+        _tracklet_detections_from_overlap(
+            detections, seeds, direction=direction, fps=fps
+        )
+        for direction in ("forward", "backward")
+    ]
+    component_by_key = {
+        _detection_key(item): item for part in components for item in part
+    }
+    component = sorted(component_by_key.values(), key=lambda item: float(item["t"]))
+    component_times = [float(item["t"]) for item in component]
+    if len(component) < 3 or any(
+        not any(
+            abs(t - (float(reading["time_sec"]) - window_start)) <= 0.05
+            for t in component_times
+        )
+        for reading in matches
+    ):
+        return candidate
+    track_id = int(metadata["local_track_id"])
+    descriptor = _extract_descriptors_for_tracks(
+        segment_path, {track_id: component}, [track_id]
+    ).get(track_id)
+    metadata.update(
+        tracklet_scope="MOTION_CONTINUOUS_JERSEY",
+        tracklet_detections=tuple(dict(item) for item in component),
+        tracklet_sample_indices=tuple(int(item["sample_index"]) for item in component),
+    )
+    metadata["jersey_evidence"] = {**evidence, "component_match_samples": len(matches)}
+    metadata["benchmark_evidence"] = [
+        item
+        for item in (metadata.get("benchmark_evidence") or [])
+        if any(
+            abs(float(item.get("time_sec", -1)) - window_start - t) <= 0.05
+            for t in component_times
+        )
+    ]
+    return replace(
+        candidate,
+        metadata=metadata,
+        descriptor=descriptor,
+        detection_count=len(component),
+    )
+
+
 def _empty_segment(
     *,
     window_index: int,
@@ -1553,6 +1623,8 @@ def track_player_windowed_reid(
 
     def collect(
         index: int,
+        *,
+        minimum_fps: int = 0,
     ) -> tuple[
         Path,
         list[dict[str, Any]],
@@ -1561,7 +1633,7 @@ def track_player_windowed_reid(
     ]:
         nonlocal anchor_model
         cached = window_cache.get(index)
-        if cached is not None:
+        if cached is not None and cached[3] >= minimum_fps:
             return cached
         window_start, window_end = windows[index]
         segment_path = windows_dir / f"window_{index + 1:04d}.mp4"
@@ -1574,7 +1646,7 @@ def track_player_windowed_reid(
             max(0.0, window_end - window_start),
             accurate=is_anchor_window,
         )
-        sample_fps = anchor_fps if is_anchor_window else fps
+        sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
         if is_anchor_window and anchor_detector_model != detector_model:
             if anchor_model is None:
@@ -2375,6 +2447,7 @@ def track_player_windowed_reid(
             )
 
         attempted_edges: set[tuple[int, int, str]] = set()
+        dense_windows_used = 0
         while frontier:
             frontier.sort(
                 key=lambda item: (
@@ -2428,21 +2501,60 @@ def track_player_windowed_reid(
                 segments_by_index[index] = resolved_window_proposal(index)
                 continue
 
-            candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
-                segment_path,
-                track_map,
-                previous_bboxes=state["link_bboxes"],
-                window_start=window_start,
-                direction=direction,
-                fps=sample_fps,
-                strong_overlap_score=thresholds.strong_overlap_score,
-            )
-            candidates = jersey_verifier.enrich(segment_path, candidates, window_start)
-            decision = associate_identity(
-                base_profile,
-                candidates,
-                thresholds=thresholds,
-            )
+            for density_pass in range(2):
+                candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
+                    segment_path,
+                    track_map,
+                    previous_bboxes=state["link_bboxes"],
+                    window_start=window_start,
+                    direction=direction,
+                    fps=sample_fps,
+                    strong_overlap_score=thresholds.strong_overlap_score,
+                )
+                candidates = jersey_verifier.enrich(
+                    segment_path,
+                    candidates,
+                    window_start,
+                    rescope=lambda path, candidate, start: _scope_jersey_candidate(
+                        path, candidate, start, fps=sample_fps
+                    ),
+                )
+                descriptor_lookup.update(
+                    {
+                        candidate.candidate_id: candidate.descriptor
+                        for candidate in candidates
+                    }
+                )
+                decision = associate_identity(
+                    base_profile, candidates, thresholds=thresholds
+                )
+                if (
+                    decision.accepted
+                    or density_pass
+                    or sample_fps >= 3
+                    or dense_windows_used >= 4
+                    or not jersey_verifier.should_retry_densely(candidates)
+                ):
+                    break
+                dense_windows_used += 1
+                try:
+                    segment_path, samples, track_map, sample_fps = collect(
+                        index, minimum_fps=3
+                    )
+                except (
+                    legacy.TrackingTimeoutError,
+                    StaleAnalysisAttemptError,
+                    InsufficientWorkspaceError,
+                ):
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Dense jersey retry unavailable job_id=%s window=%s error_type=%s",
+                        job_id,
+                        index,
+                        type(exc).__name__,
+                    )
+                    break
             selected_profile = next(
                 (
                     candidate
@@ -2493,6 +2605,11 @@ def track_player_windowed_reid(
                 tracklet_detections,
                 window_start=window_start,
             )
+            if selected_metadata.get("tracklet_scope") == "MOTION_CONTINUOUS_JERSEY":
+                # Shirt evidence was read at these exact coordinates. Legacy
+                # display smoothing lags camera/player motion and must not move
+                # the identity crop off the player before the final kit guard.
+                bboxes = [dict(box) for box in next_link_bboxes]
             if (
                 decision.accepted
                 and selected_track_id is not None

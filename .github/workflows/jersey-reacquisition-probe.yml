@@ -1,0 +1,39 @@
+name: Probe jersey reacquisition on three cached windows
+# Adaptive neighboring-frame confirmation and fractional-fps continuity.
+# Diagnose source crop dimensions and missing nearby detections.
+# Test bounded dense CV retry when a shirt is readable but the track is sparse.
+# Compare exact detection crops with legacy display-smoothing lag.
+on:
+  push:
+    branches: [feat/jersey-reacquisition-20260926]
+    paths: [".github/workflows/jersey-reacquisition-probe.yml"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Execute isolated read-only three-window probe
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/AlgoNext
+            git fetch origin feat/jersey-reacquisition-20260926
+            test "$(git rev-parse FETCH_HEAD)" = "${{ github.sha }}"
+            tmp_dir=$(mktemp -d /tmp/algonext-jersey-probe.XXXXXX)
+            trap 'rm -rf "$tmp_dir"' EXIT
+            for module in association jersey_vision windowed_tracking; do
+              git show "FETCH_HEAD:app/reid/$module.py" > "$tmp_dir/$module.py"
+            done
+            git show FETCH_HEAD:scripts/jersey_reacquisition_probe.py > "$tmp_dir/probe.py"
+            worker_id=$(docker compose ps -q worker)
+            test -n "$worker_id"
+            docker cp "$tmp_dir/." "$worker_id:/tmp/algonext-jersey-probe"
+            docker compose exec -T worker env PYTHONPATH=/app python /tmp/algonext-jersey-probe/probe.py /tmp/algonext-jersey-probe
+            docker compose exec -T worker rm -rf /tmp/algonext-jersey-probe
