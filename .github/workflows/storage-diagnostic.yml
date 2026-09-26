@@ -53,3 +53,23 @@ jobs:
             docker compose logs --no-color --tail=300 db redis 2>&1 | grep -Ei 'no space|disk|read.only|permission denied|cannot allocate|out of memory|FATAL|PANIC|snapshot|saving error' | tail -n 60 || true
             docker compose logs --no-color --tail=500 api 2>&1 | grep -F '84a8b83c-9920-4ec4-88cd-e3cab5f88920' | tail -n 5 || true
             docker compose exec -T worker sh -c 'du -sh /tmp/fnh_jobs /tmp/fnh_jobs_candidates /tmp/fnh_jobs_previews 2>/dev/null' || true
+      - name: Reclaim unused build cache while preserving services and data volumes
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          timeout: 2m
+          command_timeout: 7m
+          script: |
+            set -euo pipefail
+            cd /opt/AlgoNext
+            available_bytes="$(df -B1 --output=avail /var/lib/docker | tail -n 1 | tr -d ' ')"
+            if [ "$available_bytes" -lt 16106127360 ]; then
+              docker builder prune --all --force --filter 'until=1h' --keep-storage 2GB
+            fi
+            df -hT /var/lib/docker
+            docker system df
+            docker compose exec -T db psql -U postgres -d app -v ON_ERROR_STOP=1 -c 'SELECT 1 AS database_ready;'
+            docker compose exec -T redis redis-cli INFO persistence | grep -E 'rdb_last_bgsave_status|rdb_bgsave_in_progress|rdb_last_save_time'
+            docker compose ps
