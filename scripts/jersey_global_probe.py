@@ -13,6 +13,7 @@ for short in (
     "association",
     "window_logic",
     "jersey_vision",
+    "match_context",
     "jersey_search",
     "tracklet_motion",
     "windowed_tracking",
@@ -62,6 +63,34 @@ tracking.legacy._update_tracking_progress = lambda *a, **k: None
 tracking.legacy._mark_tracking_timeout = lambda *a, **k: None
 tracking._persist_tracking_output = lambda job, output, **kwargs: output
 timings = {}
+original_verifier_init = tracking.JerseyVerifier.__init__
+
+
+def check_context(self, *args, **kwargs):
+    original_verifier_init(self, *args, **kwargs)
+    from app.reid.match_context import read_scoreboard_context, same_match_context
+    import cv2
+
+    cap = cv2.VideoCapture(str(source))
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, 198000)
+        ok, frame = cap.read()
+        unrelated = read_scoreboard_context(self.reader, frame if ok else None, 198)
+    finally:
+        cap.release()
+    print(
+        "PROBE_MATCH_CONTEXT "
+        + json.dumps({"anchor": self.anchor_context, "unrelated": unrelated}),
+        flush=True,
+    )
+    assert self.anchor_context and self.anchor_context.get("legible") is True
+    assert unrelated.get("legible") is True
+    assert not same_match_context(
+        self.anchor_context, unrelated
+    ), "Foreign match has not been distinguished"
+
+
+tracking.JerseyVerifier.__init__ = check_context
 
 
 def timed_stage(owner, name):

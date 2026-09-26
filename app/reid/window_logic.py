@@ -408,6 +408,11 @@ def _verified_jersey_anchor_link(
     )
     evidence = selected.get("jersey_evidence") or {}
     reading = anchor_reid.get("jersey_anchor_reading") or {}
+    anchor_context = anchor_reid.get("jersey_anchor_match_context")
+    context = evidence.get("match_context") if isinstance(evidence, Mapping) else None
+    if anchor_context is not None or context is not None:
+        if not isinstance(context, Mapping) or context.get("anchor") != anchor_context:
+            return False
     if (
         not isinstance(evidence, Mapping)
         or not isinstance(reading, Mapping)

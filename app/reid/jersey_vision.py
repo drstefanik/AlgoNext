@@ -1,6 +1,6 @@
 """Bounded, unprompted jersey OCR. Numbers supplement CV; they never prove identity.
 
-Only isolated player crops leave the worker. The desired number, player name,
+Only isolated player crops and scoreboard strips leave the worker. The desired number, player name,
 team and video URL are deliberately absent from the model prompt. No API result
 can bypass continuity within a tracklet, kit checks, appearance checks, or the
 player-scoring benchmark gate. Two independent reads can help bridge a cut.
@@ -106,7 +106,7 @@ class JerseyReader:
         }
         self.enabled = self.enabled and bool(self.api_key)
         self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 256))
-        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 1200)
+        self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 1800)
         self.timeout = bounded_env("JERSEY_OCR_TIMEOUT_SECONDS", 20, 1, 30)
         self.clock = clock
         self.transport = transport or requests.post
@@ -116,11 +116,21 @@ class JerseyReader:
         self.cache: dict[str, dict[str, Any]] = {}
         self.batch_calls = 0
         self.images_read = 0
+        self.context_reads = 0
         self.reason = "READY" if self.enabled else "DISABLED_OR_KEY_MISSING"
 
-    def read(self, crop: JerseyCrop) -> dict[str, Any]:
+    def read(
+        self,
+        crop: JerseyCrop,
+        *,
+        prompt=PROMPT,
+        schema=SCHEMA,
+        parser=parse_reading,
+        cache_version=VERSION,
+        context=False,
+    ) -> dict[str, Any]:
         digest = hashlib.sha256(crop.jpeg).hexdigest()
-        identity = f"{VERSION}:{self.model}:{digest}"
+        identity = f"{cache_version}:{self.model}:{digest}"
         provenance = {"image_sha256": digest, "time_sec": round(crop.time_sec, 3)}
         if identity in self.cache:
             self.cache_hits += 1
@@ -144,7 +154,7 @@ class JerseyReader:
                 "model": self.model,
                 "store": False,
                 "messages": [
-                    {"role": "system", "content": PROMPT},
+                    {"role": "system", "content": prompt},
                     {
                         "role": "user",
                         "content": [
@@ -163,9 +173,9 @@ class JerseyReader:
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "jersey_reading",
+                        "name": "match_context" if context else "jersey_reading",
                         "strict": True,
-                        "schema": SCHEMA,
+                        "schema": schema,
                     },
                 },
             }
@@ -195,14 +205,17 @@ class JerseyReader:
                 "refusal"
             ):
                 raise ValueError("INCOMPLETE_OR_REFUSED")
-            result = parse_reading(json.loads(choice["message"]["content"]))
+            result = parser(json.loads(choice["message"]["content"]))
             result["request_id"] = str(self.calls)
             self.images_read += 1
             self.tokens += max(
                 0, int((envelope.get("usage") or {}).get("total_tokens") or 0)
             )
             result["status"] = "READ" if result["legible"] else "UNREADABLE"
-            self.legible += int(result["legible"])
+            if context:
+                self.context_reads += 1
+            else:
+                self.legible += int(result["legible"])
             self.cache[identity] = result
             return {**result, **provenance, "cache_hit": False}
         except Exception as exc:
@@ -524,6 +537,10 @@ class JerseyVerifier:
         self.reader = JerseyReader()
         self.anchor_signature = None
         self.anchor_reading = None
+        self.match_context_guard = os.getenv(
+            "JERSEY_OCR_BATCH_SEARCH", "0"
+        ).lower() in {"1", "true", "yes"}
+        self.anchor_context = None
         if self.target is None or not self.reader.enabled:
             return
         import cv2
@@ -555,6 +572,14 @@ class JerseyVerifier:
                                 encoded.tobytes(), float(player_ref.get("t", 0)), 1.0
                             )
                         )
+                if self.match_context_guard and (self.anchor_reading or {}).get(
+                    "legible"
+                ):
+                    from app.reid.match_context import read_scoreboard_context
+
+                    self.anchor_context = read_scoreboard_context(
+                        self.reader, frame, float(player_ref.get("t", 0))
+                    )
         finally:
             capture.release()
 
@@ -725,6 +750,26 @@ class JerseyVerifier:
                 evidence["anchor_legible"] = (self.anchor_reading or {}).get(
                     "legible"
                 ) is True
+                if evidence["status"] == "MATCH" and getattr(
+                    self, "match_context_guard", False
+                ):
+                    from app.reid.match_context import confirm_match_context
+
+                    evidence["match_context"] = confirm_match_context(
+                        self.reader,
+                        path,
+                        window_start,
+                        self.anchor_context,
+                        [
+                            r["time_sec"]
+                            for r in readings
+                            if r.get("legible") is True
+                            and r.get("number") == self.target
+                        ],
+                        call_limit=call_limit,
+                    )
+                    if evidence["match_context"]["matched"] is not True:
+                        evidence["status"] = "CONTEXT_UNVERIFIED"
                 enriched_candidate = replace(candidate, metadata=metadata)
                 if (
                     rescope is not None
@@ -746,6 +791,8 @@ class JerseyVerifier:
             **self.reader.summary(),
             "target_number": self.target,
             "anchor_reading": self.anchor_reading,
+            "anchor_match_context": getattr(self, "anchor_context", None),
+            "match_context_reads": getattr(self.reader, "context_reads", 0),
         }
 
     def can_reacquire(self) -> bool:
@@ -756,6 +803,10 @@ class JerseyVerifier:
             and anchor.get("number") == self.target
             and anchor.get("legible") is True
             and self.anchor_signature is not None
+            and (
+                not getattr(self, "match_context_guard", False)
+                or (getattr(self, "anchor_context", None) or {}).get("legible") is True
+            )
             and self.reader.enabled
             and self.reader.errors < 3
             and self.reader.max_calls - self.reader.calls >= 2

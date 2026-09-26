@@ -2268,6 +2268,11 @@ def track_player_windowed_reid(
                         if root_index == primary_anchor.get("window_index")
                         else None
                     ),
+                    "jersey_anchor_match_context": (
+                        jersey_verifier.summary().get("anchor_match_context")
+                        if root_index == primary_anchor.get("window_index")
+                        else None
+                    ),
                     "candidates": [],
                 },
             }

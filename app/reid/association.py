@@ -288,6 +288,8 @@ def _score_candidate(
     jersey = (candidate.metadata or {}).get("jersey_evidence")
     if isinstance(jersey, Mapping) and jersey.get("status") == "CONFLICT":
         reasons.append("JERSEY_NUMBER_CONFLICT")
+    if isinstance(jersey, Mapping) and jersey.get("status") == "CONTEXT_UNVERIFIED":
+        reasons.append("MATCH_CONTEXT_UNVERIFIED")
     descriptor = candidate.descriptor
     appearance: float | None = None
     descriptor_quality: float | None = None
@@ -436,6 +438,17 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
     ):
         return False
     readings = evidence.get("readings") or []
+    context = evidence.get("match_context")
+    if context is not None:
+        if not isinstance(context, Mapping) or context.get("matched") is not True:
+            return False
+        from app.reid.match_context import same_match_context
+
+        context_reads = context.get("readings")
+        if not isinstance(context_reads, (list, tuple)) or len(context_reads) < 2:
+            return False
+        if not all(same_match_context(context.get("anchor"), r) for r in context_reads):
+            return False
     if not isinstance(readings, (list, tuple)):
         return False
     matching = {}
@@ -455,6 +468,17 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
         if not isinstance(t, (int, float)) or not math.isfinite(t):
             continue
         matching[digest] = item
+    if context is not None:
+        times = []
+        for reading in context["readings"]:
+            t = reading.get("time_sec")
+            if not isinstance(t, (float, int)) or not math.isfinite(t):
+                return False
+            if not any(abs(t - m["time_sec"]) <= 0.05 for m in matching.values()):
+                return False
+            times.append(t)
+        if max(times) - min(times) < 0.6:
+            return False
     return independent_jersey_reads(list(matching.values()))
 
 
@@ -582,6 +606,7 @@ def associate_identity(
 
     hard_failures = {
         "JERSEY_NUMBER_CONFLICT",
+        "MATCH_CONTEXT_UNVERIFIED",
         "MISSING_APPEARANCE_DESCRIPTOR",
         "DESCRIPTOR_VERSION_MISMATCH",
         "LOW_DESCRIPTOR_QUALITY",
