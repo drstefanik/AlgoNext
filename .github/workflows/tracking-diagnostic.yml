@@ -55,4 +55,4 @@ jobs:
                 following = 12 if matched and re.search(r'error|exception|traceback', line, re.I) else max(0, following - 1)
             print('\n'.join(selected))
             PY
-# Post-deploy observation: jersey vision revision 2b914ce
+# Observe requested player attempt 92f4305d on jersey release 2b914ce
