@@ -2539,6 +2539,7 @@ def track_player_windowed_reid(
                 segments_by_index[index] = resolved_window_proposal(index)
                 continue
 
+            dense_hints = []
             for density_pass in range(2):
                 candidates, id_lookup, descriptor_lookup = _build_candidate_profiles(
                     segment_path,
@@ -2549,6 +2550,10 @@ def track_player_windowed_reid(
                     fps=sample_fps,
                     strong_overlap_score=thresholds.strong_overlap_score,
                 )
+                if dense_hints:
+                    candidates = jersey_verifier.prioritize_dense_candidates(
+                        candidates, dense_hints
+                    )
                 candidates = jersey_verifier.enrich(
                     segment_path,
                     candidates,
@@ -2582,6 +2587,7 @@ def track_player_windowed_reid(
                 ):
                     break
                 dense_windows_used += 1
+                dense_hints = jersey_verifier.dense_hints(candidates, window_start)
                 try:
                     segment_path, samples, track_map, sample_fps = collect(
                         index, minimum_fps=3

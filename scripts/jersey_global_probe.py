@@ -33,6 +33,8 @@ os.environ.update(
     TRACKING_TIMEOUT_SECONDS="480",
 )
 starts = [1100, 1155, 1210, 1265, 1925, 1980, 2035, 3300]
+if os.getenv("GLOBAL_PROBE_FOCUSED") == "1":
+    starts = [1155, 1265, 1925]
 tracking.legacy.iter_windows = lambda *a, **k: [
     (float(s), float(s + 60)) for s in starts
 ]

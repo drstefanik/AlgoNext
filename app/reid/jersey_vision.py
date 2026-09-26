@@ -281,6 +281,54 @@ def nearby_confirmation_detections(
 
 
 class JerseyVerifier:
+    @staticmethod
+    def dense_hints(candidates, window_start):
+        """Carry only sampling coordinates across a denser detector pass."""
+        hints = []
+        for candidate in candidates:
+            metadata = candidate.metadata or {}
+            evidence = metadata.get("jersey_evidence") or {}
+            for reading in evidence.get("readings", []):
+                if (
+                    reading.get("legible") is not True
+                    or reading.get("number") != evidence.get("target_number")
+                    or reading.get("kit_compatible") is not True
+                ):
+                    continue
+                local_time = float(reading["time_sec"]) - window_start
+                for detection in metadata.get("tracklet_detections", []):
+                    if abs(float(detection["t"]) - local_time) <= 0.05:
+                        hints.append({"t": local_time, "bbox": detection["bbox"]})
+                        break
+        return hints
+
+    @staticmethod
+    def prioritize_dense_candidates(candidates, hints):
+        """Hints guide fresh reads; they cannot transfer a number or identity."""
+        from app.reid.window_logic import bbox_iou
+
+        prioritized = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata or {})
+            preferred = []
+            for hint in hints:
+                matches = [
+                    d
+                    for d in metadata.get("tracklet_detections", [])
+                    if abs(float(d["t"]) - hint["t"]) <= 0.08
+                    and bbox_iou(d.get("bbox") or {}, hint["bbox"]) >= 0.5
+                ]
+                if matches:
+                    preferred.append(float(matches[0]["t"]))
+            if preferred:
+                metadata["jersey_preferred_times"] = preferred
+                candidate = replace(candidate, metadata=metadata)
+            prioritized.append(candidate)
+        return sorted(
+            prioritized,
+            key=lambda c: not bool((c.metadata or {}).get("jersey_preferred_times")),
+        )
+
     def __init__(
         self, target_number: Any, input_path: str, player_ref: Mapping[str, Any]
     ):
@@ -395,14 +443,32 @@ class JerseyVerifier:
                 # OCR may inspect a raw ID, but only a subsequently verified
                 # motion-continuous component can become a reacquisition candidate.
                 detections = metadata.get("tracklet_detections") or ()
+                preferred_times = metadata.get("jersey_preferred_times") or []
                 crops = []
                 if detections:
-                    for detection in choose_descriptor_detections(detections, 8):
+                    chosen = choose_descriptor_detections(detections, 8)
+                    for t in preferred_times:
+                        detection = min(
+                            detections, key=lambda d: abs(float(d["t"]) - t)
+                        )
+                        if detection not in chosen:
+                            chosen.append(detection)
+                    for detection in chosen:
                         crop = sample(detection)
                         if crop is not None:
                             crops.append(crop)
                 selected = []
-                for crop in sorted(crops, key=lambda c: c.quality, reverse=True):
+                for crop in sorted(
+                    crops,
+                    key=lambda c: (
+                        any(
+                            abs(c.time_sec - window_start - t) <= 0.08
+                            for t in preferred_times
+                        ),
+                        c.quality,
+                    ),
+                    reverse=True,
+                ):
                     if all(
                         abs(crop.time_sec - other.time_sec) >= 0.6 for other in selected
                     ):

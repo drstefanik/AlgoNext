@@ -29,6 +29,60 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_dense_sampling_retains_readable_location_without_transferring_identity(
+        self,
+    ):
+        from dataclasses import replace
+
+        box = {"x": 0.2, "y": 0.3, "w": 0.1, "h": 0.2}
+        coarse = replace(
+            self.jersey_candidate(),
+            metadata={
+                "jersey_evidence": {
+                    "target_number": 8,
+                    "readings": [
+                        {
+                            "number": 8,
+                            "legible": True,
+                            "kit_compatible": True,
+                            "time_sec": 150.025,
+                        },
+                        {
+                            "number": 6,
+                            "legible": True,
+                            "kit_compatible": True,
+                            "time_sec": 155,
+                        },
+                    ],
+                },
+                "tracklet_detections": [
+                    {"t": 50.025, "bbox": box},
+                    {"t": 55, "bbox": box},
+                ],
+            },
+        )
+        hints = JerseyVerifier.dense_hints([coarse], 100)
+        self.assertEqual(hints, [{"t": 50.025, "bbox": box}])
+        nearby = replace(
+            coarse,
+            candidate_id="new_id",
+            metadata={
+                "tracklet_detections": [{"t": 50.025, "bbox": box}],
+            },
+        )
+        other = replace(
+            nearby,
+            candidate_id="teammate",
+            metadata={
+                "tracklet_detections": [{"t": 50.025, "bbox": {**box, "x": 0.7}}],
+            },
+        )
+        reordered = JerseyVerifier.prioritize_dense_candidates([other, nearby], hints)
+        self.assertEqual(reordered[0].candidate_id, "new_id")
+        self.assertEqual(reordered[0].metadata["jersey_preferred_times"], [50.025])
+        self.assertNotIn("jersey_evidence", reordered[0].metadata)
+        self.assertNotIn("jersey_preferred_times", reordered[1].metadata)
+
     def test_global_search_requires_read_anchor_kit_and_available_budget(self):
         verifier = JerseyVerifier.__new__(JerseyVerifier)
         verifier.target = 8

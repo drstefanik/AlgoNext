@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Keep confirmation budget after rejecting already-conflicting shirt reads.
+# Focused diagnosis of dense resampling around a previously readable shirt.
 on:
   push:
     branches: [fix/global-jersey-search-20260926]
@@ -37,4 +37,4 @@ jobs:
             done
             git show FETCH_HEAD:scripts/jersey_global_probe.py > "$stage/probe.py"
             docker cp "$stage" "$worker_id:$container_stage"
-            docker exec -e PYTHONPATH=/app "$worker_id" python "$container_stage/probe.py" "$container_stage"
+            docker exec -e PYTHONPATH=/app -e GLOBAL_PROBE_FOCUSED=1 "$worker_id" python "$container_stage/probe.py" "$container_stage"
