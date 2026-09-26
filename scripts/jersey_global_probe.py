@@ -28,8 +28,8 @@ probe_root.mkdir()
 source = probe_root / "input.mp4"
 os.environ.update(
     JERSEY_OCR_ENABLED="1",
-    JERSEY_OCR_MAX_CALLS="64",
-    JERSEY_OCR_MAX_SECONDS="180",
+    JERSEY_OCR_MAX_CALLS="128",
+    JERSEY_OCR_MAX_SECONDS="240",
     TRACKING_TIMEOUT_SECONDS="480",
 )
 starts = [1100, 1155, 1210, 1265, 1925, 1980, 2035, 3300]

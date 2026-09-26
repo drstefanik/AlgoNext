@@ -105,7 +105,7 @@ class JerseyReader:
             "yes",
         }
         self.enabled = self.enabled and bool(self.api_key)
-        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 64, 0, 128))
+        self.max_calls = int(bounded_env("JERSEY_OCR_MAX_CALLS", 128, 0, 128))
         self.max_seconds = bounded_env("JERSEY_OCR_MAX_SECONDS", 240, 0, 600)
         self.timeout = bounded_env("JERSEY_OCR_TIMEOUT_SECONDS", 20, 1, 30)
         self.clock = clock
@@ -419,6 +419,10 @@ class JerseyVerifier:
                             "kit_compatible": crop.kit_compatible,
                         }
                     )
+                    # A clearly conflicting number already rejects this raw
+                    # candidate; reserve further calls for independent tracks.
+                    if evaluate_readings(readings, self.target)["status"] == "CONFLICT":
+                        break
                 # A readable back often lasts only a few seconds. Once a digit
                 # is clear, seek independent confirmation nearby rather than
                 # spending the remaining budget on distant front views.

@@ -1,4 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
+# Keep confirmation budget after rejecting already-conflicting shirt reads.
 on:
   push:
     branches: [fix/global-jersey-search-20260926]
