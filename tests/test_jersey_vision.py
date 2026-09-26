@@ -62,7 +62,9 @@ class JerseyVisionTests(unittest.TestCase):
             },
         )
         hints = JerseyVerifier.dense_hints([coarse], 100)
-        self.assertEqual(hints, [{"t": 50.025, "bbox": box}])
+        self.assertEqual(len(hints), 1)
+        self.assertAlmostEqual(hints[0]["t"], 50.025)
+        self.assertEqual(hints[0]["bbox"], box)
         nearby = replace(
             coarse,
             candidate_id="new_id",
