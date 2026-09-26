@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+from collections import Counter
 import subprocess
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1339,16 +1341,17 @@ def _team_color_guard_failure_output(
                 {
                     "raw_status": status_value,
                     "matched_before_guard": bool(
-                        status_value == "MATCHED"
-                        or has_primitive_local_track_id
+                        status_value == "MATCHED" or has_primitive_local_track_id
                     ),
                 }
             )
             diagnostic_matches.append(diagnostic)
     reported_total = finite_number(
-        source.get("anchors_total")
-        if source.get("anchors_total") is not None
-        else source_summary.get("anchors_total"),
+        (
+            source.get("anchors_total")
+            if source.get("anchors_total") is not None
+            else source_summary.get("anchors_total")
+        ),
         minimum=0.0,
         maximum=5.0,
         integer=True,
@@ -1399,16 +1402,12 @@ def _team_color_guard_failure_output(
     )
     raw_selections = source_anchor_inputs.get("selections")
     anchor_inputs = {
-        "player_ref": sanitized_anchor_input(
-            source_anchor_inputs.get("player_ref")
-        ),
+        "player_ref": sanitized_anchor_input(source_anchor_inputs.get("player_ref")),
         "selections": [
             sanitized
             for sanitized in (
                 sanitized_anchor_input(item)
-                for item in (
-                    raw_selections if isinstance(raw_selections, list) else []
-                )
+                for item in (raw_selections if isinstance(raw_selections, list) else [])
             )
             if sanitized
         ],
@@ -1452,6 +1451,70 @@ def _team_color_guard_failure_output(
         "anchor_matches": diagnostic_matches,
         "anchors_used": anchor_inputs,
         "anchor_acquisition": sanitized_acquisition,
+    }
+
+    # Retain bounded scalar diagnostics before discarding unverified identities.
+    # No boxes, URLs, candidate IDs, or identity claims enter this diagnostic view.
+    rejection_counts: Counter[str] = Counter()
+    diagnostic_windows = []
+    diagnostic_segments = source.get("segments")
+    diagnostic_segments = (
+        diagnostic_segments if isinstance(diagnostic_segments, list) else []
+    )
+    for raw in diagnostic_segments[:200]:
+        if not isinstance(raw, Mapping):
+            continue
+        reid = raw.get("reid") if isinstance(raw.get("reid"), Mapping) else {}
+        codes = [
+            str(code)
+            for code in (
+                reid.get("reason_codes")
+                if isinstance(reid.get("reason_codes"), (list, tuple))
+                else []
+            )[:20]
+            if re.fullmatch(r"[A-Z0-9_]{1,80}", str(code))
+            and "ACCEPTED" not in str(code)
+            and str(code) not in {"SUCCEEDED", "VALIDATED"}
+        ]
+        rejection_counts.update(codes)
+        diagnostic_windows.append(
+            {
+                "window_index": finite_number(
+                    raw.get("window_index"), minimum=0, maximum=100000, integer=True
+                ),
+                "reason_codes": codes,
+                "best_score": finite_number(
+                    reid.get("best_score"), minimum=0, maximum=1
+                ),
+                "margin": finite_number(reid.get("margin"), minimum=0, maximum=1),
+            }
+        )
+    jersey_source = source_summary.get("jersey_vision")
+    jersey_source = jersey_source if isinstance(jersey_source, Mapping) else {}
+    jersey_diagnostics = {
+        key: finite_number(jersey_source.get(key), minimum=0, maximum=1000000000)
+        for key in (
+            "calls",
+            "errors",
+            "cache_hits",
+            "legible_readings",
+            "total_tokens",
+            "elapsed_seconds",
+            "target_number",
+        )
+        if key in jersey_source
+    }
+    anchor_reading = jersey_source.get("anchor_reading")
+    if isinstance(anchor_reading, Mapping):
+        jersey_diagnostics["anchor_number"] = finite_number(
+            anchor_reading.get("number"), minimum=0, maximum=99, integer=True
+        )
+    reid_diagnostics = {
+        "diagnostic_only": True,
+        "validated": False,
+        "reason_counts": dict(rejection_counts),
+        "windows": diagnostic_windows,
+        "jersey_vision": jersey_diagnostics,
     }
 
     raw_segments = source.get("segments")
@@ -1579,6 +1642,7 @@ def _team_color_guard_failure_output(
         "anchors_used": {},
         "anchor_acquisition": {},
         "pre_guard_anchor_diagnostics": anchor_diagnostics,
+        "pre_guard_reid_diagnostics": reid_diagnostics,
         "tracking_success": False,
         "partial": False,
         "partial_reason": None,
@@ -1592,6 +1656,7 @@ def _team_color_guard_failure_output(
             "anchors_matched": 0,
             "anchor_matches": [],
             "pre_guard_anchor_diagnostics": anchor_diagnostics,
+            "pre_guard_reid_diagnostics": reid_diagnostics,
             "autonomous_segments_with_player": 0,
             "autonomous_bboxes_count": 0,
             "tracking_scope_status": "EMPTY",

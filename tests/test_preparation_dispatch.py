@@ -198,6 +198,7 @@ class PreparationDispatchTests(unittest.TestCase):
                     ),
                     "_build_candidates_error_detail": str,
                     "_cleanup_workdir": Mock(),
+                    "cleanup_tracking_workspace": Mock(),
                     "get_s3_client": Mock(),
                     "ensure_bucket_exists": Mock(),
                     "_safe_namespace_component": lambda value, **_: value,
@@ -222,6 +223,8 @@ class PreparationDispatchTests(unittest.TestCase):
                 self.assertEqual(job.failure_reason, "candidates_generation_failed")
                 self.assertTrue(can_retry_preparation(job))
                 task.retry.assert_not_called()
+                if missing_frames:
+                    ns["cleanup_tracking_workspace"].assert_called_once_with("one", None)
 
 
 if __name__ == "__main__":

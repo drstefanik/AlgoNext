@@ -12,6 +12,8 @@ import cv2
 from ultralytics import YOLO
 
 from app.core.tracking_outcome import StaleAnalysisAttemptError
+from app.core.workspace import InsufficientWorkspaceError, require_free_space
+from app.reid.jersey_vision import JerseyVerifier
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
     configured_descriptor_version,
@@ -585,18 +587,13 @@ def _stitch_manual_anchor_bboxes(
                 bbox
                 for bbox in candidates
                 if lower <= float(bbox.get("t") or 0.0)
-                and (
-                    float(bbox.get("t") or 0.0) < upper
-                    or index == len(ordered) - 1
-                )
+                and (float(bbox.get("t") or 0.0) < upper or index == len(ordered) - 1)
             ]
             if not owned and candidates:
                 owned = [
                     min(
                         candidates,
-                        key=lambda bbox: abs(
-                            float(bbox.get("t") or 0.0) - anchor_time
-                        ),
+                        key=lambda bbox: abs(float(bbox.get("t") or 0.0) - anchor_time),
                     )
                 ]
             for bbox in owned:
@@ -620,9 +617,7 @@ def _stitch_manual_anchor_bboxes(
     # manual selection. Preserve the nearest raw detector observation for each
     # matched anchor so the post-hoc geometry guard attests the tracker match
     # rather than a lagged visualization box.
-    raw_anchor_samples: dict[
-        float, tuple[float, int, dict[str, Any]]
-    ] = {}
+    raw_anchor_samples: dict[float, tuple[float, int, dict[str, Any]]] = {}
     for observation in ordered:
         anchor = observation["anchor"]
         key = (int(observation["track_id"]), int(anchor["anchor_id"]))
@@ -631,9 +626,7 @@ def _stitch_manual_anchor_bboxes(
             continue
         nearest = min(
             candidates,
-            key=lambda bbox: abs(
-                float(bbox.get("t") or 0.0) - float(anchor["t"])
-            ),
+            key=lambda bbox: abs(float(bbox.get("t") or 0.0) - float(anchor["t"])),
         )
         time_key = round(float(nearest.get("t") or 0.0), 6)
         ranked = (
@@ -645,8 +638,7 @@ def _stitch_manual_anchor_bboxes(
         if previous is None or ranked[:2] < previous[:2]:
             raw_anchor_samples[time_key] = ranked
     stitched_by_time = {
-        round(float(bbox.get("t") or 0.0), 6): dict(bbox)
-        for bbox in stitched
+        round(float(bbox.get("t") or 0.0), 6): dict(bbox) for bbox in stitched
     }
     for time_key, (_distance, _anchor_id, bbox) in raw_anchor_samples.items():
         stitched_by_time[time_key] = bbox
@@ -731,9 +723,7 @@ def _overlap_linked_detections(
             else ("time", round(float(detection.get("t") or 0.0), 6))
         )
         for previous_key, previous_bbox in previous_by_key.items():
-            time_delta = abs(
-                float(previous_bbox.get("t") or 0.0) - absolute_time
-            )
+            time_delta = abs(float(previous_bbox.get("t") or 0.0) - absolute_time)
             overlap_iou = bbox_iou(previous_bbox, bbox)
             if time_delta > tolerance_sec or overlap_iou < minimum_iou:
                 continue
@@ -959,8 +949,7 @@ def _absolute_link_bboxes(
             "conf": float(detection.get("conf") or 0.0),
         }
         for detection in detections
-        if isinstance(detection.get("bbox"), Mapping)
-        and detection.get("t") is not None
+        if isinstance(detection.get("bbox"), Mapping) and detection.get("t") is not None
     ]
 
 
@@ -1001,9 +990,7 @@ def _build_candidate_profiles(
             item for item in raw_detections if isinstance(item, Mapping)
         ]
         for raw_track_id, raw_detections in track_map.items()
-        if len(
-            [item for item in raw_detections if isinstance(item, Mapping)]
-        )
+        if len([item for item in raw_detections if isinstance(item, Mapping)])
         >= minimum_overlap_samples
     }
     overlap_by_track = {
@@ -1182,9 +1169,7 @@ def _build_candidate_profiles(
                     "overlap_previous_samples": len(
                         {
                             tuple(item["_overlap_previous_key"])
-                            for item in (
-                                overlap_links_by_track.get(track_id) or []
-                            )
+                            for item in (overlap_links_by_track.get(track_id) or [])
                             if isinstance(
                                 item.get("_overlap_previous_key"),
                                 (list, tuple),
@@ -1409,6 +1394,7 @@ def track_player_windowed_reid(
     selections: list[dict[str, Any]],
     *,
     analysis_attempt_id: str | None = None,
+    jersey_target_number: int | None = None,
     video_duration_sec: float,
     window_sec: float = 45.0,
     overlap_sec: float = 10.0,
@@ -1520,6 +1506,9 @@ def track_player_windowed_reid(
         key=lambda item: _anchor_distance(item, player_ref_norm),
     )
     primary_anchor_id = int(primary_anchor["anchor_id"])
+    jersey_verifier = JerseyVerifier(
+        jersey_target_number, input_video_path, player_ref_norm
+    )
     thresholds = _association_thresholds()
     anchor_tracklet_radius = _env_float(
         "PLAYER_REID_MANUAL_ANCHOR_RADIUS_SEC",
@@ -1576,6 +1565,7 @@ def track_player_windowed_reid(
             return cached
         window_start, window_end = windows[index]
         segment_path = windows_dir / f"window_{index + 1:04d}.mp4"
+        require_free_space(windows_dir)
         is_anchor_window = index in anchors_by_window
         legacy._extract_segment(
             input_video_path,
@@ -1792,7 +1782,11 @@ def track_player_windowed_reid(
                 seed_track_map,
                 seed_sample_fps,
             ) = collect(seed_window_index)
-        except (legacy.TrackingTimeoutError, StaleAnalysisAttemptError):
+        except (
+            legacy.TrackingTimeoutError,
+            StaleAnalysisAttemptError,
+            InsufficientWorkspaceError,
+        ):
             raise
         except Exception:
             acquisition_errors += 1
@@ -1989,7 +1983,11 @@ def track_player_windowed_reid(
                     )
                 else:
                     segment_path, samples, track_map, sample_fps = collect(root_index)
-            except (legacy.TrackingTimeoutError, StaleAnalysisAttemptError):
+            except (
+                legacy.TrackingTimeoutError,
+                StaleAnalysisAttemptError,
+                InsufficientWorkspaceError,
+            ):
                 raise
             except Exception:
                 logger.exception(
@@ -2048,11 +2046,7 @@ def track_player_windowed_reid(
                 window_start=window_start,
                 radius_sec=anchor_tracklet_radius,
             )
-            if (
-                not manual_bboxes
-                or not manual_link_bboxes
-                or not manual_track_ids
-            ):
+            if not manual_bboxes or not manual_link_bboxes or not manual_track_ids:
                 for observation in manual_observations:
                     anchor_id = int(observation["anchor"]["anchor_id"])
                     match = anchor_matches_by_id.get(anchor_id)
@@ -2186,9 +2180,7 @@ def track_player_windowed_reid(
         def nearest_manual_roots(index: int) -> tuple[int, ...]:
             minimum_distance = min(abs(index - root) for root in root_indices)
             return tuple(
-                root
-                for root in root_indices
-                if abs(index - root) == minimum_distance
+                root for root in root_indices if abs(index - root) == minimum_distance
             )
 
         frontier: list[dict[str, Any]] = []
@@ -2293,9 +2285,7 @@ def track_player_windowed_reid(
         ) -> bool:
             first_links = first.get("_continuity_link_bboxes")
             second_links = second.get("_continuity_link_bboxes")
-            if not isinstance(first_links, list) or not isinstance(
-                second_links, list
-            ):
+            if not isinstance(first_links, list) or not isinstance(second_links, list):
                 return False
             tolerance = _env_float(
                 "PLAYER_REID_OVERLAP_TOLERANCE_SEC",
@@ -2333,9 +2323,7 @@ def track_player_windowed_reid(
             used_first: set[int] = set()
             used_second: set[int] = set()
             matched_ious: list[float] = []
-            for _time_delta, negative_iou, first_index, second_index in sorted(
-                pairs
-            ):
+            for _time_delta, negative_iou, first_index, second_index in sorted(pairs):
                 if first_index in used_first or second_index in used_second:
                     continue
                 used_first.add(first_index)
@@ -2355,10 +2343,7 @@ def track_player_windowed_reid(
             distance: int,
             link_bboxes: Sequence[Mapping[str, Any]],
         ) -> None:
-            if (
-                0 <= index < len(windows)
-                and root_index in nearest_manual_roots(index)
-            ):
+            if 0 <= index < len(windows) and root_index in nearest_manual_roots(index):
                 frontier.append(
                     {
                         "root_index": int(root_index),
@@ -2413,7 +2398,11 @@ def track_player_windowed_reid(
             window_start, window_end = windows[index]
             try:
                 segment_path, samples, track_map, sample_fps = collect(index)
-            except (legacy.TrackingTimeoutError, StaleAnalysisAttemptError):
+            except (
+                legacy.TrackingTimeoutError,
+                StaleAnalysisAttemptError,
+                InsufficientWorkspaceError,
+            ):
                 raise
             except Exception:
                 logger.exception(
@@ -2448,6 +2437,7 @@ def track_player_windowed_reid(
                 fps=sample_fps,
                 strong_overlap_score=thresholds.strong_overlap_score,
             )
+            candidates = jersey_verifier.enrich(segment_path, candidates, window_start)
             decision = associate_identity(
                 base_profile,
                 candidates,
@@ -2523,6 +2513,16 @@ def track_player_windowed_reid(
                 segment_identity_id = None
             coverage = len(bboxes) / float(max(1, len(samples))) * 100.0
             reid_payload = decision.to_payload()
+            logger.info(
+                "ReID association job_id=%s attempt_id=%s window=%s status=%s reasons=%s best=%.3f margin=%.3f",
+                job_id,
+                analysis_attempt_id,
+                index,
+                decision.status,
+                ",".join(decision.reason_codes),
+                decision.best_score,
+                decision.margin,
+            )
             reid_payload.update(
                 {
                     "identity_id": identity_id,
@@ -2562,9 +2562,7 @@ def track_player_windowed_reid(
                         and isinstance(detection.get("bbox"), Mapping)
                     },
                 },
-                "_continuity_link_bboxes": [
-                    dict(bbox) for bbox in next_link_bboxes
-                ],
+                "_continuity_link_bboxes": [dict(bbox) for bbox in next_link_bboxes],
             }
             association_proposals.setdefault(index, {})[
                 int(state["root_index"])
@@ -2573,8 +2571,7 @@ def track_player_windowed_reid(
             segments_by_index[index] = resolved_segment
             if (
                 identity_status == "ACCEPTED"
-                and str(resolved_segment.get("identity_status") or "")
-                == "ACCEPTED"
+                and str(resolved_segment.get("identity_status") or "") == "ACCEPTED"
                 and str(resolved_segment.get("selected_track_id"))
                 == str(selected_track_id)
             ):
@@ -2622,9 +2619,7 @@ def track_player_windowed_reid(
                 or str(right_segment.get("identity_status") or "") != "ACCEPTED"
             ):
                 continue
-            left_proposal = association_proposals.get(left_index, {}).get(
-                left_roots[0]
-            )
+            left_proposal = association_proposals.get(left_index, {}).get(left_roots[0])
             right_proposal = association_proposals.get(right_index, {}).get(
                 right_roots[0]
             )
@@ -2669,7 +2664,11 @@ def track_player_windowed_reid(
                 parent_window_index = index - 1
             try:
                 collect(index)
-            except (legacy.TrackingTimeoutError, StaleAnalysisAttemptError):
+            except (
+                legacy.TrackingTimeoutError,
+                StaleAnalysisAttemptError,
+                InsufficientWorkspaceError,
+            ):
                 raise
             except Exception:
                 logger.exception(
@@ -2691,9 +2690,7 @@ def track_player_windowed_reid(
                 reason_code=reason_code,
                 identity_id=identity_id,
             )
-            segments_by_index[index][
-                "continuity_root_window_index"
-            ] = assigned_root
+            segments_by_index[index]["continuity_root_window_index"] = assigned_root
             processed = len(window_cache)
             if processed % 5 == 0 or processed == len(windows):
                 pct = 10 + int((processed / float(len(windows))) * 30)
@@ -2703,7 +2700,11 @@ def track_player_windowed_reid(
                     "Tracking player with experimental ReID",
                     analysis_attempt_id=analysis_attempt_id,
                 )
-    except (legacy.TrackingTimeoutError, StaleAnalysisAttemptError):
+    except (
+        legacy.TrackingTimeoutError,
+        StaleAnalysisAttemptError,
+        InsufficientWorkspaceError,
+    ):
         raise
     except Exception:
         logger.exception(
@@ -2897,6 +2898,7 @@ def track_player_windowed_reid(
         },
         "reid_summary": {
             "status": "EXPERIMENTAL",
+            "jersey_vision": jersey_verifier.summary(),
             "validated": False,
             "identity_id": identity_id,
             "descriptor_version": configured_descriptor_version(),

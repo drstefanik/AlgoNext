@@ -164,6 +164,7 @@ class CandidateScore:
     descriptor_quality: float | None
     descriptor_samples: int
     reason_codes: tuple[str, ...]
+    jersey_evidence: Mapping[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -189,6 +190,9 @@ class CandidateScore:
             ),
             "descriptor_samples": self.descriptor_samples,
             "reason_codes": list(self.reason_codes),
+            "jersey_evidence": (
+                dict(self.jersey_evidence) if self.jersey_evidence else None
+            ),
         }
 
 
@@ -281,6 +285,9 @@ def _score_candidate(
     thresholds: AssociationThresholds,
 ) -> CandidateScore:
     reasons: list[str] = []
+    jersey = (candidate.metadata or {}).get("jersey_evidence")
+    if isinstance(jersey, Mapping) and jersey.get("status") == "CONFLICT":
+        reasons.append("JERSEY_NUMBER_CONFLICT")
     descriptor = candidate.descriptor
     appearance: float | None = None
     descriptor_quality: float | None = None
@@ -334,6 +341,7 @@ def _score_candidate(
         descriptor_quality=descriptor_quality,
         descriptor_samples=descriptor_samples,
         reason_codes=tuple(dict.fromkeys(reasons)),
+        jersey_evidence=jersey if isinstance(jersey, Mapping) else None,
     )
 
 
@@ -367,11 +375,7 @@ def _verified_physical_continuity(
         previous_samples = int(metadata.get("overlap_previous_samples") or 0)
     except (TypeError, ValueError):
         return False
-    if (
-        linked_samples < 2
-        or previous_samples < 2
-        or candidate.detection_count < 2
-    ):
+    if linked_samples < 2 or previous_samples < 2 or candidate.detection_count < 2:
         return False
     raw_indices = metadata.get("tracklet_sample_indices")
     if not isinstance(raw_indices, (list, tuple)):
@@ -448,9 +452,7 @@ def associate_identity(
         unique_strong_overlap and physical_only_reasons.intersection(reasons)
     )
     if unique_strong_overlap:
-        reasons = [
-            reason for reason in reasons if reason not in physical_only_reasons
-        ]
+        reasons = [reason for reason in reasons if reason not in physical_only_reasons]
     if (
         thresholds.require_strong_overlap
         and (best.overlap_score or 0.0) >= thresholds.strong_overlap_score
@@ -461,6 +463,7 @@ def associate_identity(
         reasons.append("AMBIGUOUS_CANDIDATE_MARGIN")
 
     hard_failures = {
+        "JERSEY_NUMBER_CONFLICT",
         "MISSING_APPEARANCE_DESCRIPTOR",
         "DESCRIPTOR_VERSION_MISMATCH",
         "LOW_DESCRIPTOR_QUALITY",
@@ -475,6 +478,12 @@ def associate_identity(
     if accepted:
         accepted_reasons = [
             "ASSOCIATION_ACCEPTED",
+            *(
+                ["JERSEY_NUMBER_CORROBORATED"]
+                if best.jersey_evidence
+                and best.jersey_evidence.get("status") == "MATCH"
+                else []
+            ),
             *(["STRONG_TEMPORAL_OVERLAP"] if unique_strong_overlap else []),
             *(["PHYSICAL_CONTINUITY_ONLY"] if used_physical_only_path else []),
         ]

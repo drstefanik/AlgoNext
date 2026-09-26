@@ -5,6 +5,8 @@ on:
     paths:
       - "app/reid/**"
       - "app/core/preview_asset_policy.py"
+      - "app/core/workspace.py"
+      - "tests/test_jersey_vision.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "docker-compose.yml"
@@ -27,6 +29,8 @@ on:
     paths:
       - "app/reid/**"
       - "app/core/preview_asset_policy.py"
+      - "app/core/workspace.py"
+      - "tests/test_jersey_vision.py"
       - "app/workers/pipeline.py"
       - "app/workers/tracking.py"
       - "docker-compose.yml"
@@ -63,6 +67,7 @@ jobs:
       - name: Install ReID test dependencies
         run: >-
           python -m pip install
+          requests==2.32.5
           numpy==1.26.4
           opencv-python-headless==4.10.0.84
 
@@ -86,6 +91,7 @@ jobs:
           app/vision/match_observations.py
           tests/test_reid_appearance.py
           tests/test_match_observations.py
+          tests/test_jersey_vision.py
           tests/test_reid_association.py
           tests/test_reid_benchmark_evidence.py
           tests/test_reid_team_color_guard.py
@@ -102,6 +108,7 @@ jobs:
           python -m unittest
           tests/test_reid_appearance.py
           tests/test_match_observations.py
+          tests/test_jersey_vision.py
           tests/test_reid_association.py
           tests/test_reid_benchmark_evidence.py
           tests/test_reid_team_color_guard.py
