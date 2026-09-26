@@ -464,7 +464,14 @@ def nearby_confirmation_detections(
     for detection in ranked:
         absolute_time = window_start + float(detection["t"])
         distance = min(abs(absolute_time - t) for t in positive_times)
-        if distance > 3.0 or any(abs(absolute_time - t) < 0.6 for t in used_times):
+        # A fresh frame needs separation from at least one positive read.
+        # Requiring separation from every cached read leaves no frame between
+        # two batch positives on a short three-FPS fragment.
+        if (
+            distance > 3.0
+            or any(abs(absolute_time - t) <= 0.05 for t in used_times)
+            or not any(abs(absolute_time - t) >= 0.6 for t in positive_times)
+        ):
             continue
         selected.append(detection)
         used_times.append(absolute_time)

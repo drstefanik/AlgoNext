@@ -577,7 +577,41 @@ class JerseyVisionTests(unittest.TestCase):
         selected = nearby_confirmation_detections(
             detections, [112.002], [112.002, 100, 130], 100
         )
-        self.assertEqual({d["t"] for d in selected}, {10.2, 11.001, 13.003, 14.004})
+        self.assertEqual(len(selected), 4)
+        self.assertEqual(len({d["t"] for d in selected}), 4)
+        for detection in selected:
+            gap = abs(100 + detection["t"] - 112.002)
+            self.assertGreaterEqual(gap, 0.6)
+            self.assertLessEqual(gap, 3.0)
+
+    def test_short_fragment_can_confirm_between_two_same_batch_readings(self):
+        from app.reid.association import independent_jersey_reads
+
+        detections = [{"t": t} for t in (0.0, 1 / 3, 2 / 3, 1.0)]
+        selected = nearby_confirmation_detections(detections, [0.0, 1.0], [0.0, 1.0], 0)
+        self.assertEqual({d["t"] for d in selected}, {1 / 3, 2 / 3})
+        cached = [
+            {"time_sec": t, "image_sha256": str(i) * 64, "request_id": "batch"}
+            for i, t in enumerate((0.0, 1.0))
+        ]
+        self.assertFalse(independent_jersey_reads(cached))
+        for detection in selected:
+            self.assertTrue(
+                independent_jersey_reads(
+                    [
+                        *cached,
+                        {
+                            "time_sec": detection["t"],
+                            "image_sha256": "f" * 64,
+                            "request_id": "fresh",
+                        },
+                    ]
+                )
+            )
+        self.assertEqual(
+            nearby_confirmation_detections([{"t": 0.1}, {"t": 0.2}], [0.0], [0.0], 0),
+            [],
+        )
 
     def jersey_candidate(self, *, vector=(1, 0), evidence_changes=None):
         readings = [
