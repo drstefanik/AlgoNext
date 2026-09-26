@@ -5,6 +5,7 @@ import os
 from typing import Any, Callable
 
 from app.core.tracking_outcome import StaleAnalysisAttemptError
+from app.core.workspace import InsufficientWorkspaceError, cleanup_tracking_workspace
 from app.reid.full_match_runtime import (
     budget_full_match_kwargs,
     install_progress_adapter,
@@ -98,6 +99,7 @@ def install_windowed_reid(
     timeout_error = getattr(tracking_module, "TrackingTimeoutError", None)
 
     def patched(*args: Any, **kwargs: Any) -> Any:
+        jersey_target_number = kwargs.pop("jersey_target_number", None)
         effective_kwargs, profile = budget_full_match_kwargs(kwargs)
         raw_job_id = args[0] if args else None
         job_id = str(raw_job_id) if raw_job_id is not None else None
@@ -143,6 +145,11 @@ def install_windowed_reid(
                 output = implementation(
                     *args,
                     fallback=original,
+                    **(
+                        {"jersey_target_number": jersey_target_number}
+                        if jersey_target_number is not None
+                        else {}
+                    ),
                     **effective_kwargs,
                 )
                 return _decorate_output(output, profile)
@@ -164,7 +171,9 @@ def install_windowed_reid(
                         reid_was_active=True,
                     )
 
-                if isinstance(exc, StaleAnalysisAttemptError):
+                if isinstance(
+                    exc, (StaleAnalysisAttemptError, InsufficientWorkspaceError)
+                ):
                     raise
                 logger.exception("Experimental Player ReID failed")
                 if not fail_open_enabled():
@@ -196,6 +205,8 @@ def install_windowed_reid(
                 )
             raise
         finally:
+            if job_id:
+                cleanup_tracking_workspace(job_id, analysis_attempt_id)
             end_full_match_progress(
                 job_id,
                 analysis_attempt_id=analysis_attempt_id,

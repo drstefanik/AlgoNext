@@ -1,0 +1,37 @@
+name: Jersey OCR bounded production canary
+on:
+  push:
+    branches: [feat/jersey-vision-storage-20260926]
+    paths: [".github/workflows/jersey-canary.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Test OCR on saved player crop and reclaim terminal window cache
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/AlgoNext
+            git fetch origin feat/jersey-vision-storage-20260926
+            test "$(git rev-parse FETCH_HEAD)" = "${{ github.sha }}"
+            tmp_dir=$(mktemp -d /tmp/algonext-jersey-canary.XXXXXX)
+            trap 'rm -rf "$tmp_dir"' EXIT
+            worker_id=$(docker compose ps -q worker)
+            test -n "$worker_id"
+            git show FETCH_HEAD:app/reid/jersey_vision.py > "$tmp_dir/jersey_vision.py"
+            git show FETCH_HEAD:scripts/jersey_vision_canary.py > "$tmp_dir/jersey_vision_canary.py"
+            git show FETCH_HEAD:scripts/cleanup_terminal_tracking_windows.py > "$tmp_dir/cleanup_terminal_tracking_windows.py"
+            docker cp "$tmp_dir/." "$worker_id:/tmp/algonext-jersey-canary"
+            docker compose exec -T worker env PYTHONPATH=/app python /tmp/algonext-jersey-canary/cleanup_terminal_tracking_windows.py
+            docker compose exec -T worker env PYTHONPATH=/app python /tmp/algonext-jersey-canary/jersey_vision_canary.py /tmp/algonext-jersey-canary/jersey_vision.py
+            docker compose exec -T worker rm -rf /tmp/algonext-jersey-canary
+            df -h /

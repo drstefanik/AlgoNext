@@ -48,6 +48,8 @@ from app.workers.tracking import (
 )
 from app.workers.multi_anchor import compute_tracking_window, normalize_anchors
 
+from app.core.workspace import InsufficientWorkspaceError, cleanup_tracking_workspace
+
 logger = logging.getLogger(__name__)
 
 PITCH_LENGTH_M = 105.0
@@ -1121,7 +1123,10 @@ def download_video(
     bucket: str,
     progress_callback: Optional[Callable[[], None]] = None,
 ) -> None:
+    from app.core.workspace import require_free_space
+
     dst_path.parent.mkdir(parents=True, exist_ok=True)
+    require_free_space(dst_path.parent)
     last_progress_tick = time.monotonic()
     progress_tick_seconds = 5
 
@@ -1160,9 +1165,15 @@ def download_video(
             headers={"User-Agent": "AlgoNextWorker/1.0"},
         ) as r:
             r.raise_for_status()
+            try:
+                expected_bytes = int(r.headers.get("Content-Length") or 0)
+            except (ValueError, AttributeError):
+                expected_bytes = 0
+            require_free_space(dst_path.parent, incoming_bytes=expected_bytes)
             with open(dst_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
+                        require_free_space(dst_path.parent, incoming_bytes=len(chunk))
                         f.write(chunk)
                         bytes_downloaded += len(chunk)
 
@@ -1190,6 +1201,7 @@ def download_video(
 
     def _tick(_: int) -> None:
         nonlocal last_progress_tick
+        require_free_space(dst_path.parent)
         if progress_callback is None:
             return
         now = time.monotonic()
@@ -1197,7 +1209,7 @@ def download_video(
             last_progress_tick = now
             progress_callback()
 
-    callback = _tick if progress_callback is not None else None
+    callback = _tick
     s3_client.download_file(
         Bucket=bucket,
         Key=object_key,
@@ -2381,6 +2393,8 @@ def extract_preview_frames(
             db.rollback()
     finally:
         _cleanup_workdir(base_dir)
+        if base_dir is not None:
+            cleanup_tracking_workspace(job_id, analysis_attempt_id)
         db.close()
 
 
@@ -2419,12 +2433,20 @@ def kickoff_job(
             # Only the untouched initial phase is ours. An ambiguous publish
             # must not overwrite an already-running preview or newer attempt.
             update_preanalysis_job(
-                db, job_id, analysis_attempt_id,
+                db,
+                job_id,
+                analysis_attempt_id,
                 lambda job: (
                     setattr(job, "status", "FAILED"),
                     setattr(job, "failure_reason", "PREPARATION_ENQUEUE_FAILED"),
-                    setattr(job, "error", "Unable to queue video preparation. Retry this job."),
-                    set_progress(job, "PREVIEWS_FAILED", 0, "Preparation enqueue failed"),
+                    setattr(
+                        job,
+                        "error",
+                        "Unable to queue video preparation. Retry this job.",
+                    ),
+                    set_progress(
+                        job, "PREVIEWS_FAILED", 0, "Preparation enqueue failed"
+                    ),
                 ),
                 allowed_progress_steps=frozenset({"CREATED"}),
             )
@@ -2968,7 +2990,9 @@ def extract_candidates(
             )
             job.status = "FAILED"
             job.failure_reason = "candidates_generation_failed"
-            job.error = "Player detection failed. Retry preparation with the saved video."
+            job.error = (
+                "Player detection failed. Retry preparation with the saved video."
+            )
             set_progress(job, "CANDIDATES_FAILED", 20, "Player detection failed")
 
         try:
@@ -2989,6 +3013,8 @@ def extract_candidates(
         }
     finally:
         _cleanup_workdir(base_dir)
+        if base_dir is not None:
+            cleanup_tracking_workspace(job_id, analysis_attempt_id)
         db.close()
 
 
@@ -3518,6 +3544,7 @@ def run_analysis(
                 fps=5,
                 max_windows=max_windows,
                 analysis_attempt_id=analysis_attempt_id,
+                jersey_target_number=(target.get("player") or {}).get("shirt_number"),
             )
         else:
             tracking_output = track_player(
@@ -4116,6 +4143,21 @@ def run_analysis(
         except Exception:
             db.rollback()
         return
+    except InsufficientWorkspaceError as e:
+        try:
+            update_current_attempt(
+                db,
+                job_id,
+                lambda job: (
+                    setattr(job, "status", "FAILED"),
+                    setattr(job, "failure_reason", "INSUFFICIENT_WORKSPACE"),
+                    setattr(job, "error", str(e)),
+                    set_progress(job, "FAILED", 100, str(e)),
+                ),
+            )
+        except Exception:
+            db.rollback()
+        return
     except AnalysisError as e:
         try:
             update_current_attempt(
@@ -4155,4 +4197,6 @@ def run_analysis(
         return
     finally:
         _cleanup_workdir(base_dir)
+        if base_dir is not None:
+            cleanup_tracking_workspace(job_id, analysis_attempt_id)
         db.close()
