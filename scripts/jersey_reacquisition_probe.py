@@ -17,6 +17,64 @@ for short in ("association", "jersey_vision", "windowed_tracking"):
 
 tracking = sys.modules["app.reid.windowed_tracking"]
 from app.reid.team_color_guard import apply_team_color_guard
+from app.reid.appearance import crop_from_normalized_bbox, evaluate_crop_quality
+from app.reid.team_color_guard import extract_kit_color_signature, signatures_compatible
+import cv2
+
+neighbor_diagnostics = []
+verifier_class = sys.modules["app.reid.jersey_vision"].JerseyVerifier
+original_enrich = verifier_class.enrich
+
+
+def diagnostic_enrich(self, path, candidates, start, **kwargs):
+    enriched = original_enrich(self, path, candidates, start, **kwargs)
+    cap = cv2.VideoCapture(str(path))
+    try:
+        for candidate in enriched:
+            metadata = candidate.metadata or {}
+            for reading in metadata.get("jersey_evidence", {}).get("readings", []):
+                if reading.get("number") != 8 or reading.get("legible") is not True:
+                    continue
+                items = []
+                for detection in metadata.get("tracklet_detections", []):
+                    t = float(detection["t"])
+                    if abs(start + t - reading["time_sec"]) > 4:
+                        continue
+                    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                    ok, frame = cap.read()
+                    if not ok:
+                        continue
+                    crop = crop_from_normalized_bbox(frame, detection["bbox"])
+                    quality = evaluate_crop_quality(crop)
+                    signature = extract_kit_color_signature(crop)
+                    items.append(
+                        {
+                            "t": start + t,
+                            "sample": detection.get("sample_index"),
+                            "width": quality.width,
+                            "height": quality.height,
+                            "sharpness": quality.sharpness,
+                            "kit": (
+                                signatures_compatible(self.anchor_signature, signature)
+                                if signature
+                                else None
+                            ),
+                        }
+                    )
+                neighbor_diagnostics.append(
+                    {
+                        "window": start,
+                        "candidate": candidate.candidate_id,
+                        "tracklet_size": len(metadata.get("tracklet_detections", [])),
+                        "nearby": items,
+                    }
+                )
+    finally:
+        cap.release()
+    return enriched
+
+
+verifier_class.enrich = diagnostic_enrich
 
 job_id = "796f8c0f-94cd-4d2d-b8b1-a0f6ee5a5b60"
 attempt = "92f4305d-adb7-44b7-ba63-fe629bbc92f8"
@@ -82,6 +140,7 @@ try:
         "guarded_status": guarded.get("tracking_status"),
         "jersey": result.get("reid_summary", {}).get("jersey_vision"),
         "windows": [],
+        "neighbor_diagnostics": neighbor_diagnostics,
     }
     for segment in result.get("segments", []):
         reid = segment.get("reid", {})

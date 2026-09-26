@@ -90,7 +90,10 @@ class JerseyVisionTests(unittest.TestCase):
         changes = [
             {"anchor_legible": False},
             {"anchor_number": 6},
+            {"anchor_number": True},
             {"component_match_samples": 1},
+            {"component_match_samples": "invalid"},
+            {"readings": {"not": "an array"}},
         ]
         for field, value in [
             ("image_sha256", "a" * 64),

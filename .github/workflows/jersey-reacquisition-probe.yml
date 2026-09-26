@@ -1,5 +1,6 @@
 name: Probe jersey reacquisition on three cached windows
 # Adaptive neighboring-frame confirmation and fractional-fps continuity.
+# Diagnose source crop dimensions and missing nearby detections.
 on:
   push:
     branches: [feat/jersey-reacquisition-20260926]
