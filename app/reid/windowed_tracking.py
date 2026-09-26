@@ -15,7 +15,7 @@ from ultralytics import YOLO
 from app.core.tracking_outcome import StaleAnalysisAttemptError
 from app.core.workspace import InsufficientWorkspaceError, require_free_space
 from app.reid.jersey_vision import JerseyVerifier
-from app.reid.jersey_search import scout_jerseys
+from app.reid.jersey_search import scout_jerseys, trim_kit_component
 from app.reid.appearance import (
     aggregate_appearance_descriptors,
     configured_descriptor_version,
@@ -1143,6 +1143,29 @@ def _build_candidate_profiles(
             scoped_track_map[track_id] = raw_detections
             scope_by_track[track_id] = "FULL_WINDOW"
             effective_overlap_by_track[track_id] = overlap
+            preferred = (
+                JerseyVerifier.preferred_sampling_times(raw_detections, sampling_hints)
+                if sampling_hints
+                else []
+            )
+            if preferred:
+                # A raw ID can be reused after an occlusion. A readable hint
+                # only identifies where to search, not its distant occurrences.
+                components = []
+                for t in preferred:
+                    seed = min(raw_detections, key=lambda d: abs(float(d["t"]) - t))
+                    component = {
+                        _detection_key(d): d
+                        for direction_hint in ("forward", "backward")
+                        for d in _tracklet_detections_from_overlap(
+                            raw_detections, [seed], direction=direction_hint, fps=fps
+                        )
+                    }
+                    components.append(
+                        sorted(component.values(), key=lambda d: float(d["t"]))
+                    )
+                scoped_track_map[track_id] = max(components, key=len)
+                scope_by_track[track_id] = "JERSEY_SEARCH_COMPONENT"
     descriptor_by_track = _extract_descriptors_for_tracks(
         segment_path, scoped_track_map, selected_ids
     )
@@ -1197,7 +1220,9 @@ def _build_candidate_profiles(
     return profiles, id_lookup, descriptor_lookup
 
 
-def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
+def _scope_jersey_candidate(
+    segment_path, candidate, window_start, *, fps=1, anchor_signature=None
+):
     """Keep only the component containing two independent matching shirt reads."""
     from dataclasses import replace
 
@@ -1232,6 +1257,13 @@ def _scope_jersey_candidate(segment_path, candidate, window_start, *, fps=1):
         _detection_key(item): item for part in components for item in part
     }
     component = sorted(component_by_key.values(), key=lambda item: float(item["t"]))
+    if anchor_signature is not None:
+        component = trim_kit_component(
+            segment_path,
+            component,
+            [float(reading["time_sec"]) - window_start for reading in matches],
+            anchor_signature,
+        )
     component_times = [float(item["t"]) for item in component]
     if len(component) < 3 or any(
         not any(
@@ -1666,10 +1698,15 @@ def track_player_windowed_reid(
         sample_fps = max(minimum_fps, anchor_fps if is_anchor_window else fps)
         selected_model = model
         selected_tracker = tracker
-        if is_anchor_window and anchor_detector_model != detector_model:
+        if is_anchor_window and (
+            anchor_detector_model != detector_model or batch_search
+        ):
             if anchor_model is None:
                 anchor_model = YOLO(anchor_detector_model)
             selected_model = anchor_model
+            # persist=True requires an isolated model for the manual tracker.
+            if batch_search:
+                selected_tracker = original_kwargs["tracker"]
         elif minimum_fps > fps and not is_anchor_window:
             # A fresh tracker is required: Ultralytics keeps the existing
             # tracker instance when persist=True. Compensate camera pans in
@@ -2591,14 +2628,36 @@ def track_player_windowed_reid(
                     read_budget = 0
                 else:
                     read_budget = 8 if jersey_search else None
+                if batch_search:
+                    remaining_windows = (
+                        len(windows)
+                        - len(manual_roots)
+                        - len({d["window_index"] for d in search_diagnostics})
+                    )
+                    read_budget = min(
+                        6,
+                        max(
+                            0,
+                            jersey_verifier.reader.max_calls
+                            - jersey_verifier.reader.calls
+                            - remaining_windows,
+                        ),
+                    )
                 candidates = jersey_verifier.enrich(
                     segment_path,
                     candidates,
                     window_start,
                     rescope=lambda path, candidate, start: _scope_jersey_candidate(
-                        path, candidate, start, fps=sample_fps
+                        path,
+                        candidate,
+                        start,
+                        fps=sample_fps,
+                        anchor_signature=(
+                            jersey_verifier.anchor_signature if batch_search else None
+                        ),
                     ),
                     max_calls=read_budget,
+                    hinted_only=batch_search,
                 )
                 descriptor_lookup.update(
                     {

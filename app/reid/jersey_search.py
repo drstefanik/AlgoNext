@@ -11,6 +11,50 @@ from app.reid.team_color_guard import extract_kit_color_signature, signatures_co
 from app.reid.window_logic import choose_descriptor_detections
 
 
+def trim_kit_component(path, detections, seed_times, anchor_signature):
+    """Stop propagation at the first frame that cannot attest the same kit.
+
+    A tracker ID can jump to an opponent while keeping plausible motion. A
+    sampled end-of-segment colour guard misses short switches. Check every
+    observation before emitting a jersey-confirmed component instead.
+    """
+    if not detections or not seed_times:
+        return []
+    ordered = sorted(detections, key=lambda item: float(item["t"]))
+    first = min(
+        range(len(ordered)), key=lambda i: abs(float(ordered[i]["t"]) - min(seed_times))
+    )
+    last = min(
+        range(len(ordered)), key=lambda i: abs(float(ordered[i]["t"]) - max(seed_times))
+    )
+    cap = cv2.VideoCapture(str(path))
+    compatible = {}
+
+    def matches(index):
+        if index not in compatible:
+            detection = ordered[index]
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(detection["t"]) * 1000)
+            ok, frame = cap.read()
+            crop = crop_from_normalized_bbox(frame, detection["bbox"]) if ok else None
+            signature = extract_kit_color_signature(crop)
+            compatible[index] = bool(
+                signature and signatures_compatible(anchor_signature, signature) is True
+            )
+        return compatible[index]
+
+    try:
+        if not all(matches(i) for i in range(first, last + 1)):
+            return []
+        low, high = first, last
+        while low > 0 and matches(low - 1):
+            low -= 1
+        while high + 1 < len(ordered) and matches(high + 1):
+            high += 1
+        return ordered[low : high + 1]
+    finally:
+        cap.release()
+
+
 def scout_jerseys(
     verifier, path, track_map, window_start
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:

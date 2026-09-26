@@ -458,6 +458,22 @@ def _verified_jersey_reacquisition(candidate: CandidateProfile | None) -> bool:
     return independent_jersey_reads(list(matching.values()))
 
 
+def _jersey_tracklets_are_disjoint(profiles: Sequence[CandidateProfile]) -> bool:
+    """Separate moments are fragments; concurrent jersey matches are ambiguous."""
+    ranges = []
+    for profile in profiles:
+        detections = (profile.metadata or {}).get("tracklet_detections") or []
+        try:
+            times = [float(d["t"]) for d in detections]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if len(times) < 3 or not all(math.isfinite(t) for t in times):
+            return False
+        ranges.append((min(times), max(times)))
+    ranges.sort()
+    return all(ranges[i][0] - ranges[i - 1][1] > 0.05 for i in range(1, len(ranges)))
+
+
 def associate_identity(
     identity: IdentityProfile,
     candidates: Iterable[CandidateProfile],
@@ -482,6 +498,13 @@ def associate_identity(
                 ),
                 _verified_jersey_reacquisition(
                     profiles_by_id.get(candidate.candidate_id)
+                ),
+                (
+                    profiles_by_id[candidate.candidate_id].detection_count
+                    if _verified_jersey_reacquisition(
+                        profiles_by_id[candidate.candidate_id]
+                    )
+                    else 0
                 ),
                 candidate.combined_score,
                 candidate.appearance_similarity or 0.0,
@@ -515,12 +538,15 @@ def associate_identity(
             for candidate in scored[1:]
         )
     )
+    verified_jersey_profiles = [
+        p for p in candidate_profiles if _verified_jersey_reacquisition(p)
+    ]
     unique_jersey = bool(
         _verified_jersey_reacquisition(best_profile)
-        and sum(
-            _verified_jersey_reacquisition(profile) for profile in candidate_profiles
+        and (
+            len(verified_jersey_profiles) == 1
+            or _jersey_tracklets_are_disjoint(verified_jersey_profiles)
         )
-        == 1
     )
     physical_only_reasons = {
         "MISSING_APPEARANCE_DESCRIPTOR",

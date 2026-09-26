@@ -147,7 +147,7 @@ try:
         video_duration_sec=6559.339,
         window_sec=60,
         overlap_sec=5,
-        fps=1,
+        fps=3,
         max_windows=len(starts),
     )
     guarded = apply_team_color_guard(
@@ -160,6 +160,14 @@ try:
         "jersey": guarded.get("reid_summary", {}).get("jersey_vision"),
         "identity_search": guarded.get("reid_summary", {}).get("identity_search"),
         "batch_search": guarded.get("reid_summary", {}).get("jersey_search_windows"),
+        "kit_guard": guarded.get("reid_summary", {}).get("team_color_guard"),
+        "observed_seconds": round(
+            sum(
+                len(s.get("bboxes", [])) / max(1, s.get("sample_fps", 1))
+                for s in segments
+            ),
+            3,
+        ),
         "windows": [
             {
                 "start": s["window_start"],

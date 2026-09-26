@@ -29,6 +29,34 @@ from app.reid.jersey_vision import (
 
 
 class JerseyVisionTests(unittest.TestCase):
+    def test_kit_component_stops_at_unknown_or_opponent_without_rejoining(self):
+        from app.reid.jersey_search import trim_kit_component
+        from unittest.mock import MagicMock
+
+        detections = [{"t": i, "bbox": {}} for i in range(6)]
+        for boundary in (False, None):
+            cap = MagicMock()
+            cap.set.side_effect = lambda _, time: setattr(cap, "time", int(time / 1000))
+            cap.read.side_effect = lambda: (True, cap.time)
+            with patch(
+                "app.reid.jersey_search.cv2.VideoCapture", return_value=cap
+            ), patch(
+                "app.reid.jersey_search.crop_from_normalized_bbox",
+                side_effect=lambda frame, _: frame,
+            ), patch(
+                "app.reid.jersey_search.extract_kit_color_signature",
+                side_effect=lambda frame: {"time": frame},
+            ), patch(
+                "app.reid.jersey_search.signatures_compatible",
+                side_effect=lambda _, sig: boundary if sig["time"] == 3 else True,
+            ):
+                result = trim_kit_component("clip", detections, [1, 2], "anchor")
+                self.assertEqual([r["t"] for r in result], [0, 1, 2])
+                self.assertEqual(
+                    trim_kit_component("clip", detections, [2, 4], "anchor"), []
+                )
+            cap.release.assert_called()
+
     def batch_response(self, rows):
         return Mock(
             status_code=200,
@@ -391,6 +419,46 @@ class JerseyVisionTests(unittest.TestCase):
             thresholds=AssociationThresholds(require_strong_overlap=True),
         )
         self.assertFalse(decision.accepted)
+
+    def test_independently_confirmed_disjoint_tracklets_are_not_concurrent_rivals(self):
+        from dataclasses import replace
+
+        first = self.jersey_candidate()
+        first = replace(
+            first,
+            metadata={
+                **first.metadata,
+                "tracklet_detections": [{"t": t} for t in (1.0, 2.0, 3.0)],
+            },
+        )
+        second = replace(
+            first,
+            candidate_id="later_fragment",
+            metadata={
+                **first.metadata,
+                "tracklet_detections": [{"t": t} for t in (5.0, 6.0, 7.0)],
+            },
+        )
+        identity = IdentityProfile("player", first.descriptor)
+        thresholds = AssociationThresholds(require_strong_overlap=True)
+        self.assertTrue(
+            associate_identity(
+                identity, [first, second], thresholds=thresholds
+            ).accepted
+        )
+        for times in [(2.0, 3.0, 4.0), (3.01, 4.0, 5.0), (float("nan"), 4.0, 5.0)]:
+            overlapping = replace(
+                second,
+                metadata={
+                    **second.metadata,
+                    "tracklet_detections": [{"t": t} for t in times],
+                },
+            )
+            self.assertFalse(
+                associate_identity(
+                    identity, [first, overlapping], thresholds=thresholds
+                ).accepted
+            )
 
     def response(self, number=8, **changes):
         reading = dict(number=number, legible=True, single_player=True, view="back")

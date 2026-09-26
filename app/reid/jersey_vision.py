@@ -566,6 +566,7 @@ class JerseyVerifier:
         *,
         rescope=None,
         max_calls: int | None = None,
+        hinted_only: bool = False,
     ):
         if (
             self.target is None
@@ -628,6 +629,15 @@ class JerseyVerifier:
                     enriched.append(candidate)
                     continue
                 metadata = dict(candidate.metadata or {})
+                if (
+                    hinted_only
+                    and not metadata.get("jersey_preferred_times")
+                    and not metadata.get("tracklet_scope", "").startswith(
+                        "MOTION_CONTINUOUS_STRONG"
+                    )
+                ):
+                    enriched.append(candidate)
+                    continue
                 # OCR may inspect a raw ID, but only a subsequently verified
                 # motion-continuous component can become a reacquisition candidate.
                 detections = metadata.get("tracklet_detections") or ()
@@ -675,7 +685,10 @@ class JerseyVerifier:
                     )
                     # A clearly conflicting number already rejects this raw
                     # candidate; reserve further calls for independent tracks.
-                    if evaluate_readings(readings, self.target)["status"] == "CONFLICT":
+                    if evaluate_readings(readings, self.target)["status"] in {
+                        "CONFLICT",
+                        "MATCH",
+                    }:
                         break
                 # A readable back often lasts only a few seconds. Once a digit
                 # is clear, seek independent confirmation nearby rather than

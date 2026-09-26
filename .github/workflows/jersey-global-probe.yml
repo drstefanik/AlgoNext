@@ -1,5 +1,5 @@
 name: Verify jersey reacquisition beyond tracking gaps
-# Compare whole-window batched search on the original eight real-video windows.
+# Verify 3-fps motion tracking, kit boundaries, and disjoint jersey fragments.
 on:
   push:
     branches: [fix/batched-identity-search-20260926]
